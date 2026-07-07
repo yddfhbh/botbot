@@ -1,0 +1,72 @@
+{
+  "output_path": "automation/live-snapshot.json",
+  "poll_interval_ms": 16,
+  "spawn_stability_frames": 2,
+  "monitor_index": 1,
+  "piece_palette": {
+    "I": [66, 175, 225],
+    "J": [17, 101, 181],
+    "L": [243, 137, 39],
+    "O": [246, 208, 60],
+    "S": [81, 184, 77],
+    "T": [151, 57, 162],
+    "Z": [235, 79, 101],
+    "G": [134, 134, 134],
+    "ghost": [221, 221, 221],
+    "empty": [0, 0, 0]
+  },
+  "recognition": {
+    "field_threshold": 60,
+    "box_threshold": 95,
+    "empty_brightness": 35,
+    "center_sample_ratio": 0.42,
+    "top_spawn_sample_ratio": 0.52,
+    "top_spawn_y_bias": 0.38,
+    "remove_center_overlay_artifacts": true
+  },
+  "piece_detection": {
+    "background_rgb": [0, 0, 0],
+    "background_distance_threshold": 45,
+    "piece_match_threshold": 95,
+    "min_pixels": 50
+  },
+  "board": {
+    "x": 495,
+    "y": 255,
+    "w": 297,
+    "h": 595,
+    "visible_rows": 20,
+    "visible_cols": 10,
+    "sample_inset": 0.32,
+    "empty_rgb": [0, 0, 0],
+    "occupancy_threshold": 55,
+    "trim_disconnected": true
+  },
+  "hold_slot": {
+    "x": 321,
+    "y": 279,
+    "w": 149,
+    "h": 89
+  },
+  "queue_slots": [
+    { "x": 819, "y": 295, "w": 118, "h": 63 },
+    { "x": 819, "y": 384, "w": 118, "h": 63 },
+    { "x": 819, "y": 474, "w": 118, "h": 63 },
+    { "x": 819, "y": 572, "w": 118, "h": 63 },
+    { "x": 819, "y": 650, "w": 118, "h": 70 }
+  ],
+  "spawn_zone": {
+    "x": 582,
+    "y": 162,
+    "w": 120,
+    "h": 132
+  },
+  "active_spawn": {
+    "enabled": true,
+    "cols_left": 3.0,
+    "cols_width": 4.0,
+    "rows_above": 3.2,
+    "rows_inside": 1.2
+  },
+  "debug_output_path": "automation/scanner-debug.png"
+}

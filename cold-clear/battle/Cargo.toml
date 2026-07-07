@@ -1,0 +1,14 @@
+[package]
+name = "battle"
+version = "0.1.0"
+authors = ["MinusKelvin <minuskelvin.carlson@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libtetris = { path = "../libtetris" }
+ordered-float = { version = "2.8.0", features = ["serde"] }
+rand = "0.7.0"
+rand_pcg = "0.2.0"
+serde = { version = "1", features = ["derive"] }

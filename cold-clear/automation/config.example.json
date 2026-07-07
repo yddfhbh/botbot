@@ -1,0 +1,37 @@
+{
+  "snapshot_path": "automation/live-snapshot.json",
+  "dry_run": true,
+  "poll_interval_ms": 16,
+  "tap_duration_ms": 8,
+  "settle_delay_ms": 2,
+  "bot": {
+    "threads": 1,
+    "min_nodes": 0,
+    "max_nodes": 400000,
+    "use_hold": true,
+    "speculate": false,
+    "movement_mode": "zero_g_complete",
+    "spawn_rule": "row19_or20"
+  },
+  "handling": {
+    "arr_ms": 0,
+    "das_ms": 97,
+    "dcd_ms": 0,
+    "soft_drop_mode": "infinite",
+    "soft_drop_factor": 1,
+    "prevent_accidental_hard_drops": true,
+    "cancel_das_on_direction_change": true,
+    "prefer_soft_drop_over_movement": true,
+    "irs_mode": "tap",
+    "ihs_mode": "tap"
+  },
+  "keys": {
+    "left": "LEFT",
+    "right": "RIGHT",
+    "rotate_cw": "X",
+    "rotate_ccw": "Z",
+    "hold": "C",
+    "soft_drop": "DOWN",
+    "hard_drop": "SPACE"
+  }
+}
