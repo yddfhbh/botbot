@@ -11,9 +11,10 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    AutomationConfig, BotConfig, BufferModeConfig, HandlingConfig, KeyBindings,
+    AutomationConfig, BotConfig, BufferModeConfig, HandlingConfig, InputBackendConfig, KeyBindings,
     MovementModeConfig, SoftDropModeConfig, SpawnRuleConfig,
 };
+use crate::driver::{InputDriver, WindowsSendInputDriver};
 use crate::paths::AppPaths;
 use crate::runtime::run_automation;
 
@@ -47,6 +48,11 @@ struct LauncherState {
     poll_interval_ms: u64,
     tap_duration_ms: u64,
     settle_delay_ms: u64,
+    pre_hard_drop_delay_ms: u64,
+    post_hard_drop_delay_ms: u64,
+    post_move_cooldown_ms: u64,
+    min_snapshot_age_ms: u64,
+    input_backend: InputBackendConfig,
     bot: BotConfig,
     handling: HandlingConfig,
     keys: KeyBindings,
@@ -63,8 +69,13 @@ impl Default for LauncherState {
             always_on_top: false,
             dry_run: true,
             poll_interval_ms: 16,
-            tap_duration_ms: 8,
-            settle_delay_ms: 2,
+            tap_duration_ms: 18,
+            settle_delay_ms: 10,
+            pre_hard_drop_delay_ms: 20,
+            post_hard_drop_delay_ms: 50,
+            post_move_cooldown_ms: 50,
+            min_snapshot_age_ms: 20,
+            input_backend: InputBackendConfig::VirtualKey,
             bot: BotConfig::default(),
             handling: HandlingConfig::default(),
             keys: KeyBindings::default(),
@@ -88,6 +99,24 @@ pub fn launcher_viewport(paths: &AppPaths) -> egui::ViewportBuilder {
 }
 
 impl LauncherState {
+    fn apply_tetrio_safe_preset(&mut self) {
+        self.tap_duration_ms = 18;
+        self.settle_delay_ms = 10;
+        self.pre_hard_drop_delay_ms = 20;
+        self.post_hard_drop_delay_ms = 50;
+        self.post_move_cooldown_ms = 50;
+        self.min_snapshot_age_ms = 20;
+        self.bot.speculate = false;
+        self.bot.movement_mode = MovementModeConfig::HardDropOnly;
+        self.bot.spawn_rule = SpawnRuleConfig::Row19Or20;
+        self.handling.soft_drop_mode = SoftDropModeConfig::Infinite;
+        self.handling.prevent_accidental_hard_drops = true;
+        self.handling.cancel_das_on_direction_change = true;
+        self.handling.prefer_soft_drop_over_movement = false;
+        self.handling.irs_mode = BufferModeConfig::Off;
+        self.handling.ihs_mode = BufferModeConfig::Off;
+    }
+
     fn apply_preset(&mut self) {
         self.scanner_config_path = match self.preset {
             ModePreset::VsLeft1080p => "automation/scan-config.vs-left-1080p.json",
@@ -96,20 +125,19 @@ impl LauncherState {
         }
         .to_owned();
         self.snapshot_path = "automation/live-snapshot.json".to_owned();
-        self.bot.movement_mode = MovementModeConfig::ZeroGComplete;
+        self.apply_tetrio_safe_preset();
     }
 
     fn migrate_legacy_defaults(&mut self) {
         if self.preset != ModePreset::Custom
-            && self.bot.movement_mode == MovementModeConfig::TwentyG
+            && matches!(
+                self.bot.movement_mode,
+                MovementModeConfig::TwentyG | MovementModeConfig::ZeroGComplete
+            )
+            && self.tap_duration_ms <= 8
+            && self.settle_delay_ms <= 2
         {
-            self.bot.movement_mode = MovementModeConfig::ZeroGComplete;
-        }
-        if self.tap_duration_ms == 24 {
-            self.tap_duration_ms = 8;
-        }
-        if self.settle_delay_ms == 10 {
-            self.settle_delay_ms = 2;
+            self.apply_tetrio_safe_preset();
         }
     }
 
@@ -120,6 +148,11 @@ impl LauncherState {
             poll_interval_ms: self.poll_interval_ms,
             tap_duration_ms: self.tap_duration_ms,
             settle_delay_ms: self.settle_delay_ms,
+            pre_hard_drop_delay_ms: self.pre_hard_drop_delay_ms,
+            post_hard_drop_delay_ms: self.post_hard_drop_delay_ms,
+            post_move_cooldown_ms: self.post_move_cooldown_ms,
+            min_snapshot_age_ms: self.min_snapshot_age_ms,
+            input_backend: self.input_backend,
             bot: self.bot.clone(),
             handling: self.handling.clone(),
             keys: self.keys.clone(),
@@ -195,7 +228,8 @@ impl LauncherApp {
         } else {
             self.push_log(format!(
                 "[launcher] saved settings to {}",
-                self.paths.display_workspace_relative(&self.paths.launcher_state_path)
+                self.paths
+                    .display_workspace_relative(&self.paths.launcher_state_path)
             ));
         }
     }
@@ -268,10 +302,25 @@ impl LauncherApp {
     fn stop(&mut self) {
         if let Some(mut running) = self.running.take() {
             running.stop();
+            if let Err(err) = self.release_all_keys_now() {
+                self.push_log(format!(
+                    "[launcher] failed to release keys on stop: {err:#}"
+                ));
+            } else {
+                self.push_log("[launcher] released keys on stop");
+            }
             self.push_log("[launcher] session stopped");
         }
         self.event_rx = None;
         self.status = "Idle".to_owned();
+    }
+
+    fn release_all_keys_now(&self) -> Result<()> {
+        if self.state.dry_run {
+            return Ok(());
+        }
+        let mut driver = WindowsSendInputDriver::new(&self.state.keys, self.state.input_backend)?;
+        driver.release_all_keys()
     }
 
     fn poll_events(&mut self) {
@@ -376,6 +425,16 @@ impl eframe::App for LauncherApp {
                 ui.add(egui::DragValue::new(&mut self.state.settle_delay_ms).speed(1));
             });
             ui.horizontal(|ui| {
+                ui.label("Pre HD");
+                ui.add(egui::DragValue::new(&mut self.state.pre_hard_drop_delay_ms).speed(1));
+                ui.label("Post HD");
+                ui.add(egui::DragValue::new(&mut self.state.post_hard_drop_delay_ms).speed(1));
+                ui.label("Cooldown");
+                ui.add(egui::DragValue::new(&mut self.state.post_move_cooldown_ms).speed(1));
+                ui.label("Min age");
+                ui.add(egui::DragValue::new(&mut self.state.min_snapshot_age_ms).speed(1));
+            });
+            ui.horizontal(|ui| {
                 ui.label("Threads");
                 ui.add(egui::DragValue::new(&mut self.state.bot.threads).range(1..=64));
                 ui.label("Min nodes");
@@ -389,10 +448,11 @@ impl eframe::App for LauncherApp {
                     .selected_text(movement_mode_label(self.state.bot.movement_mode))
                     .show_ui(ui, |ui| {
                         for mode in [
-                            MovementModeConfig::TwentyG,
+                            MovementModeConfig::HardDropOnly,
+                            MovementModeConfig::ZeroGSafe,
                             MovementModeConfig::ZeroG,
                             MovementModeConfig::ZeroGComplete,
-                            MovementModeConfig::HardDropOnly,
+                            MovementModeConfig::TwentyG,
                         ] {
                             ui.selectable_value(
                                 &mut self.state.bot.movement_mode,
@@ -410,6 +470,22 @@ impl eframe::App for LauncherApp {
                                 &mut self.state.bot.spawn_rule,
                                 rule,
                                 spawn_rule_label(rule),
+                            );
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Input backend");
+                egui::ComboBox::from_id_salt("input_backend")
+                    .selected_text(input_backend_label(self.state.input_backend))
+                    .show_ui(ui, |ui| {
+                        for backend in
+                            [InputBackendConfig::VirtualKey, InputBackendConfig::ScanCode]
+                        {
+                            ui.selectable_value(
+                                &mut self.state.input_backend,
+                                backend,
+                                input_backend_label(backend),
                             );
                         }
                     });
@@ -462,7 +538,11 @@ impl eframe::App for LauncherApp {
                 egui::ComboBox::from_id_salt("irs_mode")
                     .selected_text(buffer_mode_label(self.state.handling.irs_mode))
                     .show_ui(ui, |ui| {
-                        for mode in [BufferModeConfig::Off, BufferModeConfig::Hold, BufferModeConfig::Tap] {
+                        for mode in [
+                            BufferModeConfig::Off,
+                            BufferModeConfig::Hold,
+                            BufferModeConfig::Tap,
+                        ] {
                             ui.selectable_value(
                                 &mut self.state.handling.irs_mode,
                                 mode,
@@ -474,7 +554,11 @@ impl eframe::App for LauncherApp {
                 egui::ComboBox::from_id_salt("ihs_mode")
                     .selected_text(buffer_mode_label(self.state.handling.ihs_mode))
                     .show_ui(ui, |ui| {
-                        for mode in [BufferModeConfig::Off, BufferModeConfig::Hold, BufferModeConfig::Tap] {
+                        for mode in [
+                            BufferModeConfig::Off,
+                            BufferModeConfig::Hold,
+                            BufferModeConfig::Tap,
+                        ] {
                             ui.selectable_value(
                                 &mut self.state.handling.ihs_mode,
                                 mode,
@@ -571,7 +655,8 @@ fn save_launcher_state(paths: &AppPaths, state: &LauncherState) -> Result<()> {
 fn movement_mode_label(mode: MovementModeConfig) -> &'static str {
     match mode {
         MovementModeConfig::ZeroG => "ZeroG",
-        MovementModeConfig::ZeroGComplete => "ZeroG Complete",
+        MovementModeConfig::ZeroGSafe => "ZeroG Safe",
+        MovementModeConfig::ZeroGComplete => "ZeroG Complete (Experimental)",
         MovementModeConfig::TwentyG => "TwentyG",
         MovementModeConfig::HardDropOnly => "Hard Drop Only",
     }
@@ -596,6 +681,13 @@ fn buffer_mode_label(mode: BufferModeConfig) -> &'static str {
         BufferModeConfig::Off => "Off",
         BufferModeConfig::Hold => "Hold",
         BufferModeConfig::Tap => "Tap",
+    }
+}
+
+fn input_backend_label(backend: InputBackendConfig) -> &'static str {
+    match backend {
+        InputBackendConfig::VirtualKey => "Virtual Key",
+        InputBackendConfig::ScanCode => "Scan Code",
     }
 }
 
@@ -660,4 +752,33 @@ where
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn built_in_preset_uses_safe_defaults() {
+        let mut state = LauncherState::default();
+        state.preset = ModePreset::Solo1080p;
+        state.apply_preset();
+
+        assert_eq!(state.bot.movement_mode, MovementModeConfig::HardDropOnly);
+        assert_eq!(state.bot.spawn_rule, SpawnRuleConfig::Row19Or20);
+        assert_eq!(state.tap_duration_ms, 18);
+        assert_eq!(state.settle_delay_ms, 10);
+        assert_eq!(state.post_hard_drop_delay_ms, 50);
+        assert_eq!(state.handling.irs_mode, BufferModeConfig::Off);
+        assert_eq!(state.handling.ihs_mode, BufferModeConfig::Off);
+    }
+
+    #[test]
+    fn readme_matches_safe_preset_defaults() {
+        let readme = include_str!("../README.md");
+        assert!(readme.contains("TETR.IO Safe preset"));
+        assert!(readme.contains("Hard Drop Only"));
+        assert!(readme.contains("ZeroG Complete"));
+        assert!(readme.contains("Advanced/Experimental"));
+    }
 }

@@ -1,7 +1,8 @@
+use std::convert::TryInto;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::convert::TryInto;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use libtetris::Piece;
@@ -27,7 +28,9 @@ impl GameSnapshot {
         self.field
             .clone()
             .try_into()
-            .map_err(|rows: Vec<[bool; 10]>| anyhow::anyhow!("expected 40 rows, got {}", rows.len()))
+            .map_err(|rows: Vec<[bool; 10]>| {
+                anyhow::anyhow!("expected 40 rows, got {}", rows.len())
+            })
     }
 
     pub fn queue_pieces(&self) -> Vec<Piece> {
@@ -47,14 +50,22 @@ pub struct JsonFileScanner {
     path: PathBuf,
     last_token: Option<String>,
     waiting_for_file_logged: bool,
+    min_snapshot_age: Duration,
+    pending_token: Option<String>,
+    pending_snapshot: Option<GameSnapshot>,
+    pending_seen_count: u32,
 }
 
 impl JsonFileScanner {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf, min_snapshot_age: Duration) -> Self {
         Self {
             path,
             last_token: None,
             waiting_for_file_logged: false,
+            min_snapshot_age,
+            pending_token: None,
+            pending_snapshot: None,
+            pending_seen_count: 0,
         }
     }
 }
@@ -78,19 +89,48 @@ impl SnapshotScanner for JsonFileScanner {
             }
             Err(err) => {
                 return Err(err).with_context(|| {
-                    format!(
-                        "failed to read snapshot JSON from {}",
-                        self.path.display()
-                    )
+                    format!("failed to read snapshot JSON from {}", self.path.display())
                 });
             }
         };
+        let metadata = fs::metadata(&self.path).with_context(|| {
+            format!(
+                "failed to read snapshot metadata from {}",
+                self.path.display()
+            )
+        })?;
+        let modified_at = metadata
+            .modified()
+            .context("failed to read snapshot modified timestamp")?;
         let snapshot: GameSnapshot =
             serde_json::from_str(&raw).context("failed to parse snapshot JSON")?;
         if self.last_token.as_deref() == Some(snapshot.token.as_str()) {
             return Ok(None);
         }
+        let is_same_pending = self.pending_token.as_deref() == Some(snapshot.token.as_str());
+        if is_same_pending {
+            self.pending_seen_count += 1;
+            self.pending_snapshot = Some(snapshot.clone());
+        } else {
+            self.pending_token = Some(snapshot.token.clone());
+            self.pending_snapshot = Some(snapshot.clone());
+            self.pending_seen_count = 1;
+        }
+
+        let age_ready = modified_at
+            .elapsed()
+            .map(|age| age >= self.min_snapshot_age)
+            .unwrap_or(true);
+        let stable_enough = self.pending_seen_count >= 2;
+
+        if !age_ready || !stable_enough {
+            return Ok(None);
+        }
+
         self.last_token = Some(snapshot.token.clone());
+        self.pending_token = None;
+        self.pending_snapshot = None;
+        self.pending_seen_count = 0;
         Ok(Some(snapshot))
     }
 }

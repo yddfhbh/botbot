@@ -10,9 +10,8 @@ pub struct AppPaths {
 
 impl AppPaths {
     pub fn discover() -> Self {
-        let workspace_root = discover_workspace_root().unwrap_or_else(|| {
-            env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        });
+        let workspace_root = discover_workspace_root()
+            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let automation_dir = workspace_root.join("automation");
         Self {
             launcher_state_path: automation_dir.join("launcher-state.json"),
@@ -52,7 +51,11 @@ fn discover_workspace_root() -> Option<PathBuf> {
     for candidate in candidates {
         for ancestor in candidate.ancestors() {
             let automation_dir = ancestor.join("automation");
-            if automation_dir.join("scripts").join("screen_scanner.py").exists() {
+            if automation_dir
+                .join("scripts")
+                .join("screen_scanner.py")
+                .exists()
+            {
                 return Some(ancestor.to_path_buf());
             }
         }

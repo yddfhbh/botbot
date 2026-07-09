@@ -10,6 +10,11 @@ pub struct AutomationConfig {
     pub poll_interval_ms: u64,
     pub tap_duration_ms: u64,
     pub settle_delay_ms: u64,
+    pub pre_hard_drop_delay_ms: u64,
+    pub post_hard_drop_delay_ms: u64,
+    pub post_move_cooldown_ms: u64,
+    pub min_snapshot_age_ms: u64,
+    pub input_backend: InputBackendConfig,
     pub bot: BotConfig,
     pub handling: HandlingConfig,
     pub keys: KeyBindings,
@@ -21,8 +26,13 @@ impl Default for AutomationConfig {
             snapshot_path: PathBuf::from("snapshot.json"),
             dry_run: true,
             poll_interval_ms: 16,
-            tap_duration_ms: 8,
-            settle_delay_ms: 2,
+            tap_duration_ms: 18,
+            settle_delay_ms: 10,
+            pre_hard_drop_delay_ms: 20,
+            post_hard_drop_delay_ms: 50,
+            post_move_cooldown_ms: 50,
+            min_snapshot_age_ms: 20,
+            input_backend: InputBackendConfig::VirtualKey,
             bot: BotConfig::default(),
             handling: HandlingConfig::default(),
             keys: KeyBindings::default(),
@@ -50,7 +60,7 @@ impl Default for BotConfig {
             max_nodes: 400_000,
             use_hold: true,
             speculate: false,
-            movement_mode: MovementModeConfig::ZeroGComplete,
+            movement_mode: MovementModeConfig::HardDropOnly,
             spawn_rule: SpawnRuleConfig::Row19Or20,
         }
     }
@@ -81,11 +91,18 @@ impl Default for HandlingConfig {
             soft_drop_factor: 1,
             prevent_accidental_hard_drops: true,
             cancel_das_on_direction_change: true,
-            prefer_soft_drop_over_movement: true,
-            irs_mode: BufferModeConfig::Tap,
-            ihs_mode: BufferModeConfig::Tap,
+            prefer_soft_drop_over_movement: false,
+            irs_mode: BufferModeConfig::Off,
+            ihs_mode: BufferModeConfig::Off,
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputBackendConfig {
+    VirtualKey,
+    ScanCode,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -107,6 +124,7 @@ pub enum BufferModeConfig {
 #[serde(rename_all = "snake_case")]
 pub enum MovementModeConfig {
     ZeroG,
+    ZeroGSafe,
     ZeroGComplete,
     TwentyG,
     HardDropOnly,

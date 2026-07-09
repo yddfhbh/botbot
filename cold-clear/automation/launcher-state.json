@@ -7,16 +7,21 @@
   "always_on_top": true,
   "dry_run": false,
   "poll_interval_ms": 16,
-  "tap_duration_ms": 8,
-  "settle_delay_ms": 2,
+  "tap_duration_ms": 18,
+  "settle_delay_ms": 10,
+  "pre_hard_drop_delay_ms": 20,
+  "post_hard_drop_delay_ms": 50,
+  "post_move_cooldown_ms": 50,
+  "min_snapshot_age_ms": 20,
+  "input_backend": "virtual_key",
   "bot": {
     "threads": 1,
     "min_nodes": 0,
     "max_nodes": 400000,
     "use_hold": true,
     "speculate": false,
-    "movement_mode": "zero_g_complete",
-    "spawn_rule": "row21_and_fall"
+    "movement_mode": "hard_drop_only",
+    "spawn_rule": "row19_or20"
   },
   "handling": {
     "arr_ms": 0,
@@ -26,9 +31,9 @@
     "soft_drop_factor": 1,
     "prevent_accidental_hard_drops": true,
     "cancel_das_on_direction_change": true,
-    "prefer_soft_drop_over_movement": true,
-    "irs_mode": "tap",
-    "ihs_mode": "tap"
+    "prefer_soft_drop_over_movement": false,
+    "irs_mode": "off",
+    "ihs_mode": "off"
   },
   "keys": {
     "left": "LEFT",

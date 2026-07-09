@@ -2,7 +2,7 @@
 
 This crate turns the existing Cold Clear move planner into a Windows automation runner.
 
-It now ships with two layers:
+It ships with two layers:
 
 - a Rust runner that consumes `GameSnapshot` JSON and drives keyboard input
 - a Python screen scanner that can capture a live client and emit that JSON
@@ -12,6 +12,7 @@ It now ships with two layers:
 - reads a `GameSnapshot` JSON file
 - rebuilds a `libtetris::Board` from that snapshot
 - asks Cold Clear for a move
+- rebuilds a safe route to `expected_location`
 - sends the resulting inputs with `SendInput`
 
 ## Snapshot contract
@@ -41,15 +42,48 @@ cargo run -p automation
 Running without arguments opens the launcher window. From there you can:
 
 - choose `2P Left 1080p`, `Solo 1080p`, or `Custom`
-- edit dry-run, timings, nodes, movement mode, spawn rule, handling, and key bindings
+- edit dry-run, timings, nodes, movement mode, spawn rule, handling, input backend, and key bindings
 - start or stop the scanner + bot session
 - save launcher settings for the next launch
 
-For live TETR.IO control, the built-in presets now default to `Hard Drop Only`, which is less
-ambitious than `ZeroG Complete` but much closer to what the simple key-tap driver can reproduce
-reliably.
+## TETR.IO Safe preset
 
-If you still want the old terminal-only behavior, pass a config path argument.
+The built-in live presets now apply a `TETR.IO Safe preset` aimed at personal solo / practice testing.
+
+- `Movement`: `Hard Drop Only` by default
+- `Spawn`: `Row 19 or 20`
+- `Tap`: `18ms`
+- `Settle`: `10ms`
+- `Pre Hard Drop Delay`: `20ms`
+- `Post Hard Drop Delay`: `50ms`
+- `Post Move Cooldown`: `50ms`
+- `Min Snapshot Age`: `20ms`
+- `IRS/IHS`: `Off`
+- `Prevent accidental hard drops`: `On`
+- `SoftDrop route`: disabled when `soft_drop_mode = infinite`
+
+If you want a slightly more flexible route search without going all the way to experimental handling,
+switch `Movement` to `ZeroG Safe`.
+
+`ZeroG Complete` is still available, but it should be treated as `Advanced/Experimental`. Use it only
+when the logged input route is something the real client can actually reproduce.
+
+## If inputs still feel unstable
+
+Try these first:
+
+- `Movement`: `Hard Drop Only` or `ZeroG Safe`
+- `Spawn`: `Row 19 or 20`
+- `Tap`: `16-24ms`
+- `Settle`: `8-15ms`
+- `IRS/IHS`: `Off`
+- `Prevent accidental hard drops`: `On`
+- `Input backend`: switch from `Virtual Key` to `Scan Code`
+- `SoftDrop route`: keep it disabled for Infinite SDF clients like TETR.IO
+
+The runner now also forces `release_all_keys()` before a plan, after hold, before hard drop, after hard
+drop, and again when the launcher stops. Hard drop is executed in its own phase with configurable
+pre/post delays, and the next token is guarded by snapshot age plus a short post-move cooldown.
 
 ## Scanner
 
@@ -65,8 +99,8 @@ For TETR.IO, you can usually skip manual dragging and let it auto-detect from th
 python automation/scripts/calibrate_regions.py --monitor 1 --player-side auto --auto-save --output automation/scan-config.json
 ```
 
-If two boards are visible and you want the left or right one explicitly, replace `auto` with
-`left` or `right`.
+If two boards are visible and you want the left or right one explicitly, replace `auto` with `left`
+or `right`.
 
 If you are using the same 1920x1080 TETR.IO layouts as the included reference screenshots, you can
 skip calibration entirely and use the fixed presets:
@@ -80,15 +114,6 @@ python automation/scripts/screen_scanner.py automation/scan-config.solo-1080p.js
 ```
 
 `automation/scan-config.json` currently defaults to the 2-player left-side 1080p layout.
-
-## Packaging Note
-
-The launcher exe is now windowed, but the live scanner still runs through the bundled Python script
-`automation/scripts/screen_scanner.py`. So for a true single-file distribution, the next step would
-be either:
-
-- bundle Python together with the release package, or
-- port the scanner from Python into Rust later
 
 Keys inside the calibrator:
 
@@ -108,8 +133,8 @@ Then start the live scanner:
 python automation/scripts/screen_scanner.py automation/scan-config.json
 ```
 
-The scanner writes `automation/live-snapshot.json` by default. Point the Rust runner at that file
-by changing `snapshot_path` in `automation/config.example.json`.
+The scanner writes `automation/live-snapshot.json` by default. Point the Rust runner at that file by
+changing `snapshot_path` in `automation/config.example.json`.
 
 ## How the scanner works
 
@@ -120,35 +145,17 @@ by changing `snapshot_path` in `automation/config.example.json`.
 - falls back to previous preview-queue shift inference when the active piece is not directly visible
 - emits a new snapshot only after the preview queue is stable for a few frames
 
-The live input side now rebuilds a route from the planned `expected_location` using the same
-SRS rotation/kick logic as `libtetris`, instead of replaying Cold Clear's internal movement list
-directly. The current handling settings especially affect whether soft-drop steps are allowed:
-`soft_drop_mode = infinite` disables stepped soft-drop routing, while `step` allows tucks that
-need explicit downward inputs.
-
 ## Practical notes
 
 - The scanner assumes a fairly standard colored skin. If your client uses a custom skin, update the
   `piece_palette` in `automation/scan-config.json`.
 - If you do not calibrate an `active_slot`, the very first piece after startup may be skipped. After
-  that, the scanner can infer the active piece from the queue shift. For TETR.IO, calibrating `p`
-  as a spawn zone above the matrix is the better default.
+  that, the scanner can infer the active piece from the queue shift. For TETR.IO, calibrating `p` as
+  a spawn zone above the matrix is the better default.
 - TETR.IO solo and versus both commonly spawn the current piece above the visible matrix. The
-  scanner now supports a `spawn_zone` rectangle for that case, and also has an automatic board-based
+  scanner supports a `spawn_zone` rectangle for that case, and also has an automatic board-based
   fallback zone if you do not draw one manually.
-- The calibrator can auto-detect the board and derive hold/next/spawn rectangles from it. In most
-  standard TETR.IO layouts that is enough without dragging every box by hand.
 - `debug_output_path` saves an annotated frame each time a snapshot is emitted, which helps a lot
   when tuning colors and rectangles.
 - `combo`, `b2b`, and `incoming` are currently emitted as `0/false/0`. That is enough to play, but
   defensive choices will improve if you later add those signals.
-
-## Real-client scope
-
-For a real client such as TETR.IO or Jstris, the remaining tuning is:
-
-- field cells
-- hold
-- active piece or reliable queue-shift inference
-- preview queue
-- optional incoming garbage
