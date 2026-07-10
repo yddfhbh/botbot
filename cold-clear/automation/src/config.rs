@@ -5,16 +5,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutomationConfig {
+    pub snapshot_provider: SnapshotProviderConfig,
     pub snapshot_path: PathBuf,
     pub dry_run: bool,
     pub poll_interval_ms: u64,
     pub tap_duration_ms: u64,
-    pub settle_delay_ms: u64,
-    pub pre_hard_drop_delay_ms: u64,
-    pub post_hard_drop_delay_ms: u64,
-    pub post_move_cooldown_ms: u64,
+    pub movement_tap_duration_ms: u64,
+    pub rotate_tap_duration_ms: u64,
+    pub hold_tap_duration_ms: u64,
+    pub hard_drop_tap_duration_ms: u64,
+    pub soft_drop_tap_duration_ms: u64,
+    pub movement_interval_ms: u64,
+    pub rotation_interval_ms: u64,
+    pub piece_interval_ms: u64,
+    pub hard_drop_interval_ms: u64,
     pub min_snapshot_age_ms: u64,
     pub input_backend: InputBackendConfig,
+    pub scanner: ScannerSourceConfig,
+    pub browser: BrowserCdpConfig,
     pub bot: BotConfig,
     pub handling: HandlingConfig,
     pub keys: KeyBindings,
@@ -23,19 +31,83 @@ pub struct AutomationConfig {
 impl Default for AutomationConfig {
     fn default() -> Self {
         Self {
-            snapshot_path: PathBuf::from("snapshot.json"),
+            snapshot_provider: SnapshotProviderConfig::BrowserCdp,
+            snapshot_path: PathBuf::from("automation/live-snapshot.json"),
             dry_run: true,
             poll_interval_ms: 16,
-            tap_duration_ms: 18,
-            settle_delay_ms: 10,
-            pre_hard_drop_delay_ms: 20,
-            post_hard_drop_delay_ms: 50,
-            post_move_cooldown_ms: 50,
-            min_snapshot_age_ms: 20,
-            input_backend: InputBackendConfig::VirtualKey,
+            tap_duration_ms: 60,
+            movement_tap_duration_ms: 55,
+            rotate_tap_duration_ms: 70,
+            hold_tap_duration_ms: 70,
+            hard_drop_tap_duration_ms: 80,
+            soft_drop_tap_duration_ms: 55,
+            movement_interval_ms: 60,
+            rotation_interval_ms: 120,
+            piece_interval_ms: 100,
+            hard_drop_interval_ms: 100,
+            min_snapshot_age_ms: 40,
+            input_backend: InputBackendConfig::BrowserCdp,
+            scanner: ScannerSourceConfig::default(),
+            browser: BrowserCdpConfig::default(),
             bot: BotConfig::default(),
             handling: HandlingConfig::default(),
             keys: KeyBindings::default(),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotProviderConfig {
+    Scanner,
+    BrowserCdp,
+    File,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScannerSourceConfig {
+    pub config_path: String,
+    pub python_command: String,
+}
+
+impl Default for ScannerSourceConfig {
+    fn default() -> Self {
+        Self {
+            config_path: "automation/scan-config.vs-left-1080p.json".to_owned(),
+            python_command: "python".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BrowserCdpConfig {
+    pub node_command: String,
+    pub chrome_path: String,
+    pub cdp_port: u16,
+    pub url: String,
+    pub target_hint: String,
+    pub connect_only: bool,
+    pub probe_page_state: bool,
+    pub use_ribbon_websocket: bool,
+    pub use_seed_simulation_fallback: bool,
+    pub bootstrap_timeout_ms: u64,
+}
+
+impl Default for BrowserCdpConfig {
+    fn default() -> Self {
+        Self {
+            node_command: "node".to_owned(),
+            chrome_path: String::new(),
+            cdp_port: 9222,
+            url: "https://tetr.io/".to_owned(),
+            target_hint: "TETR.IO".to_owned(),
+            connect_only: false,
+            probe_page_state: true,
+            use_ribbon_websocket: true,
+            use_seed_simulation_fallback: true,
+            bootstrap_timeout_ms: 2500,
         }
     }
 }
@@ -103,6 +175,7 @@ impl Default for HandlingConfig {
 pub enum InputBackendConfig {
     VirtualKey,
     ScanCode,
+    BrowserCdp,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

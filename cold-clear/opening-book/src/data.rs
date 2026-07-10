@@ -34,10 +34,13 @@ impl Position {
         }
         let mut board = Board::new_with_state(field, self.bag, self.extra, false, 0);
         let soft_dropped = !board.above_stack(&mv);
-        let is_tspin = soft_dropped && mv.kind.0 == Piece::T && (
-            board.occupied(mv.x - 1, mv.y - 1) as u8 + board.occupied(mv.x + 1, mv.y - 1) as u8 +
-            board.occupied(mv.x - 1, mv.y + 1) as u8 + board.occupied(mv.x + 1, mv.y + 1) as u8
-        ) >= 3;
+        let is_tspin = soft_dropped
+            && mv.kind.0 == Piece::T
+            && (board.occupied(mv.x - 1, mv.y - 1) as u8
+                + board.occupied(mv.x + 1, mv.y - 1) as u8
+                + board.occupied(mv.x - 1, mv.y + 1) as u8
+                + board.occupied(mv.x + 1, mv.y + 1) as u8)
+                >= 3;
         let lock = board.lock_piece(mv);
         let long_moves = match is_tspin && lock.cleared_lines.len() >= 2 {
             true => 0, // prefer tspin doubles

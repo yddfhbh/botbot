@@ -1,0 +1,652 @@
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const DEFAULT_URL = "https://tetr.io/";
+const DEFAULT_PORT = 9222;
+const DEFAULT_NEXT_COUNT = 6;
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const snapshotPath = args.snapshotPath ?? "automation/live-snapshot.json";
+  const url = args.url ?? DEFAULT_URL;
+  const port = numberArg(args.port, DEFAULT_PORT);
+  const targetHint = args.target ?? "TETR.IO";
+  const pollMs = numberArg(args.pollMs, 40);
+  const connectOnly = args.connectOnly === "1";
+  const probePageState = args.probePageState !== "0";
+  const useRibbonWebsocket = args.useRibbonWebsocket !== "0";
+  const useSeedSimulationFallback = args.useSeedSimulationFallback !== "0";
+  const chromePath = process.env.CHROME_PATH || "";
+  const msgpack = await loadOptionalMsgpack();
+
+  let browserProcess = null;
+  if (!connectOnly) {
+    const alreadyOpen = await isCdpOpen(port);
+    if (!alreadyOpen) {
+      browserProcess = launchChromium({ port, url, chromePath });
+    }
+  }
+
+  await waitForCdp(port);
+  const target = await findOrCreateTarget({ port, url, targetHint });
+  const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
+  await cdp.send("Page.bringToFront");
+  await cdp.send("Runtime.evaluate", {
+    expression: "window.focus(); document.body && document.body.focus && document.body.focus(); true"
+  }).catch(() => undefined);
+
+  console.log(`[browser] connected to ${target.title || target.url} on port ${port}`);
+
+  const network = createTetrioNetworkState();
+  if (useRibbonWebsocket) {
+    await installRibbonMonitor(cdp, network, msgpack);
+  }
+
+  let lastReason = "";
+  let stableSignature = "";
+  let stableCount = 0;
+  let lastWrittenToken = "";
+
+  const stop = async () => {
+    await cdp.close().catch(() => undefined);
+    browserProcess?.kill();
+  };
+  process.on("SIGINT", () => stop().finally(() => process.exit(0)));
+  process.on("SIGTERM", () => stop().finally(() => process.exit(0)));
+
+  while (true) {
+    const state = await readTetrioState(cdp, {
+      probePageState,
+      useSeedSimulationFallback,
+      network
+    });
+
+    if (!state.ok || !state.ready || !state.playing || state.countdown) {
+      const reason =
+        state.reason ??
+        (!state.playing ? "page is not playing" : state.countdown ? "countdown active" : "state not ready");
+      if (reason !== lastReason) {
+        console.log(`[browser] ${reason}`);
+        lastReason = reason;
+      }
+      await sleep(pollMs);
+      continue;
+    }
+
+    const queueText = state.queue.join(",");
+    const signature = `${state.pieceCounter}|${state.current}|${state.hold ?? "-"}|${queueText}`;
+    if (signature === stableSignature) {
+      stableCount += 1;
+    } else {
+      stableSignature = signature;
+      stableCount = 1;
+    }
+
+    if (stableCount < 2) {
+      await sleep(pollMs);
+      continue;
+    }
+
+    const snapshot = {
+      ok: true,
+      source: "browser_cdp",
+      field: state.field,
+      current: state.current.toUpperCase(),
+      hold: state.hold ? state.hold.toUpperCase() : null,
+      queue: state.queue.map((piece) => piece.toUpperCase()),
+      b2b: Boolean(state.b2b),
+      combo: state.combo,
+      incoming: state.incoming,
+      pieceCounter: state.pieceCounter,
+      token: `browser-${state.pieceCounter}`,
+      playing: state.playing,
+      countdown: state.countdown
+    };
+
+    if (snapshot.token !== lastWrittenToken) {
+      writeSnapshot(snapshotPath, snapshot);
+      lastWrittenToken = snapshot.token;
+      console.log(
+        `[browser] page state ready pieceCounter=${state.pieceCounter} current=${snapshot.current} hold=${snapshot.hold ?? "-"} queue=${snapshot.queue.join(",")}`
+      );
+    }
+
+    await sleep(pollMs);
+  }
+}
+
+function parseArgs(argv) {
+  const parsed = {};
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (!arg.startsWith("--")) continue;
+    const key = arg.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+    const next = argv[i + 1];
+    if (!next || next.startsWith("--")) {
+      parsed[key] = "1";
+      continue;
+    }
+    parsed[key] = next;
+    i++;
+  }
+  return parsed;
+}
+
+function numberArg(value, fallback) {
+  const parsed = Number.parseInt(value ?? `${fallback}`, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+async function loadOptionalMsgpack() {
+  try {
+    return await import("msgpackr");
+  } catch {
+    console.log("[browser] msgpackr not installed; ribbon seed parsing will be best-effort only");
+    return null;
+  }
+}
+
+function launchChromium({ port, url, chromePath }) {
+  const executable = chromePath || findChromiumExecutable();
+  if (!executable) {
+    throw new Error("Could not find Chrome/Edge. Set CHROME_PATH to the browser executable.");
+  }
+  const profileDir = path.join(os.tmpdir(), `botbot-tetrio-cdp-${port}`);
+  mkdirSync(profileDir, { recursive: true });
+  return spawn(
+    executable,
+    [
+      `--remote-debugging-port=${port}`,
+      "--remote-allow-origins=*",
+      `--user-data-dir=${profileDir}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-background-timer-throttling",
+      "--disable-renderer-backgrounding",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-features=Translate,CalculateNativeWinOcclusion",
+      url
+    ],
+    {
+      detached: false,
+      stdio: ["ignore", "ignore", "ignore"]
+    }
+  );
+}
+
+function findChromiumExecutable() {
+  const localAppData = process.env.LOCALAPPDATA;
+  const programFiles = process.env.ProgramFiles;
+  const programFilesX86 = process.env["ProgramFiles(x86)"];
+  const candidates = [
+    programFiles && path.join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+    programFilesX86 && path.join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
+    localAppData && path.join(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
+    programFiles && path.join(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
+    programFilesX86 && path.join(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe")
+  ].filter(Boolean);
+  return candidates.find((candidate) => existsSync(candidate)) ?? null;
+}
+
+async function isCdpOpen(port) {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/json/version`);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForCdp(port) {
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    if (await isCdpOpen(port)) return;
+    await sleep(250);
+  }
+  throw new Error(`Chrome DevTools endpoint did not open on port ${port}`);
+}
+
+async function findOrCreateTarget({ port, url, targetHint }) {
+  const list = await fetchJson(`http://127.0.0.1:${port}/json/list`);
+  const pages = list.filter((item) => item.type === "page");
+  const hinted = pages.find(
+    (item) =>
+      item.url?.toLowerCase().includes(targetHint.toLowerCase()) ||
+      item.title?.toLowerCase().includes(targetHint.toLowerCase())
+  );
+  const matchingUrl = pages.find((item) => item.url === url);
+  const existing = hinted ?? matchingUrl ?? pages[0];
+  if (existing?.webSocketDebuggerUrl) return existing;
+  return await fetchJson(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, {
+    method: "PUT"
+  });
+}
+
+async function fetchJson(url, options) {
+  const response = await fetch(url, options);
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}: ${url}`);
+  }
+  return await response.json();
+}
+
+class CdpClient {
+  static connect(webSocketDebuggerUrl) {
+    return new Promise((resolve, reject) => {
+      const socket = new WebSocket(webSocketDebuggerUrl);
+      const client = new CdpClient(socket);
+      socket.addEventListener("open", () => resolve(client), { once: true });
+      socket.addEventListener("error", (event) => reject(event.error ?? event), { once: true });
+    });
+  }
+
+  constructor(socket) {
+    this.socket = socket;
+    this.nextId = 1;
+    this.pending = new Map();
+    this.listeners = new Map();
+    socket.addEventListener("message", (event) => {
+      const message = JSON.parse(event.data);
+      if (!message.id) {
+        if (message.method) this.emit(message.method, message.params ?? {});
+        return;
+      }
+      const pending = this.pending.get(message.id);
+      if (!pending) return;
+      this.pending.delete(message.id);
+      if (message.error) pending.reject(new Error(message.error.message ?? JSON.stringify(message.error)));
+      else pending.resolve(message.result);
+    });
+  }
+
+  on(method, handler) {
+    const listeners = this.listeners.get(method) ?? new Set();
+    listeners.add(handler);
+    this.listeners.set(method, listeners);
+  }
+
+  emit(method, params) {
+    const listeners = this.listeners.get(method);
+    if (!listeners) return;
+    for (const handler of [...listeners]) handler(params);
+  }
+
+  send(method, params = {}) {
+    if (this.socket.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("CDP socket is not open"));
+    }
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.socket.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  close() {
+    this.socket.close();
+    return Promise.resolve();
+  }
+}
+
+function createTetrioNetworkState() {
+  return {
+    seed: null,
+    nextCount: DEFAULT_NEXT_COUNT,
+    readyAt: 0,
+    ribbonSeen: false
+  };
+}
+
+async function installRibbonMonitor(cdp, network, msgpack) {
+  await cdp.send("Network.enable").catch(() => undefined);
+  cdp.on("Network.webSocketCreated", (event) => {
+    if (/spool\.tetr\.io\/ribbon/i.test(event?.url ?? "")) {
+      network.ribbonSeen = true;
+      console.log("[browser] ribbon websocket opened");
+    }
+  });
+  if (!msgpack?.unpack) return;
+  const handleFrame = (event) => {
+    const payload = event?.response?.payloadData;
+    if (!payload) return;
+    const buffer = event?.response?.opcode === 2 ? Buffer.from(payload, "base64") : Buffer.from(payload, "utf8");
+    inspectRibbonPayload(buffer, network, msgpack.unpack);
+  };
+  cdp.on("Network.webSocketFrameReceived", handleFrame);
+  cdp.on("Network.webSocketFrameSent", handleFrame);
+}
+
+function inspectRibbonPayload(payload, network, unpack) {
+  const candidates = [];
+  for (let offset = 0; offset <= Math.min(24, payload.length - 1); offset++) {
+    try {
+      candidates.push(unpack(payload.subarray(offset)));
+    } catch {}
+  }
+  for (const decoded of candidates) {
+    const options = findOptionsObject(decoded);
+    if (options?.seed !== undefined && options?.bagtype !== undefined) {
+      network.seed = String(options.seed);
+      network.nextCount = Math.max(
+        1,
+        Number.parseInt(options.nextcount ?? `${DEFAULT_NEXT_COUNT}`, 10) || DEFAULT_NEXT_COUNT
+      );
+      network.readyAt = Date.now() + estimateCountdownWait(options);
+      console.log(`[browser] ribbon seed captured seed=${network.seed}`);
+      return;
+    }
+  }
+}
+
+function findOptionsObject(root) {
+  let found = null;
+  walkObject(root, (value) => {
+    if (found || !value || typeof value !== "object") return;
+    if (Object.hasOwn(value, "seed") && Object.hasOwn(value, "bagtype")) {
+      found = value;
+    } else if (
+      value.options &&
+      typeof value.options === "object" &&
+      Object.hasOwn(value.options, "seed") &&
+      Object.hasOwn(value.options, "bagtype")
+    ) {
+      found = value.options;
+    }
+  });
+  return found;
+}
+
+function walkObject(value, visit) {
+  if (!value || typeof value !== "object") return;
+  visit(value);
+  if (Array.isArray(value)) {
+    value.forEach((item) => walkObject(item, visit));
+    return;
+  }
+  for (const child of Object.values(value)) walkObject(child, visit);
+}
+
+function estimateCountdownWait(options) {
+  if (options?.countdown === false) return 0;
+  const count = finiteNumber(options?.countdown_count);
+  const interval = finiteNumber(options?.countdown_interval);
+  const pre = finiteNumber(options?.precountdown);
+  if (count !== null && interval !== null) {
+    return normalizeDuration(pre ?? 0) + count * normalizeDuration(interval) + 250;
+  }
+  return 4500;
+}
+
+function normalizeDuration(value) {
+  return value > 0 && value < 60 ? value * 1000 : value;
+}
+
+function finiteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+async function readTetrioState(cdp, options) {
+  const raw = await cdp.send("Runtime.evaluate", {
+    expression: tetrioStateExpression(),
+    returnByValue: true,
+    awaitPromise: true
+  });
+  const state = raw.result?.value ?? { ok: false, ready: false, reason: "page probe returned empty" };
+  if (state.ok) {
+    return state;
+  }
+  if (!options.useSeedSimulationFallback || !options.network.seed) {
+    return state;
+  }
+  return buildSeedFallbackState(options.network);
+}
+
+function buildSeedFallbackState(network) {
+  const now = Date.now();
+  const ready = network.readyAt > 0 && now >= network.readyAt;
+  const generated = getCurrentAndNext(network.seed, 0, network.nextCount);
+  return {
+    ok: Boolean(generated.current),
+    ready,
+    reason: ready ? null : "TETR.IO seed captured; waiting for countdown timing",
+    field: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => false)),
+    current: generated.current,
+    hold: null,
+    queue: generated.queue,
+    b2b: false,
+    combo: 0,
+    incoming: 0,
+    pieceCounter: 0,
+    playing: ready,
+    countdown: !ready
+  };
+}
+
+function createPrng(seed) {
+  let value = Number.parseInt(seed, 10) % 2147483647;
+  if (value <= 0) value += 2147483646;
+  return {
+    next() {
+      value = (16807 * value) % 2147483647;
+      return value;
+    },
+    nextFloat() {
+      return (this.next() - 1) / 2147483646;
+    }
+  };
+}
+
+function generate7BagQueue(seed, count) {
+  const rng = createPrng(seed);
+  const pieces = ["z", "l", "o", "s", "i", "j", "t"];
+  const bag = [];
+  const queue = [];
+  while (queue.length < count) {
+    const nextBag = [...pieces];
+    for (let index = nextBag.length - 1; index > 0; index--) {
+      const swapIndex = Math.floor(rng.nextFloat() * (index + 1));
+      [nextBag[index], nextBag[swapIndex]] = [nextBag[swapIndex], nextBag[index]];
+    }
+    bag.push(...nextBag);
+    while (bag.length > 0 && queue.length < count) {
+      queue.push(bag.shift());
+    }
+  }
+  return queue;
+}
+
+function getCurrentAndNext(seed, pieceIndex, nextCount = DEFAULT_NEXT_COUNT) {
+  const queue = generate7BagQueue(seed, pieceIndex + nextCount + 1);
+  return {
+    current: queue[pieceIndex] ?? null,
+    queue: queue.slice(pieceIndex + 1, pieceIndex + 1 + nextCount)
+  };
+}
+
+function tetrioStateExpression() {
+  return `(() => {
+    const pieceNames = ["i", "o", "t", "s", "z", "j", "l"];
+    const normalizePiece = (value) => {
+      if (value === null || value === undefined || value === false) return null;
+      if (typeof value === "number") return pieceNames[value] ?? null;
+      if (typeof value === "string") {
+        const text = value.trim().toLowerCase();
+        if (!text) return null;
+        for (const token of text.split(/[^a-z0-9]+/)) {
+          if (pieceNames.includes(token)) return token;
+        }
+        return pieceNames.includes(text) ? text : null;
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          const piece = normalizePiece(item);
+          if (piece) return piece;
+        }
+        return null;
+      }
+      if (typeof value === "object") {
+        for (const key of ["type", "symbol", "id", "piece", "name", "mino", "value"]) {
+          const piece = normalizePiece(value[key]);
+          if (piece) return piece;
+        }
+      }
+      return null;
+    };
+    const filled = (cell) => {
+      if (cell === null || cell === undefined || cell === false || cell === 0 || cell === "") return false;
+      if (typeof cell === "string") {
+        const text = cell.trim().toLowerCase();
+        return text !== "" && text !== "." && text !== "0" && text !== "empty";
+      }
+      if (typeof cell === "object") {
+        if ("empty" in cell) return !cell.empty;
+        if ("type" in cell) return filled(cell.type);
+        if ("mino" in cell) return filled(cell.mino);
+      }
+      return true;
+    };
+    const rowCells = (row) =>
+      Array.isArray(row)
+        ? row
+        : Array.isArray(row?.cells)
+          ? row.cells
+          : Array.isArray(row?.row)
+            ? row.row
+            : null;
+    const queueFrom = (...values) => {
+      for (const value of values) {
+        if (!Array.isArray(value)) continue;
+        const queue = value.map(normalizePiece).filter(Boolean);
+        if (queue.length > 0) return queue.slice(0, 12);
+      }
+      return [];
+    };
+    const numberFrom = (...values) => {
+      for (const value of values) {
+        const number = Number(value);
+        if (Number.isFinite(number)) return number;
+      }
+      return null;
+    };
+    const looksLikeGame = (value) =>
+      value &&
+      typeof value === "object" &&
+      typeof value.ejectState === "function" &&
+      typeof value.ejectBoardState === "function";
+    const scanObject = (root, limit = 200) => {
+      if (!root || typeof root !== "object") return null;
+      let names = [];
+      try { names = Object.getOwnPropertyNames(root).slice(0, limit); } catch {}
+      for (const name of names) {
+        try {
+          const value = root[name];
+          if (looksLikeGame(value)) return value;
+        } catch {}
+      }
+      return null;
+    };
+    const findGame = () => {
+      const direct = [window.__fusionTetrioGame, window.tetrioGame, window.TETRIO_GAME, window.game, window.app, window.tetrio];
+      for (const candidate of direct) {
+        if (looksLikeGame(candidate)) return candidate;
+        const nested = scanObject(candidate);
+        if (nested) return nested;
+      }
+      const names = Object.getOwnPropertyNames(window).slice(0, 1500);
+      for (const name of names) {
+        try {
+          const value = window[name];
+          if (looksLikeGame(value)) return value;
+        } catch {}
+      }
+      return null;
+    };
+
+    const game = findGame();
+    if (!game) {
+      return { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" };
+    }
+    window.__fusionTetrioGame = game;
+    const exported = typeof game.ejectState === "function" ? game.ejectState() : null;
+    const boardState = typeof game.ejectBoardState === "function" ? game.ejectBoardState() : null;
+    const state = exported && typeof exported === "object" && exported.game ? exported.game : exported;
+    if (!state || typeof state !== "object") {
+      return { ok: false, ready: false, reason: "TETR.IO game state is not available" };
+    }
+
+    const board =
+      Array.isArray(state.board) ? state.board :
+      Array.isArray(boardState?.b) ? boardState.b :
+      null;
+    if (!Array.isArray(board) || board.length === 0) {
+      return { ok: false, ready: false, reason: "TETR.IO board is not available" };
+    }
+
+    const current = normalizePiece(state.falling ?? state.active ?? state.current ?? state.piece);
+    const hold = normalizePiece(state.hold ?? state.held);
+    const queue = queueFrom(state.bag, state.queue, state.next, state.preview, state.previews, state.pieces);
+    const stats = state.stats ?? {};
+    const pieceCounter = Math.max(0, Math.floor(numberFrom(
+      stats.piecesplaced,
+      stats.piecesPlaced,
+      stats.pieces,
+      state.piecesplaced,
+      state.piecesPlaced,
+      state.pieceCounter,
+      state.piececount
+    ) ?? -1));
+    if (!current || pieceCounter < 0) {
+      return { ok: false, ready: false, reason: "TETR.IO current piece or piece counter is not available" };
+    }
+
+    const playing =
+      typeof game.isPlaying === "function" ? Boolean(game.isPlaying()) :
+      typeof state.playing === "boolean" ? state.playing :
+      typeof state.paused === "boolean" ? !state.paused :
+      true;
+    const started =
+      typeof game.isStarted === "function" ? Boolean(game.isStarted()) :
+      Boolean(state.started ?? true);
+    const destroyed = Boolean(state.destroyed || state.dead || state.gameover);
+    const countdown = started && !destroyed && !playing;
+    const ready = started && !destroyed;
+    const field = Array.from({ length: 40 }, (_, rowIndex) => {
+      const sourceRow = board[rowIndex];
+      const cells = rowCells(sourceRow);
+      return Array.from({ length: 10 }, (_, x) => filled(cells ? cells[x] : null));
+    });
+    return {
+      ok: true,
+      ready,
+      reason: ready ? null : !started ? "TETR.IO game is not started" : "TETR.IO game ended",
+      field,
+      current,
+      hold,
+      queue,
+      b2b: Math.max(0, numberFrom(stats.b2b, state.b2b, 0) ?? 0) > 0,
+      combo: Math.max(0, numberFrom(stats.combo, state.combo, 0) ?? 0),
+      incoming: Math.max(0, numberFrom(stats.impendingdamage, state.incoming, 0) ?? 0),
+      pieceCounter,
+      playing,
+      countdown
+    };
+  })()`;
+}
+
+function writeSnapshot(snapshotPath, payload) {
+  const directory = path.dirname(snapshotPath);
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(snapshotPath, JSON.stringify(payload, null, 2));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+main().catch((error) => {
+  console.error("[browser] fatal:", error?.message ?? error);
+  process.exit(1);
+});

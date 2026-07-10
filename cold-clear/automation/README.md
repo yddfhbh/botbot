@@ -5,15 +5,25 @@ This crate turns the existing Cold Clear move planner into a Windows automation 
 It ships with two layers:
 
 - a Rust runner that consumes `GameSnapshot` JSON and drives keyboard input
-- a Python screen scanner that can capture a live client and emit that JSON
+- a Browser CDP source that reads TETR.IO state from a Chromium tab
+- a Python screen scanner kept only as fallback/debug input
+
+Browser CDP mode is now the recommended mode for TETR.IO solo/custom practice.
+Screen scanner is fallback/debug only.
+Browser mode avoids color recognition errors and Windows foreground `SendInput` issues.
+Use only in private/solo/custom practice, not public matchmaking.
+
+Jstris extension bots avoid OS focus by dispatching DOM KeyboardEvents, but TETR.IO desktop cannot
+rely on that; use conservative CDP/browser input or conservative `SendInput` timing instead.
 
 ## What it does
 
 - reads a `GameSnapshot` JSON file
+- can produce snapshots from `browser_cdp`, `scanner`, or `file`
 - rebuilds a `libtetris::Board` from that snapshot
 - asks Cold Clear for a move
-- rebuilds a safe route to `expected_location`
-- sends the resulting inputs with `SendInput`
+- reduces `Hard Drop Only` execution to spawn-based rotations + left/right tap counts + hard drop
+- sends the resulting inputs with Browser CDP or conservative `SendInput`
 
 ## Snapshot contract
 
@@ -31,7 +41,13 @@ The scanner must write a JSON object like `sample-snapshot.json`.
 cargo run -p automation -- automation/config.example.json
 ```
 
+```powershell
+cargo run -p automation -- --snapshot-provider browser_cdp --input-backend browser_cdp
+```
+
 `dry_run: true` leaves the keyboard untouched and only prints the planned actions.
+That path uses `DebugLogBackend`; live play now defaults to `BrowserCdpInputBackend` and can fall
+back to `SendInputScanCodeBackend` or `SendInputVirtualKeyBackend` if needed.
 
 ## Launcher UI
 
@@ -42,24 +58,35 @@ cargo run -p automation
 Running without arguments opens the launcher window. From there you can:
 
 - choose `2P Left 1080p`, `Solo 1080p`, or `Custom`
+- choose `Browser CDP`, `Screen Scanner`, or `File` as the snapshot provider
+- edit Browser CDP connection fields such as Chrome path, port, URL, target hint, and ribbon/seed fallbacks
 - edit dry-run, timings, nodes, movement mode, spawn rule, handling, input backend, and key bindings
-- start or stop the scanner + bot session
+- start or stop the bot session
 - save launcher settings for the next launch
 
 ## TETR.IO Safe preset
 
 The built-in live presets now apply a `TETR.IO Safe preset` aimed at personal solo / practice testing.
 
+- `Snapshot provider`: `Browser CDP`
+- `Input backend`: `Browser CDP`
+- `URL`: `https://tetr.io/`
+- `CDP Port`: `9222`
+- `Target`: `TETR.IO`
 - `Movement`: `Hard Drop Only` by default
 - `Spawn`: `Row 19 or 20`
-- `Tap`: `18ms`
-- `Settle`: `10ms`
-- `Pre Hard Drop Delay`: `20ms`
-- `Post Hard Drop Delay`: `50ms`
-- `Post Move Cooldown`: `50ms`
-- `Min Snapshot Age`: `20ms`
+- `Legacy Tap`: `60ms`
+- `Move Tap`: `55ms`
+- `Rotate Tap`: `70ms`
+- `HardDrop Tap`: `80ms`
+- `Move Delay`: `60ms`
+- `Rotate Delay`: `120ms`
+- `HardDrop Delay`: `100ms`
+- `Piece Delay`: `100ms`
+- `Min Snapshot Age`: `40ms`
 - `IRS/IHS`: `Off`
 - `Prevent accidental hard drops`: `On`
+- `Speculate`: `Off`
 - `SoftDrop route`: disabled when `soft_drop_mode = infinite`
 
 If you want a slightly more flexible route search without going all the way to experimental handling,
@@ -68,24 +95,72 @@ switch `Movement` to `ZeroG Safe`.
 `ZeroG Complete` is still available, but it should be treated as `Advanced/Experimental`. Use it only
 when the logged input route is something the real client can actually reproduce.
 
+## Replay-calibrated input profile
+
+These defaults are tuned to match longer real TETR.IO tap windows instead of the old `18ms` single-tap
+profile:
+
+- `Movement Tap`: `55ms`
+- `Rotate Tap`: `70ms`
+- `HardDrop Tap`: `80ms`
+- `Move Delay`: `60ms`
+- `Rotate Delay`: `120ms`
+- `HardDrop Delay`: `100ms`
+- `Piece Delay`: `100ms`
+- `Snapshot provider`: `Browser CDP`
+- `Input backend`: `Browser CDP`
+- `Movement`: `Hard Drop Only`
+- `Spawn`: `Row 19 or 20`
+- `IRS/IHS`: `Off` first, then experiment with tap buffering only after the base profile is stable
+
+Movement taps are clamped below DAS with a safety margin, while rotate / hard drop keep their own
+dedicated press lengths. The launcher keeps `Legacy Tap` as a fallback, but the runtime now prefers
+the action-specific tap fields and the separate inter-action delay preset.
+
 ## If inputs still feel unstable
 
 Try these first:
 
 - `Movement`: `Hard Drop Only` or `ZeroG Safe`
 - `Spawn`: `Row 19 or 20`
-- `Tap`: `16-24ms`
-- `Settle`: `8-15ms`
+- `Move Tap`: start at `55ms`
+- `Rotate Tap`: start at `70ms`
+- `HardDrop Tap`: start at `80ms`
+- `Move Delay`: start at `60ms`
+- `Rotate Delay`: start at `120ms`
+- `HardDrop Delay`: start at `100ms`
+- `Piece Delay`: start at `100ms`
 - `IRS/IHS`: `Off`
 - `Prevent accidental hard drops`: `On`
-- `Input backend`: switch from `Virtual Key` to `Scan Code`
+- `Input backend`: keep `Browser CDP` first and only fall back to `Scan Code (SendInput)` or `Virtual Key (SendInput)` if needed
 - `SoftDrop route`: keep it disabled for Infinite SDF clients like TETR.IO
 
 The runner now also forces `release_all_keys()` before a plan, after hold, before hard drop, after hard
-drop, and again when the launcher stops. Hard drop is executed in its own phase with configurable
-pre/post delays, and the next token is guarded by snapshot age plus a short post-move cooldown.
+drop, and again when the launcher stops. In `Hard Drop Only`, the executor never uses DAS-hold movement:
+it only replays spawn-based rotations, left/right tap counts, and hard drop. After locking, the runner
+waits until the scanner reports a changed current/queue state that has stayed stable for two frames before
+starting the next piece.
+
+## Browser CDP mode
+
+Browser CDP mode attaches to a Chromium tab opened with `--remote-debugging-port=9222` or launches one
+for you. It probes TETR.IO page state first, optionally watches the ribbon WebSocket for seed/options,
+and can fall back to seed-based 7-bag reconstruction before falling all the way back to the screen scanner.
+
+Recommended Browser CDP defaults:
+
+- `Provider`: `Browser CDP`
+- `Input backend`: `Browser CDP`
+- `URL`: `https://tetr.io/`
+- `CDP Port`: `9222`
+- `Target`: `TETR.IO`
+- `Probe page state`: `On`
+- `Use ribbon websocket`: `On`
+- `Use seed simulation fallback`: `On`
 
 ## Scanner
+
+Screen scanner is still available, but it is intended for fallback/debug use now.
 
 First calibrate the board and preview rectangles:
 

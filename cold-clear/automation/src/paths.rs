@@ -6,6 +6,8 @@ pub struct AppPaths {
     pub workspace_root: PathBuf,
     pub launcher_state_path: PathBuf,
     pub scanner_script_path: PathBuf,
+    pub browser_snapshot_script_path: PathBuf,
+    pub browser_input_script_path: PathBuf,
 }
 
 impl AppPaths {
@@ -16,6 +18,12 @@ impl AppPaths {
         Self {
             launcher_state_path: automation_dir.join("launcher-state.json"),
             scanner_script_path: automation_dir.join("scripts").join("screen_scanner.py"),
+            browser_snapshot_script_path: automation_dir
+                .join("browser-source")
+                .join("tetrio-cdp-source.mjs"),
+            browser_input_script_path: automation_dir
+                .join("browser-source")
+                .join("browser-cdp-input.mjs"),
             workspace_root,
         }
     }

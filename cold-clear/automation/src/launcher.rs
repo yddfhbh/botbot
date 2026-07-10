@@ -1,8 +1,6 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -11,10 +9,11 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    AutomationConfig, BotConfig, BufferModeConfig, HandlingConfig, InputBackendConfig, KeyBindings,
-    MovementModeConfig, SoftDropModeConfig, SpawnRuleConfig,
+    AutomationConfig, BotConfig, BrowserCdpConfig, BufferModeConfig, HandlingConfig,
+    InputBackendConfig, KeyBindings, MovementModeConfig, ScannerSourceConfig,
+    SnapshotProviderConfig, SoftDropModeConfig, SpawnRuleConfig,
 };
-use crate::driver::{InputDriver, WindowsSendInputDriver};
+use crate::driver::create_input_backend;
 use crate::paths::AppPaths;
 use crate::runtime::run_automation;
 
@@ -39,18 +38,24 @@ impl ModePreset {
 #[serde(default)]
 struct LauncherState {
     preset: ModePreset,
+    snapshot_provider: SnapshotProviderConfig,
     scanner_config_path: String,
     snapshot_path: String,
     python_command: String,
-    launch_scanner: bool,
+    browser: BrowserCdpConfig,
     always_on_top: bool,
     dry_run: bool,
     poll_interval_ms: u64,
     tap_duration_ms: u64,
-    settle_delay_ms: u64,
-    pre_hard_drop_delay_ms: u64,
-    post_hard_drop_delay_ms: u64,
-    post_move_cooldown_ms: u64,
+    movement_tap_duration_ms: u64,
+    rotate_tap_duration_ms: u64,
+    hold_tap_duration_ms: u64,
+    hard_drop_tap_duration_ms: u64,
+    soft_drop_tap_duration_ms: u64,
+    movement_interval_ms: u64,
+    rotation_interval_ms: u64,
+    piece_interval_ms: u64,
+    hard_drop_interval_ms: u64,
     min_snapshot_age_ms: u64,
     input_backend: InputBackendConfig,
     bot: BotConfig,
@@ -62,20 +67,26 @@ impl Default for LauncherState {
     fn default() -> Self {
         Self {
             preset: ModePreset::VsLeft1080p,
+            snapshot_provider: SnapshotProviderConfig::BrowserCdp,
             scanner_config_path: "automation/scan-config.vs-left-1080p.json".to_owned(),
             snapshot_path: "automation/live-snapshot.json".to_owned(),
             python_command: "python".to_owned(),
-            launch_scanner: true,
+            browser: BrowserCdpConfig::default(),
             always_on_top: false,
             dry_run: true,
             poll_interval_ms: 16,
-            tap_duration_ms: 18,
-            settle_delay_ms: 10,
-            pre_hard_drop_delay_ms: 20,
-            post_hard_drop_delay_ms: 50,
-            post_move_cooldown_ms: 50,
-            min_snapshot_age_ms: 20,
-            input_backend: InputBackendConfig::VirtualKey,
+            tap_duration_ms: 60,
+            movement_tap_duration_ms: 55,
+            rotate_tap_duration_ms: 70,
+            hold_tap_duration_ms: 70,
+            hard_drop_tap_duration_ms: 80,
+            soft_drop_tap_duration_ms: 55,
+            movement_interval_ms: 60,
+            rotation_interval_ms: 120,
+            piece_interval_ms: 100,
+            hard_drop_interval_ms: 100,
+            min_snapshot_age_ms: 40,
+            input_backend: InputBackendConfig::BrowserCdp,
             bot: BotConfig::default(),
             handling: HandlingConfig::default(),
             keys: KeyBindings::default(),
@@ -100,12 +111,20 @@ pub fn launcher_viewport(paths: &AppPaths) -> egui::ViewportBuilder {
 
 impl LauncherState {
     fn apply_tetrio_safe_preset(&mut self) {
-        self.tap_duration_ms = 18;
-        self.settle_delay_ms = 10;
-        self.pre_hard_drop_delay_ms = 20;
-        self.post_hard_drop_delay_ms = 50;
-        self.post_move_cooldown_ms = 50;
-        self.min_snapshot_age_ms = 20;
+        self.tap_duration_ms = 60;
+        self.movement_tap_duration_ms = 55;
+        self.rotate_tap_duration_ms = 70;
+        self.hold_tap_duration_ms = 70;
+        self.hard_drop_tap_duration_ms = 80;
+        self.soft_drop_tap_duration_ms = 55;
+        self.movement_interval_ms = 60;
+        self.rotation_interval_ms = 120;
+        self.piece_interval_ms = 100;
+        self.hard_drop_interval_ms = 100;
+        self.min_snapshot_age_ms = 40;
+        self.snapshot_provider = SnapshotProviderConfig::BrowserCdp;
+        self.input_backend = InputBackendConfig::BrowserCdp;
+        self.browser = BrowserCdpConfig::default();
         self.bot.speculate = false;
         self.bot.movement_mode = MovementModeConfig::HardDropOnly;
         self.bot.spawn_rule = SpawnRuleConfig::Row19Or20;
@@ -135,7 +154,6 @@ impl LauncherState {
                 MovementModeConfig::TwentyG | MovementModeConfig::ZeroGComplete
             )
             && self.tap_duration_ms <= 8
-            && self.settle_delay_ms <= 2
         {
             self.apply_tetrio_safe_preset();
         }
@@ -143,16 +161,27 @@ impl LauncherState {
 
     fn to_automation_config(&self, paths: &AppPaths) -> AutomationConfig {
         AutomationConfig {
+            snapshot_provider: self.snapshot_provider,
             snapshot_path: paths.resolve_workspace_path(&self.snapshot_path),
             dry_run: self.dry_run,
             poll_interval_ms: self.poll_interval_ms,
             tap_duration_ms: self.tap_duration_ms,
-            settle_delay_ms: self.settle_delay_ms,
-            pre_hard_drop_delay_ms: self.pre_hard_drop_delay_ms,
-            post_hard_drop_delay_ms: self.post_hard_drop_delay_ms,
-            post_move_cooldown_ms: self.post_move_cooldown_ms,
+            movement_tap_duration_ms: self.movement_tap_duration_ms,
+            rotate_tap_duration_ms: self.rotate_tap_duration_ms,
+            hold_tap_duration_ms: self.hold_tap_duration_ms,
+            hard_drop_tap_duration_ms: self.hard_drop_tap_duration_ms,
+            soft_drop_tap_duration_ms: self.soft_drop_tap_duration_ms,
+            movement_interval_ms: self.movement_interval_ms,
+            rotation_interval_ms: self.rotation_interval_ms,
+            piece_interval_ms: self.piece_interval_ms,
+            hard_drop_interval_ms: self.hard_drop_interval_ms,
             min_snapshot_age_ms: self.min_snapshot_age_ms,
             input_backend: self.input_backend,
+            scanner: ScannerSourceConfig {
+                config_path: self.scanner_config_path.clone(),
+                python_command: self.python_command.clone(),
+            },
+            browser: self.browser.clone(),
             bot: self.bot.clone(),
             handling: self.handling.clone(),
             keys: self.keys.clone(),
@@ -168,22 +197,13 @@ enum LauncherEvent {
 struct RunningSession {
     stop: Arc<AtomicBool>,
     automation_thread: Option<JoinHandle<()>>,
-    scanner_child: Option<Child>,
-    scanner_log_threads: Vec<JoinHandle<()>>,
 }
 
 impl RunningSession {
     fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(child) = self.scanner_child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
         if let Some(thread) = self.automation_thread.take() {
             let _ = thread.join();
-        }
-        for handle in self.scanner_log_threads.drain(..) {
-            let _ = handle.join();
         }
     }
 }
@@ -244,29 +264,15 @@ impl LauncherApp {
 
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let mut scanner_child = None;
-        let mut scanner_log_threads = Vec::new();
-
-        if self.state.launch_scanner {
-            match spawn_scanner_process(&self.paths, &self.state, &tx) {
-                Ok((child, threads)) => {
-                    scanner_child = Some(child);
-                    scanner_log_threads = threads;
-                }
-                Err(err) => {
-                    self.push_log(format!("[launcher] scanner launch failed: {err:#}"));
-                    self.status = "Scanner launch failed".to_owned();
-                    return;
-                }
-            }
-        }
 
         let config = self.state.to_automation_config(&self.paths);
+        let paths = self.paths.clone();
         let worker_stop = stop.clone();
         let worker_tx = tx.clone();
+        let worker_log_tx = worker_tx.clone();
         let automation_thread = thread::spawn(move || {
-            let result = run_automation(config, &worker_stop, |line| {
-                let _ = worker_tx.send(LauncherEvent::Log(line));
+            let result = run_automation(paths, config, &worker_stop, move |line| {
+                let _ = worker_log_tx.send(LauncherEvent::Log(line));
             })
             .map_err(|err| format!("{err:#}"));
             let _ = worker_tx.send(LauncherEvent::AutomationExited(result));
@@ -278,8 +284,6 @@ impl LauncherApp {
         self.running = Some(RunningSession {
             stop,
             automation_thread: Some(automation_thread),
-            scanner_child,
-            scanner_log_threads,
         });
     }
 
@@ -319,8 +323,9 @@ impl LauncherApp {
         if self.state.dry_run {
             return Ok(());
         }
-        let mut driver = WindowsSendInputDriver::new(&self.state.keys, self.state.input_backend)?;
-        driver.release_all_keys()
+        let config = self.state.to_automation_config(&self.paths);
+        let mut backend = create_input_backend(&self.paths, &config)?;
+        backend.release_all_keys()
     }
 
     fn poll_events(&mut self) {
@@ -393,6 +398,24 @@ impl eframe::App for LauncherApp {
             });
 
             ui.horizontal(|ui| {
+                ui.label("Provider");
+                egui::ComboBox::from_id_salt("snapshot_provider")
+                    .selected_text(snapshot_provider_label(self.state.snapshot_provider))
+                    .show_ui(ui, |ui| {
+                        for provider in [
+                            SnapshotProviderConfig::BrowserCdp,
+                            SnapshotProviderConfig::Scanner,
+                            SnapshotProviderConfig::File,
+                        ] {
+                            ui.selectable_value(
+                                &mut self.state.snapshot_provider,
+                                provider,
+                                snapshot_provider_label(provider),
+                            );
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
                 ui.label("Scanner Config");
                 ui.text_edit_singleline(&mut self.state.scanner_config_path);
             });
@@ -401,10 +424,37 @@ impl eframe::App for LauncherApp {
                 ui.text_edit_singleline(&mut self.state.snapshot_path);
             });
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.state.launch_scanner, "Launch scanner process");
                 ui.label("Python");
                 ui.text_edit_singleline(&mut self.state.python_command);
             });
+            if self.state.snapshot_provider == SnapshotProviderConfig::BrowserCdp {
+                ui.horizontal(|ui| {
+                    ui.label("Chrome Path");
+                    ui.text_edit_singleline(&mut self.state.browser.chrome_path);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("CDP Port");
+                    ui.add(egui::DragValue::new(&mut self.state.browser.cdp_port).speed(1));
+                    ui.label("URL");
+                    ui.text_edit_singleline(&mut self.state.browser.url);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Target");
+                    ui.text_edit_singleline(&mut self.state.browser.target_hint);
+                    ui.checkbox(&mut self.state.browser.connect_only, "Connect only");
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.state.browser.probe_page_state, "Probe page state");
+                    ui.checkbox(
+                        &mut self.state.browser.use_ribbon_websocket,
+                        "Use ribbon websocket",
+                    );
+                    ui.checkbox(
+                        &mut self.state.browser.use_seed_simulation_fallback,
+                        "Use seed simulation fallback",
+                    );
+                });
+            }
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.state.always_on_top, "Always on top");
             });
@@ -419,18 +469,34 @@ impl eframe::App for LauncherApp {
             ui.horizontal(|ui| {
                 ui.label("Poll");
                 ui.add(egui::DragValue::new(&mut self.state.poll_interval_ms).speed(1));
-                ui.label("Tap");
+                ui.label("Legacy Tap");
                 ui.add(egui::DragValue::new(&mut self.state.tap_duration_ms).speed(1));
-                ui.label("Settle");
-                ui.add(egui::DragValue::new(&mut self.state.settle_delay_ms).speed(1));
             });
             ui.horizontal(|ui| {
-                ui.label("Pre HD");
-                ui.add(egui::DragValue::new(&mut self.state.pre_hard_drop_delay_ms).speed(1));
-                ui.label("Post HD");
-                ui.add(egui::DragValue::new(&mut self.state.post_hard_drop_delay_ms).speed(1));
-                ui.label("Cooldown");
-                ui.add(egui::DragValue::new(&mut self.state.post_move_cooldown_ms).speed(1));
+                ui.label("Move Tap");
+                ui.add(egui::DragValue::new(&mut self.state.movement_tap_duration_ms).speed(1));
+                ui.label("Rotate Tap");
+                ui.add(egui::DragValue::new(&mut self.state.rotate_tap_duration_ms).speed(1));
+                ui.label("Hold Tap");
+                ui.add(egui::DragValue::new(&mut self.state.hold_tap_duration_ms).speed(1));
+            });
+            ui.horizontal(|ui| {
+                ui.label("HardDrop Tap");
+                ui.add(egui::DragValue::new(&mut self.state.hard_drop_tap_duration_ms).speed(1));
+                ui.label("SoftDrop Tap");
+                ui.add(egui::DragValue::new(&mut self.state.soft_drop_tap_duration_ms).speed(1));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Move Delay");
+                ui.add(egui::DragValue::new(&mut self.state.movement_interval_ms).speed(1));
+                ui.label("Rotate Delay");
+                ui.add(egui::DragValue::new(&mut self.state.rotation_interval_ms).speed(1));
+                ui.label("Piece Delay");
+                ui.add(egui::DragValue::new(&mut self.state.piece_interval_ms).speed(1));
+                ui.label("HardDrop Delay");
+                ui.add(egui::DragValue::new(&mut self.state.hard_drop_interval_ms).speed(1));
+            });
+            ui.horizontal(|ui| {
                 ui.label("Min age");
                 ui.add(egui::DragValue::new(&mut self.state.min_snapshot_age_ms).speed(1));
             });
@@ -479,9 +545,11 @@ impl eframe::App for LauncherApp {
                 egui::ComboBox::from_id_salt("input_backend")
                     .selected_text(input_backend_label(self.state.input_backend))
                     .show_ui(ui, |ui| {
-                        for backend in
-                            [InputBackendConfig::VirtualKey, InputBackendConfig::ScanCode]
-                        {
+                        for backend in [
+                            InputBackendConfig::BrowserCdp,
+                            InputBackendConfig::ScanCode,
+                            InputBackendConfig::VirtualKey,
+                        ] {
                             ui.selectable_value(
                                 &mut self.state.input_backend,
                                 backend,
@@ -686,72 +754,18 @@ fn buffer_mode_label(mode: BufferModeConfig) -> &'static str {
 
 fn input_backend_label(backend: InputBackendConfig) -> &'static str {
     match backend {
-        InputBackendConfig::VirtualKey => "Virtual Key",
-        InputBackendConfig::ScanCode => "Scan Code",
+        InputBackendConfig::BrowserCdp => "Browser CDP",
+        InputBackendConfig::VirtualKey => "Virtual Key (SendInput)",
+        InputBackendConfig::ScanCode => "Scan Code (SendInput)",
     }
 }
 
-fn spawn_scanner_process(
-    paths: &AppPaths,
-    state: &LauncherState,
-    tx: &Sender<LauncherEvent>,
-) -> Result<(Child, Vec<JoinHandle<()>>)> {
-    let script = &paths.scanner_script_path;
-    let scanner_config = paths.resolve_workspace_path(&state.scanner_config_path);
-    let mut child = Command::new(&state.python_command)
-        .arg(script)
-        .arg(&scanner_config)
-        .current_dir(&paths.workspace_root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to launch scanner with {} {}",
-                state.python_command,
-                script.display()
-            )
-        })?;
-
-    let mut log_threads = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        log_threads.push(spawn_log_thread("[scanner] ", stdout, tx.clone()));
+fn snapshot_provider_label(provider: SnapshotProviderConfig) -> &'static str {
+    match provider {
+        SnapshotProviderConfig::BrowserCdp => "Browser CDP",
+        SnapshotProviderConfig::Scanner => "Screen Scanner",
+        SnapshotProviderConfig::File => "File",
     }
-    if let Some(stderr) = child.stderr.take() {
-        log_threads.push(spawn_log_thread("[scanner][err] ", stderr, tx.clone()));
-    }
-    tx.send(LauncherEvent::Log(format!(
-        "[launcher] scanner launched with {}",
-        scanner_config.display()
-    )))
-    .ok();
-    Ok((child, log_threads))
-}
-
-fn spawn_log_thread<R>(prefix: &'static str, reader: R, tx: Sender<LauncherEvent>) -> JoinHandle<()>
-where
-    R: std::io::Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut reader = BufReader::new(reader);
-        let mut buffer = Vec::new();
-        loop {
-            buffer.clear();
-            match reader.read_until(b'\n', &mut buffer) {
-                Ok(0) => break,
-                Ok(_) => {
-                    let line = String::from_utf8_lossy(&buffer)
-                        .trim_end_matches(['\r', '\n'])
-                        .to_string();
-                    let _ = tx.send(LauncherEvent::Log(format!("{prefix}{line}")));
-                }
-                Err(err) => {
-                    let _ = tx.send(LauncherEvent::Log(format!("{prefix}read error: {err}")));
-                    break;
-                }
-            }
-        }
-    })
 }
 
 #[cfg(test)]
@@ -766,9 +780,18 @@ mod tests {
 
         assert_eq!(state.bot.movement_mode, MovementModeConfig::HardDropOnly);
         assert_eq!(state.bot.spawn_rule, SpawnRuleConfig::Row19Or20);
-        assert_eq!(state.tap_duration_ms, 18);
-        assert_eq!(state.settle_delay_ms, 10);
-        assert_eq!(state.post_hard_drop_delay_ms, 50);
+        assert_eq!(state.tap_duration_ms, 60);
+        assert_eq!(state.movement_tap_duration_ms, 55);
+        assert_eq!(state.rotate_tap_duration_ms, 70);
+        assert_eq!(state.hold_tap_duration_ms, 70);
+        assert_eq!(state.hard_drop_tap_duration_ms, 80);
+        assert_eq!(state.soft_drop_tap_duration_ms, 55);
+        assert_eq!(state.movement_interval_ms, 60);
+        assert_eq!(state.rotation_interval_ms, 120);
+        assert_eq!(state.piece_interval_ms, 100);
+        assert_eq!(state.hard_drop_interval_ms, 100);
+        assert_eq!(state.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
+        assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
         assert_eq!(state.handling.irs_mode, BufferModeConfig::Off);
         assert_eq!(state.handling.ihs_mode, BufferModeConfig::Off);
     }

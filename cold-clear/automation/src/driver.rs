@@ -1,9 +1,14 @@
+use std::io::Write;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
-use crate::config::{BufferModeConfig, HandlingConfig, InputBackendConfig, KeyBindings};
+use crate::config::{
+    AutomationConfig, BufferModeConfig, HandlingConfig, InputBackendConfig, KeyBindings,
+};
+use crate::paths::AppPaths;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum GameAction {
@@ -26,107 +31,316 @@ pub struct ExecutionPlan {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionTimings {
     pub tap_duration: Duration,
-    pub settle_delay: Duration,
-    pub pre_hard_drop_delay: Duration,
-    pub post_hard_drop_delay: Duration,
+    pub movement_tap_duration: Duration,
+    pub rotate_tap_duration: Duration,
+    pub hold_tap_duration: Duration,
+    pub hard_drop_tap_duration: Duration,
+    pub soft_drop_tap_duration: Duration,
+    pub movement_interval: Duration,
+    pub rotation_interval: Duration,
+    pub piece_interval: Duration,
+    pub hard_drop_interval: Duration,
 }
 
-pub trait InputDriver {
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct ActionTapProfile {
+    requested_duration: Duration,
+    actual_duration: Duration,
+    source: &'static str,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct ActionDelayProfile {
+    duration: Duration,
+    label: &'static str,
+    source: &'static str,
+}
+
+pub trait InputBackend {
     fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()>;
     fn release_all_keys(&mut self) -> Result<()>;
+}
 
-    fn execute_plan<F>(
-        &mut self,
-        plan: &ExecutionPlan,
-        handling: &HandlingConfig,
-        timings: ExecutionTimings,
-        mut log: F,
-    ) -> Result<()>
-    where
-        F: FnMut(String),
-    {
-        log_release(&mut log, "before_plan");
-        self.release_all_keys()
-            .context("failed to release all keys before executing plan")?;
+pub fn create_input_backend(
+    paths: &AppPaths,
+    config: &AutomationConfig,
+) -> Result<Box<dyn InputBackend>> {
+    if config.dry_run {
+        return Ok(Box::new(DebugLogBackend::new()));
+    }
 
-        if plan.hold {
-            if handling.ihs_mode == BufferModeConfig::Off {
-                log("[automation] ihs_mode=Off hold will be tapped after snapshot".to_owned());
-            }
-            tap_with_logging(self, GameAction::Hold, timings.tap_duration, &mut log)
-                .context("failed to send hold input")?;
-            log_release(&mut log, "after_hold");
-            self.release_all_keys()
-                .context("failed to release all keys after hold input")?;
-            sleep_and_log(&mut log, "settle_after_hold", timings.settle_delay);
+    match config.input_backend {
+        InputBackendConfig::ScanCode => Ok(Box::new(SendInputScanCodeBackend::new(&config.keys)?)),
+        InputBackendConfig::VirtualKey => {
+            Ok(Box::new(SendInputVirtualKeyBackend::new(&config.keys)?))
         }
-
-        if handling.irs_mode == BufferModeConfig::Off
-            && plan
-                .movement_actions
-                .iter()
-                .any(|action| matches!(action, GameAction::RotateCw | GameAction::RotateCcw))
-        {
-            log("[automation] irs_mode=Off rotations will be tapped after snapshot".to_owned());
-        }
-
-        for action in &plan.movement_actions {
-            tap_with_logging(self, *action, timings.tap_duration, &mut log)
-                .with_context(|| format!("failed to send action {:?}", action))?;
-            sleep_and_log(&mut log, "settle_after_action", timings.settle_delay);
-        }
-
-        if plan.hard_drop {
-            log_release(&mut log, "before_hard_drop");
-            self.release_all_keys()
-                .context("failed to release all keys before hard drop")?;
-            if handling.prevent_accidental_hard_drops {
-                log("[automation] prevent_accidental_hard_drops=On".to_owned());
-            }
-            let pre_hard_drop_delay = timings.pre_hard_drop_delay;
-            sleep_and_log(&mut log, "pre_hard_drop_delay", pre_hard_drop_delay);
-            tap_with_logging(self, GameAction::HardDrop, timings.tap_duration, &mut log)
-                .context("failed to send hard drop input")?;
-            log_release(&mut log, "after_hard_drop");
-            self.release_all_keys()
-                .context("failed to release all keys after hard drop")?;
-            sleep_and_log(
-                &mut log,
-                "post_hard_drop_delay",
-                timings.post_hard_drop_delay,
-            );
-        }
-
-        Ok(())
+        InputBackendConfig::BrowserCdp => Ok(Box::new(BrowserCdpInputBackend::new(paths, config)?)),
     }
 }
 
-fn tap_with_logging<F, D>(
-    driver: &mut D,
+pub fn execute_plan<B, F>(
+    backend: &mut B,
+    plan: &ExecutionPlan,
+    handling: &HandlingConfig,
+    timings: ExecutionTimings,
+    mut log: F,
+) -> Result<()>
+where
+    B: InputBackend + ?Sized,
+    F: FnMut(String),
+{
+    log_release(&mut log, "before_plan");
+    backend
+        .release_all_keys()
+        .context("failed to release all keys before executing plan")?;
+
+    if plan.hold {
+        if handling.ihs_mode == BufferModeConfig::Off {
+            log("[automation] ihs_mode=Off hold will be tapped after snapshot".to_owned());
+        }
+        tap_action_with_logging(backend, GameAction::Hold, handling, timings, &mut log)
+            .context("failed to send hold input")?;
+        log_release(&mut log, "after_hold");
+        backend
+            .release_all_keys()
+            .context("failed to release all keys after hold input")?;
+        sleep_action_delay(&mut log, GameAction::Hold, timings);
+    }
+
+    if handling.irs_mode == BufferModeConfig::Off
+        && plan
+            .movement_actions
+            .iter()
+            .any(|action| matches!(action, GameAction::RotateCw | GameAction::RotateCcw))
+    {
+        log("[automation] irs_mode=Off rotations will be tapped after snapshot".to_owned());
+    }
+
+    for action in &plan.movement_actions {
+        tap_action_with_logging(backend, *action, handling, timings, &mut log)
+            .with_context(|| format!("failed to send action {:?}", action))?;
+        sleep_action_delay(&mut log, *action, timings);
+    }
+
+    if plan.hard_drop {
+        log_release(&mut log, "before_hard_drop");
+        backend
+            .release_all_keys()
+            .context("failed to release all keys before hard drop")?;
+        if handling.prevent_accidental_hard_drops {
+            log("[automation] prevent_accidental_hard_drops=On".to_owned());
+        }
+        tap_action_with_logging(backend, GameAction::HardDrop, handling, timings, &mut log)
+            .context("failed to send hard drop input")?;
+        log_release(&mut log, "after_hard_drop");
+        backend
+            .release_all_keys()
+            .context("failed to release all keys after hard drop")?;
+        sleep_action_delay(&mut log, GameAction::HardDrop, timings);
+    }
+
+    Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn duration_for_action(
     action: GameAction,
-    duration: Duration,
+    handling: &HandlingConfig,
+    timings: ExecutionTimings,
+) -> Duration {
+    action_tap_profile(action, handling, timings).actual_duration
+}
+
+fn tap_action_with_logging<B, F>(
+    backend: &mut B,
+    action: GameAction,
+    handling: &HandlingConfig,
+    timings: ExecutionTimings,
     log: &mut F,
 ) -> Result<()>
 where
+    B: InputBackend + ?Sized,
     F: FnMut(String),
-    D: InputDriver + ?Sized,
 {
+    let profile = action_tap_profile(action, handling, timings);
+    log_movement_clamp(action, profile, handling, log);
     let down_at = unix_time_ms();
     log(format!(
-        "[automation] tap {:?} down ts={} duration_ms={}",
+        "[automation] tap {:?} down ts={} duration_ms={} source={}",
         action,
         down_at,
-        duration.as_millis()
+        profile.actual_duration.as_millis(),
+        profile.source
     ));
-    driver.tap(action, duration)?;
+    backend.tap(action, profile.actual_duration)?;
     let up_at = unix_time_ms();
     log(format!(
-        "[automation] tap {:?} up ts={} held_ms={}",
+        "[automation] tap {:?} up ts={} held_ms={} source={}",
         action,
         up_at,
-        duration.as_millis()
+        profile.actual_duration.as_millis(),
+        profile.source
     ));
     Ok(())
+}
+
+fn sleep_action_delay<F>(log: &mut F, action: GameAction, timings: ExecutionTimings)
+where
+    F: FnMut(String),
+{
+    let profile = action_delay_profile(action, timings);
+    if profile.duration.is_zero() {
+        return;
+    }
+    log(format!(
+        "[automation] {} {}ms source={}",
+        profile.label,
+        profile.duration.as_millis(),
+        profile.source
+    ));
+    thread::sleep(profile.duration);
+}
+
+fn action_tap_profile(
+    action: GameAction,
+    handling: &HandlingConfig,
+    timings: ExecutionTimings,
+) -> ActionTapProfile {
+    let (requested_duration, source) = requested_duration_for_action(action, timings);
+    let actual_duration = match action {
+        GameAction::Left | GameAction::Right => {
+            clamp_movement_tap_duration(requested_duration, Duration::from_millis(handling.das_ms))
+        }
+        _ => requested_duration,
+    };
+    ActionTapProfile {
+        requested_duration,
+        actual_duration,
+        source,
+    }
+}
+
+fn requested_duration_for_action(
+    action: GameAction,
+    timings: ExecutionTimings,
+) -> (Duration, &'static str) {
+    match action {
+        GameAction::Left | GameAction::Right => fallback_aware_duration(
+            timings.movement_tap_duration,
+            timings.tap_duration,
+            "movement_tap",
+        ),
+        GameAction::RotateCw | GameAction::RotateCcw => fallback_aware_duration(
+            timings.rotate_tap_duration,
+            timings.tap_duration,
+            "rotate_tap",
+        ),
+        GameAction::Hold => {
+            fallback_aware_duration(timings.hold_tap_duration, timings.tap_duration, "hold_tap")
+        }
+        GameAction::SoftDrop => fallback_aware_duration(
+            timings.soft_drop_tap_duration,
+            timings.tap_duration,
+            "soft_drop_tap",
+        ),
+        GameAction::HardDrop => fallback_aware_duration(
+            timings.hard_drop_tap_duration,
+            timings.tap_duration,
+            "hard_drop_tap",
+        ),
+    }
+}
+
+fn action_delay_profile(action: GameAction, timings: ExecutionTimings) -> ActionDelayProfile {
+    match action {
+        GameAction::Left | GameAction::Right | GameAction::SoftDrop => {
+            let (duration, source) = fallback_aware_duration(
+                timings.movement_interval,
+                Duration::ZERO,
+                "movement_interval",
+            );
+            ActionDelayProfile {
+                duration,
+                label: "after_move_delay",
+                source,
+            }
+        }
+        GameAction::RotateCw | GameAction::RotateCcw => {
+            let (duration, source) = fallback_aware_duration(
+                timings.rotation_interval,
+                timings.movement_interval,
+                "rotation_interval",
+            );
+            ActionDelayProfile {
+                duration,
+                label: "after_rotate_delay",
+                source,
+            }
+        }
+        GameAction::Hold => {
+            let (duration, source) = fallback_aware_duration(
+                timings.piece_interval,
+                timings.rotation_interval,
+                "piece_interval",
+            );
+            ActionDelayProfile {
+                duration,
+                label: "after_hold_delay",
+                source,
+            }
+        }
+        GameAction::HardDrop => {
+            let (duration, source) = fallback_aware_duration(
+                timings.hard_drop_interval,
+                timings.piece_interval,
+                "hard_drop_interval",
+            );
+            ActionDelayProfile {
+                duration,
+                label: "after_hard_drop_delay",
+                source,
+            }
+        }
+    }
+}
+
+fn fallback_aware_duration(
+    specific: Duration,
+    fallback: Duration,
+    specific_source: &'static str,
+) -> (Duration, &'static str) {
+    if specific.is_zero() {
+        (fallback, "legacy_tap_fallback")
+    } else {
+        (specific, specific_source)
+    }
+}
+
+fn clamp_movement_tap_duration(requested_duration: Duration, das_duration: Duration) -> Duration {
+    let min_duration = Duration::from_millis(25);
+    let das_guard = Duration::from_millis(20);
+    let das_capped = das_duration.saturating_sub(das_guard).max(min_duration);
+    requested_duration.min(das_capped).max(min_duration)
+}
+
+fn log_movement_clamp<F>(
+    action: GameAction,
+    profile: ActionTapProfile,
+    handling: &HandlingConfig,
+    log: &mut F,
+) where
+    F: FnMut(String),
+{
+    if matches!(action, GameAction::Left | GameAction::Right)
+        && profile.actual_duration < profile.requested_duration
+    {
+        log(format!(
+            "[automation] movement tap clamped {}ms -> {}ms because das_ms={}",
+            profile.requested_duration.as_millis(),
+            profile.actual_duration.as_millis(),
+            handling.das_ms
+        ));
+    }
 }
 
 fn log_release<F>(log: &mut F, context: &str)
@@ -138,17 +352,6 @@ where
         context,
         unix_time_ms()
     ));
-}
-
-fn sleep_and_log<F>(log: &mut F, label: &str, duration: Duration)
-where
-    F: FnMut(String),
-{
-    if duration.is_zero() {
-        return;
-    }
-    log(format!("[automation] {} {}ms", label, duration.as_millis()));
-    thread::sleep(duration);
 }
 
 fn unix_time_ms() -> u128 {
@@ -167,8 +370,8 @@ struct InputKey {
 }
 
 #[cfg(windows)]
-pub struct WindowsSendInputDriver {
-    input_backend: InputBackendConfig,
+struct WindowsSendInputBackend {
+    use_scan_code: bool,
     left: InputKey,
     right: InputKey,
     rotate_cw: InputKey,
@@ -179,10 +382,10 @@ pub struct WindowsSendInputDriver {
 }
 
 #[cfg(windows)]
-impl WindowsSendInputDriver {
-    pub fn new(keys: &KeyBindings, input_backend: InputBackendConfig) -> Result<Self> {
+impl WindowsSendInputBackend {
+    fn new(keys: &KeyBindings, use_scan_code: bool) -> Result<Self> {
         Ok(Self {
-            input_backend,
+            use_scan_code,
             left: parse_key(&keys.left)?,
             right: parse_key(&keys.right)?,
             rotate_cw: parse_key(&keys.rotate_cw)?,
@@ -219,11 +422,10 @@ impl WindowsSendInputDriver {
             flags |= KEYEVENTF_EXTENDEDKEY;
         }
 
-        let (virtual_key, scan_code, flags) = match self.input_backend {
-            InputBackendConfig::VirtualKey => (VIRTUAL_KEY(key.virtual_key), 0, flags),
-            InputBackendConfig::ScanCode => {
-                (VIRTUAL_KEY(0), key.scan_code, flags | KEYEVENTF_SCANCODE)
-            }
+        let (virtual_key, scan_code, flags) = if self.use_scan_code {
+            (VIRTUAL_KEY(0), key.scan_code, flags | KEYEVENTF_SCANCODE)
+        } else {
+            (VIRTUAL_KEY(key.virtual_key), 0, flags)
         };
 
         let input = INPUT {
@@ -252,7 +454,7 @@ impl WindowsSendInputDriver {
 }
 
 #[cfg(windows)]
-impl InputDriver for WindowsSendInputDriver {
+impl InputBackend for WindowsSendInputBackend {
     fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()> {
         let key = self.key_for(action);
         self.send(key, false)?;
@@ -277,41 +479,194 @@ impl InputDriver for WindowsSendInputDriver {
 }
 
 #[cfg(not(windows))]
-pub struct WindowsSendInputDriver;
+struct WindowsSendInputBackend;
 
 #[cfg(not(windows))]
-impl WindowsSendInputDriver {
-    pub fn new(_: &KeyBindings, _: InputBackendConfig) -> Result<Self> {
-        bail!("WindowsSendInputDriver is only available on Windows")
+impl WindowsSendInputBackend {
+    fn new(_: &KeyBindings, _: bool) -> Result<Self> {
+        bail!("SendInput backends are only available on Windows")
     }
 }
 
 #[cfg(not(windows))]
-impl InputDriver for WindowsSendInputDriver {
+impl InputBackend for WindowsSendInputBackend {
     fn tap(&mut self, _: GameAction, _: Duration) -> Result<()> {
-        bail!("WindowsSendInputDriver is only available on Windows")
+        bail!("SendInput backends are only available on Windows")
     }
 
     fn release_all_keys(&mut self) -> Result<()> {
-        bail!("WindowsSendInputDriver is only available on Windows")
+        bail!("SendInput backends are only available on Windows")
     }
 }
 
-pub struct LoggingDriver;
+pub struct SendInputScanCodeBackend {
+    inner: WindowsSendInputBackend,
+}
 
-impl LoggingDriver {
+impl SendInputScanCodeBackend {
+    pub fn new(keys: &KeyBindings) -> Result<Self> {
+        Ok(Self {
+            inner: WindowsSendInputBackend::new(keys, true)?,
+        })
+    }
+}
+
+impl InputBackend for SendInputScanCodeBackend {
+    fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()> {
+        self.inner.tap(action, duration)
+    }
+
+    fn release_all_keys(&mut self) -> Result<()> {
+        self.inner.release_all_keys()
+    }
+}
+
+pub struct SendInputVirtualKeyBackend {
+    inner: WindowsSendInputBackend,
+}
+
+impl SendInputVirtualKeyBackend {
+    pub fn new(keys: &KeyBindings) -> Result<Self> {
+        Ok(Self {
+            inner: WindowsSendInputBackend::new(keys, false)?,
+        })
+    }
+}
+
+impl InputBackend for SendInputVirtualKeyBackend {
+    fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()> {
+        self.inner.tap(action, duration)
+    }
+
+    fn release_all_keys(&mut self) -> Result<()> {
+        self.inner.release_all_keys()
+    }
+}
+
+pub struct DebugLogBackend;
+
+impl DebugLogBackend {
     pub fn new() -> Self {
         Self
     }
 }
 
-impl InputDriver for LoggingDriver {
+impl InputBackend for DebugLogBackend {
     fn tap(&mut self, _: GameAction, _: Duration) -> Result<()> {
         Ok(())
     }
 
     fn release_all_keys(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+pub struct BrowserCdpInputBackend {
+    child: Child,
+    stdin: ChildStdin,
+}
+
+impl BrowserCdpInputBackend {
+    pub fn new(paths: &AppPaths, config: &AutomationConfig) -> Result<Self> {
+        let script = &paths.browser_input_script_path;
+        let mut command = Command::new(&config.browser.node_command);
+        command
+            .arg(script)
+            .arg("--port")
+            .arg(config.browser.cdp_port.to_string())
+            .arg("--url")
+            .arg(&config.browser.url)
+            .arg("--target")
+            .arg(&config.browser.target_hint)
+            .arg("--connect-only")
+            .arg("1")
+            .current_dir(&paths.workspace_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        if !config.browser.chrome_path.trim().is_empty() {
+            command.env("CHROME_PATH", &config.browser.chrome_path);
+        }
+
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to launch browser input helper with {} {}",
+                config.browser.node_command,
+                script.display()
+            )
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("browser input helper stdin was not available")?;
+        Ok(Self { child, stdin })
+    }
+
+    fn command_name_for(action: GameAction) -> &'static str {
+        match action {
+            GameAction::Left => "moveLeft",
+            GameAction::Right => "moveRight",
+            GameAction::RotateCw => "rotateCW",
+            GameAction::RotateCcw => "rotateCCW",
+            GameAction::Hold => "hold",
+            GameAction::SoftDrop => "softDrop",
+            GameAction::HardDrop => "hardDrop",
+        }
+    }
+
+    fn send_line(&mut self, line: &str) -> Result<()> {
+        self.stdin
+            .write_all(line.as_bytes())
+            .context("failed to write to browser input helper")?;
+        self.stdin
+            .write_all(b"\n")
+            .context("failed to write newline to browser input helper")?;
+        self.stdin
+            .flush()
+            .context("failed to flush browser input helper")
+    }
+}
+
+impl Drop for BrowserCdpInputBackend {
+    fn drop(&mut self) {
+        let _ = self.send_line(r#"{"type":"quit"}"#);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl InputBackend for BrowserCdpInputBackend {
+    fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()> {
+        let key = Self::command_name_for(action);
+        self.send_line(&format!(
+            r#"{{"type":"tap","key":"{key}","durationMs":{}}}"#,
+            duration.as_millis()
+        ))
+    }
+
+    fn release_all_keys(&mut self) -> Result<()> {
+        self.send_line(r#"{"type":"releaseAll"}"#)
+    }
+}
+
+#[allow(dead_code)]
+pub struct BrowserDomEventBackend;
+
+#[allow(dead_code)]
+impl BrowserDomEventBackend {
+    pub fn new_disabled() -> Result<Self> {
+        bail!("BrowserDomEventBackend is disabled for TETR.IO desktop")
+    }
+}
+
+impl InputBackend for BrowserDomEventBackend {
+    fn tap(&mut self, _: GameAction, _: Duration) -> Result<()> {
+        bail!("BrowserDomEventBackend is disabled for TETR.IO desktop")
+    }
+
+    fn release_all_keys(&mut self) -> Result<()> {
+        bail!("BrowserDomEventBackend is disabled for TETR.IO desktop")
     }
 }
 
@@ -322,15 +677,15 @@ mod tests {
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum RecordedEvent {
-        Tap(GameAction),
+        Tap(GameAction, Duration),
         ReleaseAll,
     }
 
-    struct RecordingDriver {
+    struct RecordingBackend {
         events: RefCell<Vec<RecordedEvent>>,
     }
 
-    impl RecordingDriver {
+    impl RecordingBackend {
         fn new() -> Self {
             Self {
                 events: RefCell::new(Vec::new()),
@@ -338,9 +693,11 @@ mod tests {
         }
     }
 
-    impl InputDriver for RecordingDriver {
-        fn tap(&mut self, action: GameAction, _duration: Duration) -> Result<()> {
-            self.events.borrow_mut().push(RecordedEvent::Tap(action));
+    impl InputBackend for RecordingBackend {
+        fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()> {
+            self.events
+                .borrow_mut()
+                .push(RecordedEvent::Tap(action, duration));
             Ok(())
         }
 
@@ -352,61 +709,153 @@ mod tests {
 
     fn timings() -> ExecutionTimings {
         ExecutionTimings {
-            tap_duration: Duration::from_millis(0),
-            settle_delay: Duration::from_millis(0),
-            pre_hard_drop_delay: Duration::from_millis(0),
-            post_hard_drop_delay: Duration::from_millis(0),
+            tap_duration: Duration::from_millis(60),
+            movement_tap_duration: Duration::from_millis(55),
+            rotate_tap_duration: Duration::from_millis(70),
+            hold_tap_duration: Duration::from_millis(70),
+            hard_drop_tap_duration: Duration::from_millis(80),
+            soft_drop_tap_duration: Duration::from_millis(55),
+            movement_interval: Duration::from_millis(60),
+            rotation_interval: Duration::from_millis(120),
+            piece_interval: Duration::from_millis(100),
+            hard_drop_interval: Duration::from_millis(100),
         }
     }
 
     #[test]
-    fn execute_plan_releases_keys_around_hold_and_hard_drop() {
-        let mut driver = RecordingDriver::new();
+    fn execute_plan_uses_action_specific_durations_and_releases_keys() {
+        let mut backend = RecordingBackend::new();
         let plan = ExecutionPlan {
             hold: true,
-            movement_actions: vec![GameAction::RotateCw, GameAction::Left],
+            movement_actions: vec![GameAction::RotateCw, GameAction::Left, GameAction::SoftDrop],
             hard_drop: true,
         };
+        let mut logs = Vec::new();
 
-        driver
-            .execute_plan(&plan, &HandlingConfig::default(), timings(), |_| {})
-            .unwrap();
+        execute_plan(
+            &mut backend,
+            &plan,
+            &HandlingConfig::default(),
+            timings(),
+            |line| logs.push(line),
+        )
+        .unwrap();
 
         assert_eq!(
-            &*driver.events.borrow(),
+            &*backend.events.borrow(),
             &[
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::Hold),
+                RecordedEvent::Tap(GameAction::Hold, Duration::from_millis(70)),
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::RotateCw),
-                RecordedEvent::Tap(GameAction::Left),
+                RecordedEvent::Tap(GameAction::RotateCw, Duration::from_millis(70)),
+                RecordedEvent::Tap(GameAction::Left, Duration::from_millis(55)),
+                RecordedEvent::Tap(GameAction::SoftDrop, Duration::from_millis(55)),
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::HardDrop),
+                RecordedEvent::Tap(GameAction::HardDrop, Duration::from_millis(80)),
                 RecordedEvent::ReleaseAll,
             ]
         );
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("release_all before_plan")));
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("after_rotate_delay 120ms")));
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("after_hard_drop_delay 100ms")));
     }
 
     #[test]
     fn execute_plan_keeps_hard_drop_last_and_separate() {
-        let mut driver = RecordingDriver::new();
+        let mut backend = RecordingBackend::new();
         let plan = ExecutionPlan {
             hold: false,
             movement_actions: vec![GameAction::RotateCw, GameAction::Left, GameAction::SoftDrop],
             hard_drop: true,
         };
 
-        driver
-            .execute_plan(&plan, &HandlingConfig::default(), timings(), |_| {})
-            .unwrap();
+        execute_plan(
+            &mut backend,
+            &plan,
+            &HandlingConfig::default(),
+            timings(),
+            |_| {},
+        )
+        .unwrap();
 
         assert_eq!(
-            driver.events.borrow().last(),
+            backend.events.borrow().last(),
             Some(&RecordedEvent::ReleaseAll)
         );
         assert_eq!(
-            driver.events.borrow()[driver.events.borrow().len() - 2],
-            RecordedEvent::Tap(GameAction::HardDrop)
+            backend.events.borrow()[backend.events.borrow().len() - 2],
+            RecordedEvent::Tap(GameAction::HardDrop, Duration::from_millis(80))
+        );
+    }
+
+    #[test]
+    fn duration_for_action_clamps_movement_to_das_guard_band() {
+        let handling = HandlingConfig {
+            das_ms: 97,
+            ..HandlingConfig::default()
+        };
+        let timings = ExecutionTimings {
+            movement_tap_duration: Duration::from_millis(90),
+            ..timings()
+        };
+
+        assert_eq!(
+            duration_for_action(GameAction::Left, &handling, timings),
+            Duration::from_millis(77)
+        );
+        assert_eq!(
+            duration_for_action(GameAction::Right, &handling, timings),
+            Duration::from_millis(77)
+        );
+    }
+
+    #[test]
+    fn duration_for_action_keeps_short_movement_above_minimum() {
+        let handling = HandlingConfig {
+            das_ms: 30,
+            ..HandlingConfig::default()
+        };
+        let timings = ExecutionTimings {
+            movement_tap_duration: Duration::from_millis(10),
+            ..timings()
+        };
+
+        assert_eq!(
+            duration_for_action(GameAction::Left, &handling, timings),
+            Duration::from_millis(25)
+        );
+    }
+
+    #[test]
+    fn duration_for_action_uses_action_specific_tap_values() {
+        let handling = HandlingConfig::default();
+        let timings = timings();
+
+        assert_eq!(
+            duration_for_action(GameAction::RotateCw, &handling, timings),
+            Duration::from_millis(70)
+        );
+        assert_eq!(
+            duration_for_action(GameAction::RotateCcw, &handling, timings),
+            Duration::from_millis(70)
+        );
+        assert_eq!(
+            duration_for_action(GameAction::Hold, &handling, timings),
+            Duration::from_millis(70)
+        );
+        assert_eq!(
+            duration_for_action(GameAction::SoftDrop, &handling, timings),
+            Duration::from_millis(55)
+        );
+        assert_eq!(
+            duration_for_action(GameAction::HardDrop, &handling, timings),
+            Duration::from_millis(80)
         );
     }
 }

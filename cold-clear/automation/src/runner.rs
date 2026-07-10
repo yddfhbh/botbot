@@ -9,17 +9,18 @@ use anyhow::{Context, Result};
 use cold_clear::evaluation::Standard;
 use cold_clear::Interface;
 use libtetris::{
-    find_moves, Board, FallingPiece, Move, MovementMode, Piece, PieceMovement, Placement, SpawnRule,
+    find_moves, Board, FallingPiece, Move, MovementMode, Piece, PieceMovement, Placement,
+    RotationState, SpawnRule,
 };
 
 use crate::config::{
     AutomationConfig, HandlingConfig, MovementModeConfig, SoftDropModeConfig, SpawnRuleConfig,
 };
-use crate::driver::{ExecutionPlan, ExecutionTimings, GameAction, InputDriver};
+use crate::driver::{execute_plan, ExecutionPlan, ExecutionTimings, GameAction, InputBackend};
 use crate::scanner::{GameSnapshot, PieceToken, SnapshotScanner};
 
 #[allow(dead_code)]
-pub fn run_loop<S: SnapshotScanner, D: InputDriver>(
+pub fn run_loop<S: SnapshotScanner, D: InputBackend + ?Sized>(
     config: &AutomationConfig,
     scanner: &mut S,
     driver: &mut D,
@@ -39,51 +40,153 @@ pub fn run_loop_until<S, D, F>(
 ) -> Result<()>
 where
     S: SnapshotScanner,
-    D: InputDriver,
+    D: InputBackend + ?Sized,
     F: FnMut(String),
 {
     let poll_delay = Duration::from_millis(config.poll_interval_ms);
-    let post_move_cooldown = Duration::from_millis(config.post_move_cooldown_ms);
+    let piece_interval = Duration::from_millis(config.piece_interval_ms);
+    let mut last_piece_counter = None;
     let execution_timings = ExecutionTimings {
         tap_duration: Duration::from_millis(config.tap_duration_ms),
-        settle_delay: Duration::from_millis(config.settle_delay_ms),
-        pre_hard_drop_delay: Duration::from_millis(config.pre_hard_drop_delay_ms),
-        post_hard_drop_delay: Duration::from_millis(config.post_hard_drop_delay_ms),
+        movement_tap_duration: Duration::from_millis(config.movement_tap_duration_ms),
+        rotate_tap_duration: Duration::from_millis(config.rotate_tap_duration_ms),
+        hold_tap_duration: Duration::from_millis(config.hold_tap_duration_ms),
+        hard_drop_tap_duration: Duration::from_millis(config.hard_drop_tap_duration_ms),
+        soft_drop_tap_duration: Duration::from_millis(config.soft_drop_tap_duration_ms),
+        movement_interval: Duration::from_millis(config.movement_interval_ms),
+        rotation_interval: Duration::from_millis(config.rotation_interval_ms),
+        piece_interval,
+        hard_drop_interval: Duration::from_millis(config.hard_drop_interval_ms),
     };
+    let mut buffered_snapshot = None;
 
     loop {
         if stop.load(AtomicOrdering::Relaxed) {
             return Ok(());
         }
-        match scanner.next_snapshot()? {
-            Some(snapshot) => match prepare_execution(config, &snapshot, &mut log)? {
-                Some(prepared) => {
-                    emit_move_logs(&snapshot, &prepared, &mut log);
-                    driver
-                        .execute_plan(
+        let snapshot_option = if let Some(snapshot) = buffered_snapshot.take() {
+            Some(snapshot)
+        } else {
+            scanner.next_snapshot()?
+        };
+        match snapshot_option {
+            Some(snapshot) => {
+                if let (Some(current), Some(previous)) =
+                    (snapshot.piece_counter, last_piece_counter)
+                {
+                    if current < previous {
+                        last_piece_counter = None;
+                    }
+                }
+                if let Some(reason) = skip_snapshot_reason(&snapshot, last_piece_counter) {
+                    log(format!(
+                        "[automation] source={} token={} skip because {}",
+                        snapshot.source, snapshot.token, reason
+                    ));
+                    thread::sleep(poll_delay);
+                    continue;
+                }
+                match prepare_execution(config, &snapshot, &mut log)? {
+                    Some(prepared) => {
+                        emit_move_logs(&snapshot, &prepared, &mut log);
+                        execute_plan(
+                            driver,
                             &prepared.execution_plan,
                             &config.handling,
                             execution_timings,
                             |line| log(line),
                         )
                         .context("failed to execute bot move")?;
-                    if !post_move_cooldown.is_zero() {
-                        log(format!(
-                            "[automation] cooldown {}ms",
-                            post_move_cooldown.as_millis()
-                        ));
-                        thread::sleep(post_move_cooldown);
+                        if snapshot.piece_counter.is_some() {
+                            last_piece_counter = snapshot.piece_counter;
+                        }
+                        if prepared.execution_plan.hard_drop {
+                            buffered_snapshot = wait_for_next_piece_snapshot(
+                                scanner,
+                                &snapshot,
+                                stop,
+                                poll_delay,
+                                piece_interval,
+                                &mut log,
+                            )?;
+                            if buffered_snapshot.is_none() && stop.load(AtomicOrdering::Relaxed) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    None => {
+                        thread::sleep(poll_delay);
                     }
                 }
-                None => {
-                    thread::sleep(poll_delay);
-                }
-            },
+            }
             None => {
                 thread::sleep(poll_delay);
             }
         }
     }
+}
+
+fn wait_for_next_piece_snapshot<S, F>(
+    scanner: &mut S,
+    previous_snapshot: &GameSnapshot,
+    stop: &AtomicBool,
+    poll_delay: Duration,
+    piece_interval: Duration,
+    log: &mut F,
+) -> Result<Option<GameSnapshot>>
+where
+    S: SnapshotScanner,
+    F: FnMut(String),
+{
+    scanner.arm_piece_transition(previous_snapshot);
+    log(format!(
+        "[automation] waiting_for_piece_transition token={} queue={}",
+        previous_snapshot.token,
+        queue_labels(&previous_snapshot.queue)
+    ));
+
+    loop {
+        if stop.load(AtomicOrdering::Relaxed) {
+            return Ok(None);
+        }
+        match scanner.next_snapshot()? {
+            Some(snapshot) => {
+                if !piece_interval.is_zero() {
+                    log(format!(
+                        "[automation] piece_interval {}ms before next token={}",
+                        piece_interval.as_millis(),
+                        snapshot.token
+                    ));
+                    thread::sleep(piece_interval);
+                }
+                log(format!(
+                    "[automation] next_piece_ready token={} queue={}",
+                    snapshot.token,
+                    queue_labels(&snapshot.queue)
+                ));
+                return Ok(Some(snapshot));
+            }
+            None => thread::sleep(poll_delay),
+        }
+    }
+}
+
+fn skip_snapshot_reason(
+    snapshot: &GameSnapshot,
+    last_piece_counter: Option<u32>,
+) -> Option<String> {
+    if !snapshot.playing {
+        return Some("playing=false".to_owned());
+    }
+    if snapshot.countdown {
+        return Some("countdown=true".to_owned());
+    }
+    if let (Some(current), Some(previous)) = (snapshot.piece_counter, last_piece_counter) {
+        if current == previous {
+            return Some(format!("duplicate pieceCounter={current}"));
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -237,7 +340,8 @@ where
         .unwrap_or_default();
 
     log(format!(
-        "[automation] token={} piece={} hold={} mode={} spawn={}{fallback_suffix}",
+        "[automation] source={} token={} piece={} hold={} mode={} spawn={}{fallback_suffix}",
+        snapshot.source,
         snapshot.token,
         active_piece,
         hold_piece,
@@ -273,6 +377,14 @@ fn route_actions_with_hard_drop(plan: &ExecutionPlan) -> Vec<GameAction> {
     actions
 }
 
+fn queue_labels(queue: &[PieceToken]) -> String {
+    queue
+        .iter()
+        .map(|piece| piece.label())
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 fn movement_mode_label(mode: MovementModeConfig) -> &'static str {
     match mode {
         MovementModeConfig::ZeroG => "ZeroG",
@@ -290,6 +402,7 @@ fn spawn_rule_label(rule: SpawnRuleConfig) -> &'static str {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn plan_move(config: &AutomationConfig, snapshot: &GameSnapshot) -> Result<(Move, &'static str)> {
     let movement_mode = config.bot.movement_mode;
     let planned_move = plan_move_for_mode(config, snapshot, movement_mode)?;
@@ -363,13 +476,17 @@ fn build_execution_plan(
         execution_piece(snapshot, planned_move.hold).map_err(BuildExecutionError::Fatal)?;
     let spawned = spawn_for_execution(&board, active_piece, config.bot.spawn_rule)
         .map_err(BuildExecutionError::Fatal)?;
-    let route_selection = placement_actions_for_target(
-        &board,
-        spawned,
-        planned_move.expected_location,
-        movement_mode_for_routes(movement_mode),
-        &config.handling,
-    )
+    let route_selection = if movement_mode == MovementModeConfig::HardDropOnly {
+        safe_spawn_tap_route(&board, spawned, planned_move.expected_location)
+    } else {
+        placement_actions_for_target(
+            &board,
+            spawned,
+            planned_move.expected_location,
+            movement_mode_for_routes(movement_mode),
+            &config.handling,
+        )
+    }
     .map_err(BuildExecutionError::NoSafeRoute)?;
 
     Ok(ExecutionPlanBuildResult {
@@ -390,6 +507,118 @@ fn board_from_snapshot(snapshot: &GameSnapshot) -> Result<Board> {
         snapshot.b2b,
         snapshot.combo,
     ))
+}
+
+fn safe_spawn_tap_route(
+    board: &Board,
+    spawned: FallingPiece,
+    target: FallingPiece,
+) -> std::result::Result<RouteSelection, RouteSelectionFailure> {
+    let target = target.canonical();
+    let (mut movement_actions, rotated_piece) = apply_safe_rotations(board, spawned, target)?;
+    let (shift_actions, shifted_piece) = apply_safe_horizontal_taps(board, rotated_piece, target)?;
+    movement_actions.extend(shift_actions);
+
+    let mut locked_piece = shifted_piece;
+    locked_piece.sonic_drop(board);
+    if !locked_piece.same_location(&target) {
+        return Err(RouteSelectionFailure {
+            candidate_count: 1,
+            rejected_count: 1,
+            representative_reject_reason: Some(format!(
+                "spawn_tap_route_misses_target {:?} -> {:?}",
+                locked_piece.canonical(),
+                target
+            )),
+        });
+    }
+
+    Ok(RouteSelection {
+        route_kind: "SpawnTapCountSafe",
+        movement_actions,
+        candidate_count: 1,
+        rejected_count: 0,
+        representative_reject_reason: None,
+    })
+}
+
+fn apply_safe_rotations(
+    board: &Board,
+    mut piece: FallingPiece,
+    target: FallingPiece,
+) -> std::result::Result<(Vec<GameAction>, FallingPiece), RouteSelectionFailure> {
+    let actions = safe_rotation_actions(target.kind.1);
+    for action in &actions {
+        let rotated = match action {
+            GameAction::RotateCw => piece.cw(board),
+            GameAction::RotateCcw => piece.ccw(board),
+            _ => unreachable!("safe rotation plan only emits rotate actions"),
+        };
+        if !rotated {
+            return Err(RouteSelectionFailure {
+                candidate_count: 1,
+                rejected_count: 1,
+                representative_reject_reason: Some(format!(
+                    "spawn_rotation_failed target_rotation={:?}",
+                    target.kind.1
+                )),
+            });
+        }
+    }
+    if piece.canonical().kind.1 != target.kind.1 {
+        return Err(RouteSelectionFailure {
+            candidate_count: 1,
+            rejected_count: 1,
+            representative_reject_reason: Some(format!(
+                "spawn_rotation_ended_at_unexpected_orientation {:?} -> {:?}",
+                piece.canonical().kind.1,
+                target.kind.1
+            )),
+        });
+    }
+    Ok((actions, piece))
+}
+
+fn apply_safe_horizontal_taps(
+    board: &Board,
+    mut piece: FallingPiece,
+    target: FallingPiece,
+) -> std::result::Result<(Vec<GameAction>, FallingPiece), RouteSelectionFailure> {
+    let delta = target.x - piece.canonical().x;
+    let action = if delta < 0 {
+        GameAction::Left
+    } else {
+        GameAction::Right
+    };
+    let mut actions = Vec::new();
+    for _ in 0..delta.abs() {
+        let shifted = match action {
+            GameAction::Left => piece.shift(board, -1, 0),
+            GameAction::Right => piece.shift(board, 1, 0),
+            _ => unreachable!("safe horizontal plan only emits left/right actions"),
+        };
+        if !shifted {
+            return Err(RouteSelectionFailure {
+                candidate_count: 1,
+                rejected_count: 1,
+                representative_reject_reason: Some(format!(
+                    "spawn_horizontal_tap_blocked delta={} target_x={}",
+                    delta, target.x
+                )),
+            });
+        }
+        actions.push(action);
+    }
+    Ok((actions, piece))
+}
+
+fn safe_rotation_actions(rotation: RotationState) -> Vec<GameAction> {
+    match rotation {
+        RotationState::North => Vec::new(),
+        RotationState::East => vec![GameAction::RotateCw],
+        RotationState::South => vec![GameAction::RotateCw, GameAction::RotateCw],
+        RotationState::West => vec![GameAction::RotateCcw],
+    }
 }
 
 fn execution_piece(snapshot: &GameSnapshot, use_hold: bool) -> Result<Piece> {
@@ -640,6 +869,7 @@ mod tests {
     #[test]
     fn plan_move_requires_queue() {
         let snapshot = GameSnapshot {
+            source: "test".to_owned(),
             token: "t0".to_owned(),
             field: vec![[false; 10]; 40],
             queue: vec![],
@@ -647,6 +877,9 @@ mod tests {
             combo: 0,
             b2b: false,
             incoming: 0,
+            piece_counter: None,
+            playing: true,
+            countdown: false,
         };
         let result = plan_move(&AutomationConfig::default(), &snapshot);
         assert!(result.is_err());
@@ -655,6 +888,7 @@ mod tests {
     #[test]
     fn plan_move_works_for_a_basic_queue() {
         let snapshot = GameSnapshot {
+            source: "test".to_owned(),
             token: "t1".to_owned(),
             field: vec![[false; 10]; 40],
             queue: vec![PieceToken::I, PieceToken::O, PieceToken::T, PieceToken::L],
@@ -662,6 +896,9 @@ mod tests {
             combo: 0,
             b2b: false,
             incoming: 0,
+            piece_counter: None,
+            playing: true,
+            countdown: false,
         };
         let (result, _mode) = plan_move(&AutomationConfig::default(), &snapshot).unwrap();
         assert!(!result.inputs.is_empty() || result.hold);
@@ -670,6 +907,7 @@ mod tests {
     #[test]
     fn execution_plan_uses_libtetris_route_for_simple_drop() {
         let snapshot = GameSnapshot {
+            source: "test".to_owned(),
             token: "t2".to_owned(),
             field: vec![[false; 10]; 40],
             queue: vec![PieceToken::J, PieceToken::O, PieceToken::T, PieceToken::L],
@@ -677,6 +915,9 @@ mod tests {
             combo: 0,
             b2b: false,
             incoming: 0,
+            piece_counter: None,
+            playing: true,
+            countdown: false,
         };
         let config = AutomationConfig::default();
         let planned_move = Move {
@@ -700,6 +941,51 @@ mod tests {
 
         assert_eq!(plan.execution_plan.movement_actions, vec![GameAction::Left]);
         assert!(plan.execution_plan.hard_drop);
+        assert_eq!(plan.route_selection.route_kind, "SpawnTapCountSafe");
+    }
+
+    #[test]
+    fn hard_drop_only_safe_executor_uses_spawn_rotations_then_taps() {
+        let snapshot = GameSnapshot {
+            source: "test".to_owned(),
+            token: "t3".to_owned(),
+            field: vec![[false; 10]; 40],
+            queue: vec![PieceToken::T, PieceToken::O, PieceToken::I, PieceToken::L],
+            hold: None,
+            combo: 0,
+            b2b: false,
+            incoming: 0,
+            piece_counter: None,
+            playing: true,
+            countdown: false,
+        };
+        let config = AutomationConfig::default();
+        let board = board_from_snapshot(&snapshot).unwrap();
+        let mut target = spawn_for_execution(&board, Piece::T, SpawnRuleConfig::Row19Or20).unwrap();
+        assert!(target.cw(&board));
+        assert!(target.cw(&board));
+        assert!(target.shift(&board, -1, 0));
+        assert!(target.sonic_drop(&board));
+
+        let planned_move = Move {
+            inputs: Default::default(),
+            expected_location: target,
+            hold: false,
+        };
+
+        let plan = build_execution_plan(
+            &config,
+            &snapshot,
+            &planned_move,
+            MovementModeConfig::HardDropOnly,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.execution_plan.movement_actions,
+            vec![GameAction::RotateCw, GameAction::RotateCw, GameAction::Left]
+        );
+        assert_eq!(plan.route_selection.route_kind, "SpawnTapCountSafe");
     }
 
     #[test]
@@ -735,6 +1021,56 @@ mod tests {
         assert_eq!(
             compare_route_candidates(&no_soft_drop, &soft_drop_tail),
             Ordering::Less
+        );
+    }
+
+    #[test]
+    fn skip_snapshot_reason_blocks_duplicate_piece_counter() {
+        let snapshot = GameSnapshot {
+            source: "browser_cdp".to_owned(),
+            token: "browser-12-repeat".to_owned(),
+            field: vec![[false; 10]; 40],
+            queue: vec![PieceToken::T, PieceToken::I, PieceToken::O],
+            hold: None,
+            combo: 0,
+            b2b: false,
+            incoming: 0,
+            piece_counter: Some(12),
+            playing: true,
+            countdown: false,
+        };
+
+        assert_eq!(
+            skip_snapshot_reason(&snapshot, Some(12)).as_deref(),
+            Some("duplicate pieceCounter=12")
+        );
+    }
+
+    #[test]
+    fn skip_snapshot_reason_blocks_non_playing_or_countdown_states() {
+        let mut snapshot = GameSnapshot {
+            source: "browser_cdp".to_owned(),
+            token: "browser-3".to_owned(),
+            field: vec![[false; 10]; 40],
+            queue: vec![PieceToken::T, PieceToken::I, PieceToken::O],
+            hold: None,
+            combo: 0,
+            b2b: false,
+            incoming: 0,
+            piece_counter: Some(3),
+            playing: false,
+            countdown: false,
+        };
+        assert_eq!(
+            skip_snapshot_reason(&snapshot, None).as_deref(),
+            Some("playing=false")
+        );
+
+        snapshot.playing = true;
+        snapshot.countdown = true;
+        assert_eq!(
+            skip_snapshot_reason(&snapshot, None).as_deref(),
+            Some("countdown=true")
         );
     }
 }
