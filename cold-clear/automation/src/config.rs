@@ -49,7 +49,7 @@ impl Default for AutomationConfig {
             piece_interval_ms: 60,
             hard_drop_interval_ms: 40,
             min_snapshot_age_ms: 30,
-            input_backend: InputBackendConfig::BrowserCdp,
+            input_backend: InputBackendConfig::ScanCode,
             browser: BrowserCdpConfig::default(),
             bot: BotConfig::default(),
             handling: HandlingConfig::default(),
@@ -293,6 +293,7 @@ mod tests {
         let config = AutomationConfig::default();
 
         assert_eq!(config.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
+        assert_eq!(config.input_backend, InputBackendConfig::ScanCode);
     }
 
     #[test]

@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     AutomationConfig, BotConfig, BrowserCdpConfig, BufferModeConfig, DebuggerProbeMode,
-    HandlingConfig, InputFocusMode, KeyBindings, MovementModeConfig, PlayerSelectorConfig,
-    RibbonDecodeMode, SnapshotProviderConfig, SoftDropModeConfig, SpawnRuleConfig,
+    HandlingConfig, InputBackendConfig, InputFocusMode, KeyBindings, MovementModeConfig,
+    PlayerSelectorConfig, RibbonDecodeMode, SnapshotProviderConfig, SoftDropModeConfig,
+    SpawnRuleConfig,
 };
 use crate::driver::create_input_backend;
 use crate::paths::AppPaths;
@@ -47,6 +48,7 @@ struct LauncherState {
     dry_run: bool,
     poll_interval_ms: u64,
     perf_log_enabled: bool,
+    input_backend: InputBackendConfig,
     target_pps: f32,
     tap_duration_ms: u64,
     movement_tap_duration_ms: u64,
@@ -75,6 +77,7 @@ impl Default for LauncherState {
             dry_run: true,
             poll_interval_ms: 20,
             perf_log_enabled: true,
+            input_backend: InputBackendConfig::ScanCode,
             target_pps: 1.2,
             tap_duration_ms: 60,
             movement_tap_duration_ms: 20,
@@ -112,6 +115,7 @@ pub fn launcher_viewport(paths: &AppPaths) -> egui::ViewportBuilder {
 impl LauncherState {
     fn apply_tetrio_safe_preset(&mut self) {
         self.snapshot_provider = SnapshotProviderConfig::BrowserCdp;
+        self.input_backend = InputBackendConfig::ScanCode;
         self.target_pps = 1.2;
         self.tap_duration_ms = 60;
         self.poll_interval_ms = 20;
@@ -297,7 +301,7 @@ impl LauncherState {
             piece_interval_ms: self.piece_interval_ms,
             hard_drop_interval_ms: self.hard_drop_interval_ms,
             min_snapshot_age_ms: self.min_snapshot_age_ms,
-            input_backend: crate::config::InputBackendConfig::BrowserCdp,
+            input_backend: self.input_backend,
             browser: self.browser.clone(),
             bot: self.bot.clone(),
             handling: self.handling.clone(),
@@ -857,7 +861,21 @@ impl eframe::App for LauncherApp {
                     "Allow post-softdrop horizontal",
                 );
                 ui.label("Input");
-                ui.monospace("Browser CDP");
+                egui::ComboBox::from_id_salt("input_backend")
+                    .selected_text(input_backend_label(self.state.input_backend))
+                    .show_ui(ui, |ui| {
+                        for backend in [
+                            InputBackendConfig::ScanCode,
+                            InputBackendConfig::VirtualKey,
+                            InputBackendConfig::BrowserCdp,
+                        ] {
+                            ui.selectable_value(
+                                &mut self.state.input_backend,
+                                backend,
+                                input_backend_label(backend),
+                            );
+                        }
+                    });
             });
             ui.horizontal(|ui| {
                 if ui.button("Stable").clicked() {
@@ -1115,6 +1133,14 @@ fn input_focus_mode_label(mode: InputFocusMode) -> &'static str {
     }
 }
 
+fn input_backend_label(backend: InputBackendConfig) -> &'static str {
+    match backend {
+        InputBackendConfig::ScanCode => "Scan Code",
+        InputBackendConfig::VirtualKey => "Virtual Key",
+        InputBackendConfig::BrowserCdp => "Browser CDP",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1126,6 +1152,7 @@ mod tests {
         state.apply_preset();
 
         assert_eq!(state.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
+        assert_eq!(state.input_backend, InputBackendConfig::ScanCode);
         assert_eq!(state.bot.movement_mode, MovementModeConfig::ZeroGSafe);
         assert_eq!(state.bot.spawn_rule, SpawnRuleConfig::Row19Or20);
         assert_eq!(state.target_pps, 1.2);
@@ -1226,6 +1253,7 @@ mod tests {
         assert_eq!(state.bot.threads, 1);
         assert_eq!(state.bot.min_nodes, 0);
         assert_eq!(state.bot.max_nodes, 100_000);
+        assert_eq!(state.input_backend, InputBackendConfig::ScanCode);
         assert_eq!(state.handling.action_settle_ms, 0);
         assert!(!state.handling.release_after_each_action);
     }

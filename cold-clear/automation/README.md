@@ -1,11 +1,12 @@
 # Automation Bridge
 
-This crate turns the Cold Clear planner into a Browser CDP driven TETR.IO automation runner.
+This crate turns the Cold Clear planner into a Browser CDP snapshot driven TETR.IO automation runner.
 
-- Browser CDP mode is the recommended mode for TETR.IO solo/custom practice.
+- Browser CDP snapshot mode is the recommended way to read TETR.IO state.
 - `WebSocket Seed` is an experimental VS room snapshot provider that only reconstructs `current` / `queue`.
 - Screen scanner support has been removed from the launcher and runtime flow.
-- Browser mode avoids color recognition errors and many Windows foreground `SendInput` issues.
+- `Scan Code` is the default input backend on Windows because it avoids Browser CDP input stalls while keeping CDP state reads.
+- `Browser CDP` input remains available when foreground `SendInput` is unreliable.
 - Use only in private/solo/custom practice, not public matchmaking.
 
 ## What It Does
@@ -23,11 +24,11 @@ cargo run -p automation -- automation/config.example.json
 ```
 
 ```powershell
-cargo run -p automation -- --input-backend browser_cdp --cdp-port 9222 --url https://tetr.io/ --target TETR.IO
+cargo run -p automation -- --input-backend scan_code --cdp-port 9222 --url https://tetr.io/ --target TETR.IO
 ```
 
 ```powershell
-cargo run -p automation -- --snapshot-provider websocket_seed --input-backend browser_cdp --cdp-port 9222 --url https://tetr.io/ --target TETR.IO
+cargo run -p automation -- --snapshot-provider websocket_seed --input-backend scan_code --cdp-port 9222 --url https://tetr.io/ --target TETR.IO
 ```
 
 `dry_run: true` leaves the keyboard untouched and only prints planned actions.
@@ -42,6 +43,7 @@ Running without arguments opens the launcher.
 
 - choose `2P Left 1080p`, `Solo 1080p`, or `Custom`
 - choose `Browser CDP Direct`, `WebSocket Seed`, or `File`
+- choose `Scan Code`, `Virtual Key`, or `Browser CDP` for input
 - set snapshot path, Chrome path, CDP port, URL, and target hint
 - choose `Player` selector plus optional nickname / user id when using VS rooms
 - tune `Browser state poll ms`, `Debugger probe mode`, `Ribbon decode mode`, `Input focus mode`, planner limits, and `Perf log`
@@ -53,7 +55,7 @@ Running without arguments opens the launcher.
 The default preset now favors stability over raw throughput.
 
 - `Snapshot provider`: `Browser CDP Direct`
-- `Input backend`: `Browser CDP`
+- `Input backend`: `Scan Code`
 - `Movement`: `ZeroG Safe`
 - `Spawn`: `Row 19 or 20`
 - `Target PPS`: `1.2`
@@ -98,6 +100,7 @@ The default preset now favors stability over raw throughput.
 - Browser CDP `Runtime.evaluate` usually only needs to run every `30-60ms`.
 - `Poll 2ms` is for debug / benchmark use only, not a recommended default.
 - When performance is bad, start testing from `threads=1` and `max_nodes=100000`.
+- If `cdp_eval_ms` spikes and `input_ms` jumps together, keep the snapshot provider on `Browser CDP Direct` and switch only the input backend to `Scan Code` first.
 
 ## Browser CDP Mode
 
