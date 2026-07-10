@@ -240,6 +240,7 @@ struct RouteSelectionFailure {
     candidate_count: usize,
     rejected_count: usize,
     representative_reject_reason: Option<String>,
+    rejected_route_samples: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -312,8 +313,25 @@ where
                     .as_deref()
                     .unwrap_or("unknown")
             ));
+            if !failure.rejected_route_samples.is_empty() {
+                log(format!(
+                    "[automation] token={} reject_samples={}",
+                    snapshot.token,
+                    failure.rejected_route_samples.join(" | ")
+                ));
+            }
 
             let fallback_mode = MovementModeConfig::HardDropOnly;
+            log(format!(
+                "[automation] HARD_DROP_ONLY_FALLBACK token={} from={} to={} reason={}",
+                snapshot.token,
+                movement_mode_label(config.bot.movement_mode),
+                movement_mode_label(fallback_mode),
+                failure
+                    .representative_reject_reason
+                    .as_deref()
+                    .unwrap_or("unknown")
+            ));
             let Some((fallback_move, fallback_info)) =
                 plan_move_for_mode(config, snapshot, fallback_mode)?
             else {
@@ -364,6 +382,13 @@ fn log_route_skip<F>(
             .as_deref()
             .unwrap_or("unknown")
     ));
+    if !failure.rejected_route_samples.is_empty() {
+        log(format!(
+            "[automation] token={} reject_samples={}",
+            snapshot.token,
+            failure.rejected_route_samples.join(" | ")
+        ));
+    }
 }
 
 fn emit_move_logs<F>(snapshot: &GameSnapshot, prepared: &PreparedExecution, log: &mut F)
@@ -589,6 +614,7 @@ fn safe_spawn_tap_route(
                 locked_piece.canonical(),
                 target
             )),
+            rejected_route_samples: vec![],
         });
     }
 
@@ -621,6 +647,7 @@ fn apply_safe_rotations(
                     "spawn_rotation_failed target_rotation={:?}",
                     target.kind.1
                 )),
+                rejected_route_samples: vec![],
             });
         }
     }
@@ -633,6 +660,7 @@ fn apply_safe_rotations(
                 piece.canonical().kind.1,
                 target.kind.1
             )),
+            rejected_route_samples: vec![],
         });
     }
     Ok((actions, piece))
@@ -664,6 +692,7 @@ fn apply_safe_horizontal_taps(
                     "spawn_horizontal_tap_blocked delta={} target_x={}",
                     delta, target.x
                 )),
+                rejected_route_samples: vec![],
             });
         }
         actions.push(action);
@@ -740,15 +769,26 @@ fn placement_actions_for_target(
                 "no_route_to_target {:?} -> {:?}",
                 spawned, target
             )),
+            rejected_route_samples: vec![],
         });
     }
 
     let mut rejected_reasons = Vec::new();
+    let mut rejected_route_samples = Vec::new();
     let mut candidates = Vec::new();
     for placement in placements.iter() {
         match candidate_route_from_movements(&placement.inputs.movements, handling) {
             Ok(candidate) => candidates.push(candidate),
-            Err(reason) => rejected_reasons.push(reason),
+            Err(reason) => {
+                if rejected_route_samples.len() < 4 {
+                    rejected_route_samples.push(format!(
+                        "{} route={}",
+                        reason,
+                        format_piece_movements(&placement.inputs.movements)
+                    ));
+                }
+                rejected_reasons.push(reason);
+            }
         }
     }
 
@@ -757,6 +797,7 @@ fn placement_actions_for_target(
             candidate_count: placements.len(),
             rejected_count: rejected_reasons.len(),
             representative_reject_reason: summarize_reject_reasons(&rejected_reasons),
+            rejected_route_samples,
         });
     }
 
@@ -804,6 +845,11 @@ fn candidate_route_from_movements(
         .map(game_action_from_piece_movement)
         .collect::<Vec<_>>();
     let has_soft_drop = movements.contains(&PieceMovement::SonicDrop);
+    let has_post_softdrop_actions = movements
+        .iter()
+        .position(|movement| *movement == PieceMovement::SonicDrop)
+        .map(|index| index + 1 < movements.len())
+        .unwrap_or(false);
     let soft_drop_count = movements
         .iter()
         .filter(|movement| **movement == PieceMovement::SonicDrop)
@@ -829,7 +875,9 @@ fn candidate_route_from_movements(
 
     Ok(CandidateRoute {
         score,
-        route_kind: if has_soft_drop {
+        route_kind: if has_post_softdrop_actions {
+            "SoftDropSpinRoute"
+        } else if has_soft_drop {
             "SoftDropTail"
         } else {
             "NoSoftDrop"
@@ -846,17 +894,54 @@ fn validate_route(
         .iter()
         .position(|movement| *movement == PieceMovement::SonicDrop)
     {
-        if handling.soft_drop_mode == SoftDropModeConfig::Infinite {
+        let trailing_actions = &movements[first_soft_drop_index + 1..];
+        let has_post_softdrop_actions = !trailing_actions.is_empty();
+        let trailing_actions_are_spin_safe = trailing_actions
+            .iter()
+            .all(|movement| is_allowed_post_softdrop_movement(*movement));
+
+        if handling.soft_drop_mode == SoftDropModeConfig::Infinite
+            && !(handling.allow_post_softdrop_actions
+                && has_post_softdrop_actions
+                && trailing_actions_are_spin_safe)
+        {
             return Err("soft_drop_blocked_for_infinite_sdf".to_owned());
         }
-        if movements[first_soft_drop_index..]
-            .iter()
-            .any(|movement| *movement != PieceMovement::SonicDrop)
+        if has_post_softdrop_actions
+            && !(handling.allow_post_softdrop_actions && trailing_actions_are_spin_safe)
         {
-            return Err("soft_drop_must_be_terminal".to_owned());
+            return Err(format!(
+                "soft_drop_post_actions_blocked actions={}",
+                format_piece_movements(trailing_actions)
+            ));
         }
     }
     Ok(())
+}
+
+fn is_allowed_post_softdrop_movement(movement: PieceMovement) -> bool {
+    matches!(
+        movement,
+        PieceMovement::Left
+            | PieceMovement::Right
+            | PieceMovement::Cw
+            | PieceMovement::Ccw
+            | PieceMovement::SonicDrop
+    )
+}
+
+fn format_piece_movements(movements: &[PieceMovement]) -> String {
+    movements
+        .iter()
+        .map(|movement| match movement {
+            PieceMovement::Left => "Left",
+            PieceMovement::Right => "Right",
+            PieceMovement::Cw => "RotateCw",
+            PieceMovement::Ccw => "RotateCcw",
+            PieceMovement::SonicDrop => "SoftDrop",
+        })
+        .collect::<Vec<_>>()
+        .join(">")
 }
 
 fn count_direction_changes(movements: &[PieceMovement]) -> usize {
@@ -1057,6 +1142,52 @@ mod tests {
         assert_eq!(
             result.unwrap_err(),
             "soft_drop_blocked_for_infinite_sdf".to_owned()
+        );
+    }
+
+    #[test]
+    fn spin_routes_can_be_allowed_after_soft_drop() {
+        let handling = HandlingConfig {
+            allow_post_softdrop_actions: true,
+            ..HandlingConfig::default()
+        };
+        let route = candidate_route_from_movements(
+            &[
+                PieceMovement::Left,
+                PieceMovement::SonicDrop,
+                PieceMovement::Cw,
+                PieceMovement::Right,
+            ],
+            &handling,
+        )
+        .unwrap();
+
+        assert_eq!(
+            route.movement_actions,
+            vec![
+                GameAction::Left,
+                GameAction::SoftDrop,
+                GameAction::RotateCw,
+                GameAction::Right,
+            ]
+        );
+        assert_eq!(route.route_kind, "SoftDropSpinRoute");
+    }
+
+    #[test]
+    fn post_softdrop_actions_stay_blocked_in_safe_mode() {
+        let handling = HandlingConfig {
+            soft_drop_mode: SoftDropModeConfig::Step,
+            ..HandlingConfig::default()
+        };
+        let result = candidate_route_from_movements(
+            &[PieceMovement::SonicDrop, PieceMovement::Cw],
+            &handling,
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            "soft_drop_post_actions_blocked actions=RotateCw".to_owned()
         );
     }
 

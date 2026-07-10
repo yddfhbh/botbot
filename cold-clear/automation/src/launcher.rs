@@ -132,6 +132,7 @@ impl LauncherState {
         self.bot.movement_mode = MovementModeConfig::ZeroGSafe;
         self.bot.spawn_rule = SpawnRuleConfig::Row19Or20;
         self.handling.soft_drop_mode = SoftDropModeConfig::Infinite;
+        self.handling.allow_post_softdrop_actions = false;
         self.handling.prevent_accidental_hard_drops = true;
         self.handling.cancel_das_on_direction_change = true;
         self.handling.prefer_soft_drop_over_movement = false;
@@ -449,6 +450,10 @@ impl eframe::App for LauncherApp {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.state.dry_run, "Dry run");
                 ui.checkbox(&mut self.state.bot.use_hold, "Use hold");
+                ui.checkbox(
+                    &mut self.state.handling.allow_post_softdrop_actions,
+                    "Allow spin routes",
+                );
                 ui.label("Input");
                 ui.monospace("Browser CDP");
             });
@@ -619,6 +624,7 @@ mod tests {
         assert_eq!(state.hard_drop_interval_ms, 100);
         assert_eq!(state.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
         assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
+        assert!(!state.handling.allow_post_softdrop_actions);
         assert_eq!(state.handling.irs_mode, BufferModeConfig::Off);
         assert_eq!(state.handling.ihs_mode, BufferModeConfig::Off);
     }
