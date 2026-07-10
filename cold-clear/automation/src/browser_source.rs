@@ -272,7 +272,11 @@ where
                     let line = String::from_utf8_lossy(&buffer)
                         .trim_end_matches(['\r', '\n'])
                         .to_string();
-                    emit_log(&logger, format!("{prefix}{line}"));
+                    if line.starts_with(prefix.trim_end()) {
+                        emit_log(&logger, line);
+                    } else {
+                        emit_log(&logger, format!("{prefix}{line}"));
+                    }
                 }
                 Err(err) => {
                     emit_log(&logger, format!("{prefix}read error: {err}"));

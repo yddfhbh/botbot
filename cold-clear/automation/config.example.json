@@ -37,7 +37,7 @@
     "max_nodes": 400000,
     "use_hold": true,
     "speculate": false,
-    "movement_mode": "hard_drop_only",
+    "movement_mode": "zero_g_safe",
     "spawn_rule": "row19_or20"
   },
   "handling": {

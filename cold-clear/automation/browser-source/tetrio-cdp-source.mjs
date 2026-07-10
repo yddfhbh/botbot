@@ -6,6 +6,7 @@ import path from "node:path";
 const DEFAULT_URL = "https://tetr.io/";
 const DEFAULT_PORT = 9222;
 const DEFAULT_NEXT_COUNT = 6;
+const DEFAULT_STATUS_MS = 2500;
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -33,6 +34,7 @@ async function main() {
   const target = await findOrCreateTarget({ port, url, targetHint });
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
   await cdp.send("Page.bringToFront");
+  await installBackgroundInputKeepalive(cdp);
   await cdp.send("Runtime.evaluate", {
     expression: "window.focus(); document.body && document.body.focus && document.body.focus(); true"
   }).catch(() => undefined);
@@ -45,9 +47,13 @@ async function main() {
   }
 
   let lastReason = "";
+  let lastReasonAt = 0;
   let stableSignature = "";
   let stableCount = 0;
   let lastWrittenToken = "";
+  const probeState = {
+    lastCaptureAt: 0
+  };
 
   const stop = async () => {
     await cdp.close().catch(() => undefined);
@@ -60,20 +66,25 @@ async function main() {
     const state = await readTetrioState(cdp, {
       probePageState,
       useSeedSimulationFallback,
-      network
+      network,
+      probeState
     });
 
     if (!state.ok || !state.ready || !state.playing || state.countdown) {
       const reason =
         state.reason ??
         (!state.playing ? "page is not playing" : state.countdown ? "countdown active" : "state not ready");
-      if (reason !== lastReason) {
+      if (reason !== lastReason || Date.now() - lastReasonAt >= DEFAULT_STATUS_MS) {
         console.log(`[browser] ${reason}`);
         lastReason = reason;
+        lastReasonAt = Date.now();
       }
       await sleep(pollMs);
       continue;
     }
+
+    lastReason = "";
+    lastReasonAt = 0;
 
     const queueText = state.queue.join(",");
     const signature = `${state.pieceCounter}|${state.current}|${state.hold ?? "-"}|${queueText}`;
@@ -217,7 +228,14 @@ async function findOrCreateTarget({ port, url, targetHint }) {
       item.title?.toLowerCase().includes(targetHint.toLowerCase())
   );
   const matchingUrl = pages.find((item) => item.url === url);
-  const existing = hinted ?? matchingUrl ?? pages[0];
+  const matchingHost = pages.find((item) => {
+    try {
+      return new URL(item.url).host === new URL(url).host;
+    } catch {
+      return false;
+    }
+  });
+  const existing = hinted ?? matchingUrl ?? matchingHost ?? pages[0];
   if (existing?.webSocketDebuggerUrl) return existing;
   return await fetchJson(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, {
     method: "PUT"
@@ -265,12 +283,39 @@ class CdpClient {
     const listeners = this.listeners.get(method) ?? new Set();
     listeners.add(handler);
     this.listeners.set(method, listeners);
+    return () => this.off(method, handler);
+  }
+
+  off(method, handler) {
+    const listeners = this.listeners.get(method);
+    if (!listeners) return;
+    listeners.delete(handler);
+    if (listeners.size === 0) this.listeners.delete(method);
   }
 
   emit(method, params) {
     const listeners = this.listeners.get(method);
     if (!listeners) return;
     for (const handler of [...listeners]) handler(params);
+  }
+
+  waitForEvent(method, predicate = () => true, timeoutMs = 1000) {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Timed out waiting for CDP event ${method}`));
+      }, Math.max(1, timeoutMs));
+      const handler = (params) => {
+        if (!predicate(params)) return;
+        cleanup();
+        resolve(params);
+      };
+      const cleanup = () => {
+        clearTimeout(timeout);
+        this.off(method, handler);
+      };
+      this.on(method, handler);
+    });
   }
 
   send(method, params = {}) {
@@ -295,8 +340,59 @@ function createTetrioNetworkState() {
     seed: null,
     nextCount: DEFAULT_NEXT_COUNT,
     readyAt: 0,
-    ribbonSeen: false
+    ribbonSeen: false,
+    lastPageProbeAt: 0
   };
+}
+
+async function installBackgroundInputKeepalive(cdp) {
+  const source = `(() => {
+    if (window.__fusionBackgroundInputKeepalive) return window.__fusionBackgroundInputKeepalive;
+    const defineGetter = (target, key, value) => {
+      try {
+        Object.defineProperty(target, key, {
+          configurable: true,
+          get: () => value
+        });
+      } catch {}
+    };
+
+    defineGetter(Document.prototype, "hidden", false);
+    defineGetter(Document.prototype, "visibilityState", "visible");
+    defineGetter(document, "hidden", false);
+    defineGetter(document, "visibilityState", "visible");
+
+    try {
+      document.hasFocus = () => true;
+    } catch {}
+
+    window.addEventListener(
+      "blur",
+      (event) => {
+        event.stopImmediatePropagation();
+      },
+      true
+    );
+    document.addEventListener(
+      "visibilitychange",
+      (event) => {
+        event.stopImmediatePropagation();
+      },
+      true
+    );
+
+    window.__fusionBackgroundInputKeepalive = {
+      at: Date.now()
+    };
+    return window.__fusionBackgroundInputKeepalive;
+  })()`;
+
+  await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source }).catch(() => undefined);
+  await cdp.send("Runtime.evaluate", {
+    expression: source,
+    returnByValue: true,
+    awaitPromise: true
+  }).catch(() => undefined);
 }
 
 async function installRibbonMonitor(cdp, network, msgpack) {
@@ -389,12 +485,42 @@ function finiteNumber(value) {
 }
 
 async function readTetrioState(cdp, options) {
-  const raw = await cdp.send("Runtime.evaluate", {
-    expression: tetrioStateExpression(),
-    returnByValue: true,
-    awaitPromise: true
-  });
-  const state = raw.result?.value ?? { ok: false, ready: false, reason: "page probe returned empty" };
+  const read = async () => {
+    const raw = await cdp.send("Runtime.evaluate", {
+      expression: tetrioStateExpression(),
+      returnByValue: true,
+      awaitPromise: true
+    });
+    return raw.result?.value ?? { ok: false, ready: false, reason: "page probe returned empty" };
+  };
+
+  let state = await read();
+  const shouldCapture =
+    options.probePageState &&
+    !state.ok &&
+    Date.now() - (options.probeState?.lastCaptureAt ?? 0) >= 2000 &&
+    Date.now() - (options.network?.lastPageProbeAt ?? 0) >= 2000;
+
+  if (shouldCapture) {
+    options.probeState.lastCaptureAt = Date.now();
+    if (options.network) {
+      options.network.lastPageProbeAt = Date.now();
+    }
+    const capture = await captureTetrioGame(cdp).catch((error) => ({
+      ok: false,
+      reason: error?.message ?? String(error)
+    }));
+    if (capture.ok) {
+      console.log(`[browser] page probe exposed game object via ${capture.source}`);
+      state = await read();
+    } else if (state.reason) {
+      state = {
+        ...state,
+        reason: `${state.reason}; page probe: ${capture.reason}`
+      };
+    }
+  }
+
   if (state.ok) {
     return state;
   }
@@ -402,6 +528,101 @@ async function readTetrioState(cdp, options) {
     return state;
   }
   return buildSeedFallbackState(options.network);
+}
+
+async function captureTetrioGame(cdp) {
+  const breakpointIds = [];
+  let paused = false;
+
+  try {
+    await cdp.send("Debugger.enable");
+    for (const expression of ["window.requestAnimationFrame", "window.setTimeout"]) {
+      const evaluated = await cdp.send("Runtime.evaluate", {
+        expression,
+        objectGroup: "fusion-tetrio-probe",
+        silent: true
+      }).catch(() => null);
+      const objectId = evaluated?.result?.objectId;
+      if (!objectId) continue;
+      const breakpoint = await cdp.send("Debugger.setBreakpointOnFunctionCall", {
+        objectId
+      }).catch(() => null);
+      if (breakpoint?.breakpointId) {
+        breakpointIds.push(breakpoint.breakpointId);
+      }
+    }
+
+    if (breakpointIds.length === 0) {
+      return { ok: false, reason: "TETR.IO probe could not attach function breakpoints" };
+    }
+
+    const deadline = Date.now() + 900;
+    while (Date.now() < deadline) {
+      let event;
+      try {
+        event = await cdp.waitForEvent(
+          "Debugger.paused",
+          () => true,
+          Math.max(50, deadline - Date.now())
+        );
+      } catch {
+        break;
+      }
+
+      paused = true;
+      const exposed = await exposeTetrioGameFromPausedCallFrames(cdp, event);
+      await cdp.send("Debugger.resume").catch(() => undefined);
+      paused = false;
+      if (exposed.ok) return exposed;
+    }
+
+    return { ok: false, reason: "TETR.IO game closure not visible yet" };
+  } finally {
+    if (paused) {
+      await cdp.send("Debugger.resume").catch(() => undefined);
+    }
+    for (const breakpointId of breakpointIds) {
+      await cdp.send("Debugger.removeBreakpoint", { breakpointId }).catch(() => undefined);
+    }
+    await cdp.send("Runtime.releaseObjectGroup", {
+      objectGroup: "fusion-tetrio-probe"
+    }).catch(() => undefined);
+    await cdp.send("Debugger.disable").catch(() => undefined);
+  }
+}
+
+async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent) {
+  for (const callFrame of pausedEvent.callFrames ?? []) {
+    const result = await cdp.send("Debugger.evaluateOnCallFrame", {
+      callFrameId: callFrame.callFrameId,
+      expression: `(() => {
+        try {
+          if (
+            typeof Ai !== "undefined" &&
+            Ai &&
+            typeof Ai.ejectState === "function" &&
+            typeof Ai.ejectBoardState === "function"
+          ) {
+            window.__fusionTetrioGame = Ai;
+            window.__fusionTetrioBridge = {
+              ok: true,
+              source: "closure:Ai",
+              at: Date.now(),
+              href: location.href
+            };
+            return window.__fusionTetrioBridge;
+          }
+        } catch {}
+        return { ok: false };
+      })()`,
+      returnByValue: true,
+      silent: true
+    }).catch(() => null);
+
+    const value = result?.result?.value;
+    if (value?.ok) return value;
+  }
+  return { ok: false, reason: "TETR.IO active game variable was not in paused scopes" };
 }
 
 function buildSeedFallbackState(network) {
@@ -614,7 +835,7 @@ function tetrioStateExpression() {
     const countdown = started && !destroyed && !playing;
     const ready = started && !destroyed;
     const field = Array.from({ length: 40 }, (_, rowIndex) => {
-      const sourceRow = board[rowIndex];
+      const sourceRow = board[board.length - 1 - rowIndex];
       const cells = rowCells(sourceRow);
       return Array.from({ length: 10 }, (_, x) => filled(cells ? cells[x] : null));
     });

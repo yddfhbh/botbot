@@ -22,7 +22,8 @@ rely on that; use conservative CDP/browser input or conservative `SendInput` tim
 - can produce snapshots from `browser_cdp`, `scanner`, or `file`
 - rebuilds a `libtetris::Board` from that snapshot
 - asks Cold Clear for a move
-- reduces `Hard Drop Only` execution to spawn-based rotations + left/right tap counts + hard drop
+- defaults to `ZeroG Safe` so spins remain available with a safer route filter
+- still keeps `Hard Drop Only` as an emergency fallback/debug mode
 - sends the resulting inputs with Browser CDP or conservative `SendInput`
 
 ## Snapshot contract
@@ -58,9 +59,9 @@ cargo run -p automation
 Running without arguments opens the launcher window. From there you can:
 
 - choose `2P Left 1080p`, `Solo 1080p`, or `Custom`
-- choose `Browser CDP`, `Screen Scanner`, or `File` as the snapshot provider
+- use the streamlined Browser CDP-only launcher
 - edit Browser CDP connection fields such as Chrome path, port, URL, target hint, and ribbon/seed fallbacks
-- edit dry-run, timings, nodes, movement mode, spawn rule, handling, input backend, and key bindings
+- edit dry-run, timings, movement mode, and spawn rule
 - start or stop the bot session
 - save launcher settings for the next launch
 
@@ -73,7 +74,7 @@ The built-in live presets now apply a `TETR.IO Safe preset` aimed at personal so
 - `URL`: `https://tetr.io/`
 - `CDP Port`: `9222`
 - `Target`: `TETR.IO`
-- `Movement`: `Hard Drop Only` by default
+- `Movement`: `ZeroG Safe` by default
 - `Spawn`: `Row 19 or 20`
 - `Legacy Tap`: `60ms`
 - `Move Tap`: `55ms`
@@ -89,8 +90,7 @@ The built-in live presets now apply a `TETR.IO Safe preset` aimed at personal so
 - `Speculate`: `Off`
 - `SoftDrop route`: disabled when `soft_drop_mode = infinite`
 
-If you want a slightly more flexible route search without going all the way to experimental handling,
-switch `Movement` to `ZeroG Safe`.
+If you need to temporarily simplify execution for debugging, switch `Movement` to `Hard Drop Only`.
 
 `ZeroG Complete` is still available, but it should be treated as `Advanced/Experimental`. Use it only
 when the logged input route is something the real client can actually reproduce.
@@ -109,7 +109,7 @@ profile:
 - `Piece Delay`: `100ms`
 - `Snapshot provider`: `Browser CDP`
 - `Input backend`: `Browser CDP`
-- `Movement`: `Hard Drop Only`
+- `Movement`: `ZeroG Safe`
 - `Spawn`: `Row 19 or 20`
 - `IRS/IHS`: `Off` first, then experiment with tap buffering only after the base profile is stable
 
@@ -121,7 +121,7 @@ the action-specific tap fields and the separate inter-action delay preset.
 
 Try these first:
 
-- `Movement`: `Hard Drop Only` or `ZeroG Safe`
+- `Movement`: keep `ZeroG Safe` first and only drop to `Hard Drop Only` for debugging
 - `Spawn`: `Row 19 or 20`
 - `Move Tap`: start at `55ms`
 - `Rotate Tap`: start at `70ms`
@@ -136,10 +136,11 @@ Try these first:
 - `SoftDrop route`: keep it disabled for Infinite SDF clients like TETR.IO
 
 The runner now also forces `release_all_keys()` before a plan, after hold, before hard drop, after hard
-drop, and again when the launcher stops. In `Hard Drop Only`, the executor never uses DAS-hold movement:
-it only replays spawn-based rotations, left/right tap counts, and hard drop. After locking, the runner
-waits until the scanner reports a changed current/queue state that has stayed stable for two frames before
-starting the next piece.
+drop, and again when the launcher stops. `ZeroG Safe` stays the recommended default because it can still
+use spin-capable routes while filtering away unsafe movement plans. `Hard Drop Only` remains available as
+a reduced fallback that never uses DAS-hold movement and only replays spawn-based rotations, left/right
+tap counts, and hard drop. After locking, the runner waits until the scanner reports a changed
+current/queue state that has stayed stable for two frames before starting the next piece.
 
 ## Browser CDP mode
 

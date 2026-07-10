@@ -126,7 +126,7 @@ impl LauncherState {
         self.input_backend = InputBackendConfig::BrowserCdp;
         self.browser = BrowserCdpConfig::default();
         self.bot.speculate = false;
-        self.bot.movement_mode = MovementModeConfig::HardDropOnly;
+        self.bot.movement_mode = MovementModeConfig::ZeroGSafe;
         self.bot.spawn_rule = SpawnRuleConfig::Row19Or20;
         self.handling.soft_drop_mode = SoftDropModeConfig::Infinite;
         self.handling.prevent_accidental_hard_drops = true;
@@ -157,11 +157,16 @@ impl LauncherState {
         {
             self.apply_tetrio_safe_preset();
         }
+        if self.preset != ModePreset::Custom
+            && self.bot.movement_mode == MovementModeConfig::HardDropOnly
+        {
+            self.bot.movement_mode = MovementModeConfig::ZeroGSafe;
+        }
     }
 
     fn to_automation_config(&self, paths: &AppPaths) -> AutomationConfig {
         AutomationConfig {
-            snapshot_provider: self.snapshot_provider,
+            snapshot_provider: SnapshotProviderConfig::BrowserCdp,
             snapshot_path: paths.resolve_workspace_path(&self.snapshot_path),
             dry_run: self.dry_run,
             poll_interval_ms: self.poll_interval_ms,
@@ -176,7 +181,7 @@ impl LauncherState {
             piece_interval_ms: self.piece_interval_ms,
             hard_drop_interval_ms: self.hard_drop_interval_ms,
             min_snapshot_age_ms: self.min_snapshot_age_ms,
-            input_backend: self.input_backend,
+            input_backend: InputBackendConfig::BrowserCdp,
             scanner: ScannerSourceConfig {
                 config_path: self.scanner_config_path.clone(),
                 python_command: self.python_command.clone(),
@@ -397,64 +402,33 @@ impl eframe::App for LauncherApp {
                 }
             });
 
+            ui.label("Browser CDP mode only. Screen scanner and file mode stay as internal fallback/debug paths.");
             ui.horizontal(|ui| {
-                ui.label("Provider");
-                egui::ComboBox::from_id_salt("snapshot_provider")
-                    .selected_text(snapshot_provider_label(self.state.snapshot_provider))
-                    .show_ui(ui, |ui| {
-                        for provider in [
-                            SnapshotProviderConfig::BrowserCdp,
-                            SnapshotProviderConfig::Scanner,
-                            SnapshotProviderConfig::File,
-                        ] {
-                            ui.selectable_value(
-                                &mut self.state.snapshot_provider,
-                                provider,
-                                snapshot_provider_label(provider),
-                            );
-                        }
-                    });
+                ui.label("Chrome Path");
+                ui.text_edit_singleline(&mut self.state.browser.chrome_path);
             });
             ui.horizontal(|ui| {
-                ui.label("Scanner Config");
-                ui.text_edit_singleline(&mut self.state.scanner_config_path);
+                ui.label("CDP Port");
+                ui.add(egui::DragValue::new(&mut self.state.browser.cdp_port).speed(1));
+                ui.label("URL");
+                ui.text_edit_singleline(&mut self.state.browser.url);
             });
             ui.horizontal(|ui| {
-                ui.label("Snapshot Path");
-                ui.text_edit_singleline(&mut self.state.snapshot_path);
+                ui.label("Target");
+                ui.text_edit_singleline(&mut self.state.browser.target_hint);
+                ui.checkbox(&mut self.state.browser.connect_only, "Connect only");
             });
             ui.horizontal(|ui| {
-                ui.label("Python");
-                ui.text_edit_singleline(&mut self.state.python_command);
+                ui.checkbox(&mut self.state.browser.probe_page_state, "Probe page state");
+                ui.checkbox(
+                    &mut self.state.browser.use_ribbon_websocket,
+                    "Use ribbon websocket",
+                );
+                ui.checkbox(
+                    &mut self.state.browser.use_seed_simulation_fallback,
+                    "Use seed simulation fallback",
+                );
             });
-            if self.state.snapshot_provider == SnapshotProviderConfig::BrowserCdp {
-                ui.horizontal(|ui| {
-                    ui.label("Chrome Path");
-                    ui.text_edit_singleline(&mut self.state.browser.chrome_path);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("CDP Port");
-                    ui.add(egui::DragValue::new(&mut self.state.browser.cdp_port).speed(1));
-                    ui.label("URL");
-                    ui.text_edit_singleline(&mut self.state.browser.url);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Target");
-                    ui.text_edit_singleline(&mut self.state.browser.target_hint);
-                    ui.checkbox(&mut self.state.browser.connect_only, "Connect only");
-                });
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.state.browser.probe_page_state, "Probe page state");
-                    ui.checkbox(
-                        &mut self.state.browser.use_ribbon_websocket,
-                        "Use ribbon websocket",
-                    );
-                    ui.checkbox(
-                        &mut self.state.browser.use_seed_simulation_fallback,
-                        "Use seed simulation fallback",
-                    );
-                });
-            }
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.state.always_on_top, "Always on top");
             });
@@ -464,49 +438,36 @@ impl eframe::App for LauncherApp {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.state.dry_run, "Dry run");
                 ui.checkbox(&mut self.state.bot.use_hold, "Use hold");
-                ui.checkbox(&mut self.state.bot.speculate, "Speculate");
+                ui.label("Input");
+                ui.monospace("Browser CDP");
             });
             ui.horizontal(|ui| {
                 ui.label("Poll");
                 ui.add(egui::DragValue::new(&mut self.state.poll_interval_ms).speed(1));
-                ui.label("Legacy Tap");
-                ui.add(egui::DragValue::new(&mut self.state.tap_duration_ms).speed(1));
             });
             ui.horizontal(|ui| {
                 ui.label("Move Tap");
                 ui.add(egui::DragValue::new(&mut self.state.movement_tap_duration_ms).speed(1));
                 ui.label("Rotate Tap");
                 ui.add(egui::DragValue::new(&mut self.state.rotate_tap_duration_ms).speed(1));
-                ui.label("Hold Tap");
-                ui.add(egui::DragValue::new(&mut self.state.hold_tap_duration_ms).speed(1));
             });
             ui.horizontal(|ui| {
                 ui.label("HardDrop Tap");
                 ui.add(egui::DragValue::new(&mut self.state.hard_drop_tap_duration_ms).speed(1));
-                ui.label("SoftDrop Tap");
-                ui.add(egui::DragValue::new(&mut self.state.soft_drop_tap_duration_ms).speed(1));
             });
             ui.horizontal(|ui| {
                 ui.label("Move Delay");
                 ui.add(egui::DragValue::new(&mut self.state.movement_interval_ms).speed(1));
                 ui.label("Rotate Delay");
                 ui.add(egui::DragValue::new(&mut self.state.rotation_interval_ms).speed(1));
-                ui.label("Piece Delay");
-                ui.add(egui::DragValue::new(&mut self.state.piece_interval_ms).speed(1));
                 ui.label("HardDrop Delay");
                 ui.add(egui::DragValue::new(&mut self.state.hard_drop_interval_ms).speed(1));
             });
             ui.horizontal(|ui| {
+                ui.label("Piece Delay");
+                ui.add(egui::DragValue::new(&mut self.state.piece_interval_ms).speed(1));
                 ui.label("Min age");
                 ui.add(egui::DragValue::new(&mut self.state.min_snapshot_age_ms).speed(1));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Threads");
-                ui.add(egui::DragValue::new(&mut self.state.bot.threads).range(1..=64));
-                ui.label("Min nodes");
-                ui.add(egui::DragValue::new(&mut self.state.bot.min_nodes).speed(1000));
-                ui.label("Max nodes");
-                ui.add(egui::DragValue::new(&mut self.state.bot.max_nodes).speed(10000));
             });
             ui.horizontal(|ui| {
                 ui.label("Movement");
@@ -539,122 +500,8 @@ impl eframe::App for LauncherApp {
                             );
                         }
                     });
-            });
-            ui.horizontal(|ui| {
-                ui.label("Input backend");
-                egui::ComboBox::from_id_salt("input_backend")
-                    .selected_text(input_backend_label(self.state.input_backend))
-                    .show_ui(ui, |ui| {
-                        for backend in [
-                            InputBackendConfig::BrowserCdp,
-                            InputBackendConfig::ScanCode,
-                            InputBackendConfig::VirtualKey,
-                        ] {
-                            ui.selectable_value(
-                                &mut self.state.input_backend,
-                                backend,
-                                input_backend_label(backend),
-                            );
-                        }
-                    });
-            });
-
-            ui.separator();
-            ui.heading("Handling");
-            ui.horizontal(|ui| {
-                ui.label("ARR");
-                ui.add(egui::DragValue::new(&mut self.state.handling.arr_ms).speed(1));
-                ui.label("DAS");
-                ui.add(egui::DragValue::new(&mut self.state.handling.das_ms).speed(1));
-                ui.label("DCD");
-                ui.add(egui::DragValue::new(&mut self.state.handling.dcd_ms).speed(1));
-            });
-            ui.horizontal(|ui| {
-                ui.label("SDF");
-                egui::ComboBox::from_id_salt("soft_drop_mode")
-                    .selected_text(soft_drop_mode_label(self.state.handling.soft_drop_mode))
-                    .show_ui(ui, |ui| {
-                        for mode in [SoftDropModeConfig::Infinite, SoftDropModeConfig::Step] {
-                            ui.selectable_value(
-                                &mut self.state.handling.soft_drop_mode,
-                                mode,
-                                soft_drop_mode_label(mode),
-                            );
-                        }
-                    });
-                ui.label("Factor");
-                ui.add(
-                    egui::DragValue::new(&mut self.state.handling.soft_drop_factor).range(1..=999),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(
-                    &mut self.state.handling.prevent_accidental_hard_drops,
-                    "Prevent accidental hard drops",
-                );
-                ui.checkbox(
-                    &mut self.state.handling.cancel_das_on_direction_change,
-                    "Cancel DAS on direction change",
-                );
-                ui.checkbox(
-                    &mut self.state.handling.prefer_soft_drop_over_movement,
-                    "Prefer soft drop over movement",
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("IRS");
-                egui::ComboBox::from_id_salt("irs_mode")
-                    .selected_text(buffer_mode_label(self.state.handling.irs_mode))
-                    .show_ui(ui, |ui| {
-                        for mode in [
-                            BufferModeConfig::Off,
-                            BufferModeConfig::Hold,
-                            BufferModeConfig::Tap,
-                        ] {
-                            ui.selectable_value(
-                                &mut self.state.handling.irs_mode,
-                                mode,
-                                buffer_mode_label(mode),
-                            );
-                        }
-                    });
-                ui.label("IHS");
-                egui::ComboBox::from_id_salt("ihs_mode")
-                    .selected_text(buffer_mode_label(self.state.handling.ihs_mode))
-                    .show_ui(ui, |ui| {
-                        for mode in [
-                            BufferModeConfig::Off,
-                            BufferModeConfig::Hold,
-                            BufferModeConfig::Tap,
-                        ] {
-                            ui.selectable_value(
-                                &mut self.state.handling.ihs_mode,
-                                mode,
-                                buffer_mode_label(mode),
-                            );
-                        }
-                    });
-            });
-
-            ui.separator();
-            ui.heading("Keys");
-            ui.horizontal(|ui| {
-                ui.label("Left");
-                ui.text_edit_singleline(&mut self.state.keys.left);
-                ui.label("Right");
-                ui.text_edit_singleline(&mut self.state.keys.right);
-                ui.label("Soft");
-                ui.text_edit_singleline(&mut self.state.keys.soft_drop);
-            });
-            ui.horizontal(|ui| {
-                ui.label("CW");
-                ui.text_edit_singleline(&mut self.state.keys.rotate_cw);
-                ui.label("CCW");
-                ui.text_edit_singleline(&mut self.state.keys.rotate_ccw);
-                ui.label("Hold");
-                ui.text_edit_singleline(&mut self.state.keys.hold);
-                ui.label("Hard");
-                ui.text_edit_singleline(&mut self.state.keys.hard_drop);
+                ui.label("Planner");
+                ui.monospace("Safe spawn tap route");
             });
 
             ui.separator();
@@ -737,37 +584,6 @@ fn spawn_rule_label(rule: SpawnRuleConfig) -> &'static str {
     }
 }
 
-fn soft_drop_mode_label(mode: SoftDropModeConfig) -> &'static str {
-    match mode {
-        SoftDropModeConfig::Infinite => "Infinite",
-        SoftDropModeConfig::Step => "Step",
-    }
-}
-
-fn buffer_mode_label(mode: BufferModeConfig) -> &'static str {
-    match mode {
-        BufferModeConfig::Off => "Off",
-        BufferModeConfig::Hold => "Hold",
-        BufferModeConfig::Tap => "Tap",
-    }
-}
-
-fn input_backend_label(backend: InputBackendConfig) -> &'static str {
-    match backend {
-        InputBackendConfig::BrowserCdp => "Browser CDP",
-        InputBackendConfig::VirtualKey => "Virtual Key (SendInput)",
-        InputBackendConfig::ScanCode => "Scan Code (SendInput)",
-    }
-}
-
-fn snapshot_provider_label(provider: SnapshotProviderConfig) -> &'static str {
-    match provider {
-        SnapshotProviderConfig::BrowserCdp => "Browser CDP",
-        SnapshotProviderConfig::Scanner => "Screen Scanner",
-        SnapshotProviderConfig::File => "File",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,7 +594,7 @@ mod tests {
         state.preset = ModePreset::Solo1080p;
         state.apply_preset();
 
-        assert_eq!(state.bot.movement_mode, MovementModeConfig::HardDropOnly);
+        assert_eq!(state.bot.movement_mode, MovementModeConfig::ZeroGSafe);
         assert_eq!(state.bot.spawn_rule, SpawnRuleConfig::Row19Or20);
         assert_eq!(state.tap_duration_ms, 60);
         assert_eq!(state.movement_tap_duration_ms, 55);
@@ -800,6 +616,7 @@ mod tests {
     fn readme_matches_safe_preset_defaults() {
         let readme = include_str!("../README.md");
         assert!(readme.contains("TETR.IO Safe preset"));
+        assert!(readme.contains("ZeroG Safe"));
         assert!(readme.contains("Hard Drop Only"));
         assert!(readme.contains("ZeroG Complete"));
         assert!(readme.contains("Advanced/Experimental"));

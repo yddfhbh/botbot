@@ -27,6 +27,7 @@ async function main() {
   const target = await findOrCreateTarget({ port, url, targetHint });
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
   await cdp.send("Page.bringToFront");
+  await installBackgroundInputKeepalive(cdp);
   await focusPage(cdp);
 
   const rl = readline.createInterface({
@@ -217,7 +218,14 @@ async function findOrCreateTarget({ port, url, targetHint }) {
       item.title?.toLowerCase().includes(targetHint.toLowerCase())
   );
   const matchingUrl = pages.find((item) => item.url === url);
-  const existing = hinted ?? matchingUrl ?? pages[0];
+  const matchingHost = pages.find((item) => {
+    try {
+      return new URL(item.url).host === new URL(url).host;
+    } catch {
+      return false;
+    }
+  });
+  const existing = hinted ?? matchingUrl ?? matchingHost ?? pages[0];
   if (existing?.webSocketDebuggerUrl) return existing;
   return await fetchJson(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, {
     method: "PUT"
@@ -230,6 +238,56 @@ async function fetchJson(url, options) {
     throw new Error(`${response.status} ${response.statusText}: ${url}`);
   }
   return await response.json();
+}
+
+async function installBackgroundInputKeepalive(cdp) {
+  const source = `(() => {
+    if (window.__fusionBackgroundInputKeepalive) return window.__fusionBackgroundInputKeepalive;
+    const defineGetter = (target, key, value) => {
+      try {
+        Object.defineProperty(target, key, {
+          configurable: true,
+          get: () => value
+        });
+      } catch {}
+    };
+
+    defineGetter(Document.prototype, "hidden", false);
+    defineGetter(Document.prototype, "visibilityState", "visible");
+    defineGetter(document, "hidden", false);
+    defineGetter(document, "visibilityState", "visible");
+
+    try {
+      document.hasFocus = () => true;
+    } catch {}
+
+    window.addEventListener(
+      "blur",
+      (event) => {
+        event.stopImmediatePropagation();
+      },
+      true
+    );
+    document.addEventListener(
+      "visibilitychange",
+      (event) => {
+        event.stopImmediatePropagation();
+      },
+      true
+    );
+
+    window.__fusionBackgroundInputKeepalive = {
+      at: Date.now()
+    };
+    return window.__fusionBackgroundInputKeepalive;
+  })()`;
+
+  await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source }).catch(() => undefined);
+  await cdp.send("Runtime.evaluate", {
+    expression: source,
+    returnByValue: true,
+    awaitPromise: true
+  }).catch(() => undefined);
 }
 
 class CdpClient {

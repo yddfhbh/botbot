@@ -132,7 +132,7 @@ impl Default for BotConfig {
             max_nodes: 400_000,
             use_hold: true,
             speculate: false,
-            movement_mode: MovementModeConfig::HardDropOnly,
+            movement_mode: MovementModeConfig::ZeroGSafe,
             spawn_rule: SpawnRuleConfig::Row19Or20,
         }
     }
