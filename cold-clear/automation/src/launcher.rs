@@ -343,6 +343,7 @@ pub struct LauncherApp {
     status: String,
     event_rx: Option<Receiver<LauncherEvent>>,
     running: Option<RunningSession>,
+    show_browser_advanced: bool,
 }
 
 impl LauncherApp {
@@ -356,17 +357,22 @@ impl LauncherApp {
             status: "Idle".to_owned(),
             event_rx: None,
             running: None,
+            show_browser_advanced: false,
         }
     }
 
     fn push_log(&mut self, line: impl Into<String>) {
         let line = line.into();
-        if line.contains("[automation] idle waiting for next live game") {
+        if line.contains("[browser] reject reason=TETR.IO game instance not captured yet") {
+            self.status = "Capture Required".to_owned();
+        } else if line.contains("[automation] idle waiting for next live game") {
             self.status = "Waiting".to_owned();
         } else if line.contains("[automation] live game resumed")
             || line.contains("[automation] source=")
         {
             self.status = "Running".to_owned();
+        } else if line.contains("[launcher] manual game-object capture completed") {
+            self.status = "Captured".to_owned();
         }
         self.append_log_file(&line);
         self.logs.push(line);
@@ -412,7 +418,7 @@ impl LauncherApp {
         }
     }
 
-    fn capture_game_object_now(&mut self) {
+    fn capture_game_object_now(&mut self) -> bool {
         let script = &self.paths.browser_snapshot_script_path;
         let mut command = Command::new(&self.state.browser.node_command);
         command
@@ -447,24 +453,44 @@ impl LauncherApp {
                 }
                 if output.status.success() {
                     self.push_log("[launcher] manual game-object capture completed");
+                    true
                 } else {
                     self.push_log(format!(
                         "[launcher] manual game-object capture failed status={}",
                         output.status
                     ));
+                    false
                 }
             }
             Err(err) => {
                 self.push_log(format!(
                     "[launcher] failed to run manual game-object capture: {err}"
                 ));
+                false
             }
         }
+    }
+
+    fn should_capture_before_start(&self) -> bool {
+        self.state.snapshot_provider == SnapshotProviderConfig::BrowserCdp
+            && self.state.browser.probe_page_state
+            && self.state.browser.debugger_probe_mode == DebuggerProbeMode::Manual
     }
 
     fn start(&mut self) {
         if self.running.is_some() {
             return;
+        }
+
+        if self.should_capture_before_start() {
+            self.push_log("[launcher] capturing game object before start");
+            if !self.capture_game_object_now() {
+                self.push_log(
+                    "[launcher] start cancelled because game object capture did not complete",
+                );
+                self.status = "Capture Failed".to_owned();
+                return;
+            }
         }
 
         self.save_state();
@@ -669,65 +695,6 @@ impl eframe::App for LauncherApp {
                         ui.checkbox(&mut self.state.browser.connect_only, "Connect only");
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Player");
-                        egui::ComboBox::from_id_salt("player_selector")
-                            .selected_text(player_selector_label(self.state.browser.player_selector))
-                            .show_ui(ui, |ui| {
-                                for selector in [
-                                    PlayerSelectorConfig::Auto,
-                                    PlayerSelectorConfig::Left,
-                                    PlayerSelectorConfig::Right,
-                                    PlayerSelectorConfig::Nickname,
-                                    PlayerSelectorConfig::UserId,
-                                ] {
-                                    ui.selectable_value(
-                                        &mut self.state.browser.player_selector,
-                                        selector,
-                                        player_selector_label(selector),
-                                    );
-                                }
-                            });
-                        ui.label("Nickname");
-                        ui.text_edit_singleline(&mut self.state.browser.player_nickname);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("User ID");
-                        ui.text_edit_singleline(&mut self.state.browser.player_user_id);
-                        ui.checkbox(
-                            &mut self.state.browser.dump_state_on_fail,
-                            "Dump state on fail",
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Dump Path");
-                        ui.text_edit_singleline(&mut self.state.browser.dump_state_path);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.state.browser.probe_page_state, "Probe page state");
-                        ui.checkbox(
-                            &mut self.state.browser.use_ribbon_websocket,
-                            "Use ribbon websocket",
-                        );
-                        ui.checkbox(
-                            &mut self.state.browser.use_seed_simulation_fallback,
-                            "Use seed simulation fallback",
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("State Poll");
-                        ui.add(
-                            egui::DragValue::new(&mut self.state.browser.state_poll_ms)
-                                .range(16..=200)
-                                .speed(1),
-                        );
-                        ui.label("Min Poll");
-                        ui.add(
-                            egui::DragValue::new(&mut self.state.browser.min_state_poll_ms)
-                                .range(1..=200)
-                                .speed(1),
-                        );
-                    });
-                    ui.horizontal(|ui| {
                         ui.label("Debugger Probe");
                         egui::ComboBox::from_id_salt("debugger_probe_mode")
                             .selected_text(debugger_probe_mode_label(
@@ -750,44 +717,115 @@ impl eframe::App for LauncherApp {
                             self.capture_game_object_now();
                         }
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("Ribbon Decode");
-                        egui::ComboBox::from_id_salt("ribbon_decode_mode")
-                            .selected_text(ribbon_decode_mode_label(
-                                self.state.browser.ribbon_decode_mode,
-                            ))
-                            .show_ui(ui, |ui| {
-                                for mode in [
-                                    RibbonDecodeMode::UntilSeed,
-                                    RibbonDecodeMode::AlwaysDebug,
-                                    RibbonDecodeMode::Off,
-                                ] {
-                                    ui.selectable_value(
-                                        &mut self.state.browser.ribbon_decode_mode,
-                                        mode,
-                                        ribbon_decode_mode_label(mode),
-                                    );
-                                }
+                    if self.state.browser.debugger_probe_mode == DebuggerProbeMode::Manual {
+                        ui.small("`Start` will try one capture first. If it fails, the session will not start.");
+                    }
+                    ui.checkbox(&mut self.show_browser_advanced, "Show advanced browser options");
+                    if self.show_browser_advanced {
+                        ui.horizontal(|ui| {
+                            ui.label("Player");
+                            egui::ComboBox::from_id_salt("player_selector")
+                                .selected_text(player_selector_label(self.state.browser.player_selector))
+                                .show_ui(ui, |ui| {
+                                    for selector in [
+                                        PlayerSelectorConfig::Auto,
+                                        PlayerSelectorConfig::Left,
+                                        PlayerSelectorConfig::Right,
+                                        PlayerSelectorConfig::Nickname,
+                                        PlayerSelectorConfig::UserId,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.state.browser.player_selector,
+                                            selector,
+                                            player_selector_label(selector),
+                                        );
+                                    }
+                                });
+                            if self.state.browser.player_selector == PlayerSelectorConfig::Nickname {
+                                ui.label("Nickname");
+                                ui.text_edit_singleline(&mut self.state.browser.player_nickname);
+                            }
+                            if self.state.browser.player_selector == PlayerSelectorConfig::UserId {
+                                ui.label("User ID");
+                                ui.text_edit_singleline(&mut self.state.browser.player_user_id);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.state.browser.probe_page_state, "Probe page state");
+                            ui.checkbox(
+                                &mut self.state.browser.dump_state_on_fail,
+                                "Dump state on fail",
+                            );
+                            ui.checkbox(
+                                &mut self.state.browser.use_ribbon_websocket,
+                                "Use ribbon websocket",
+                            );
+                            ui.checkbox(
+                                &mut self.state.browser.use_seed_simulation_fallback,
+                                "Use seed simulation fallback",
+                            );
+                        });
+                        if self.state.browser.dump_state_on_fail {
+                            ui.horizontal(|ui| {
+                                ui.label("Dump Path");
+                                ui.text_edit_singleline(&mut self.state.browser.dump_state_path);
                             });
-                        ui.label("Input Focus");
-                        egui::ComboBox::from_id_salt("input_focus_mode")
-                            .selected_text(input_focus_mode_label(
-                                self.state.browser.input_focus_mode,
-                            ))
-                            .show_ui(ui, |ui| {
-                                for mode in [
-                                    InputFocusMode::PerPlan,
-                                    InputFocusMode::PerHarddrop,
-                                    InputFocusMode::PerAction,
-                                ] {
-                                    ui.selectable_value(
-                                        &mut self.state.browser.input_focus_mode,
-                                        mode,
-                                        input_focus_mode_label(mode),
-                                    );
-                                }
-                            });
-                    });
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("State Poll");
+                            ui.add(
+                                egui::DragValue::new(&mut self.state.browser.state_poll_ms)
+                                    .range(16..=200)
+                                    .speed(1),
+                            );
+                            ui.label("Min Poll");
+                            ui.add(
+                                egui::DragValue::new(&mut self.state.browser.min_state_poll_ms)
+                                    .range(1..=200)
+                                    .speed(1),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Ribbon Decode");
+                            egui::ComboBox::from_id_salt("ribbon_decode_mode")
+                                .selected_text(ribbon_decode_mode_label(
+                                    self.state.browser.ribbon_decode_mode,
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for mode in [
+                                        RibbonDecodeMode::UntilSeed,
+                                        RibbonDecodeMode::AlwaysDebug,
+                                        RibbonDecodeMode::Off,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.state.browser.ribbon_decode_mode,
+                                            mode,
+                                            ribbon_decode_mode_label(mode),
+                                        );
+                                    }
+                                });
+                            if self.state.input_backend == InputBackendConfig::BrowserCdp {
+                                ui.label("Input Focus");
+                                egui::ComboBox::from_id_salt("input_focus_mode")
+                                    .selected_text(input_focus_mode_label(
+                                        self.state.browser.input_focus_mode,
+                                    ))
+                                    .show_ui(ui, |ui| {
+                                        for mode in [
+                                            InputFocusMode::PerPlan,
+                                            InputFocusMode::PerHarddrop,
+                                            InputFocusMode::PerAction,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut self.state.browser.input_focus_mode,
+                                                mode,
+                                                input_focus_mode_label(mode),
+                                            );
+                                        }
+                                    });
+                            }
+                        });
+                    }
                 }
                 SnapshotProviderConfig::WebsocketSeed => {
                     let snapshot_status = load_websocket_seed_status(

@@ -738,7 +738,7 @@ async function captureTetrioGame(cdp, perf) {
 
   try {
     await cdp.send("Debugger.enable");
-    for (const expression of ["window.requestAnimationFrame", "window.setTimeout"]) {
+    for (const expression of ["window.requestAnimationFrame"]) {
       const evaluated = await safeRuntimeEvaluate(
         cdp,
         {
@@ -829,76 +829,6 @@ async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent) {
     if (scopeCapture.ok) {
       return scopeCapture;
     }
-
-    const result = await cdp.send("Debugger.evaluateOnCallFrame", {
-      callFrameId: callFrame.callFrameId,
-      expression: `(() => {
-        const looksLikeGame = (value) =>
-          value &&
-          typeof value === "object" &&
-          typeof value.ejectState === "function" &&
-          typeof value.ejectBoardState === "function";
-        const scanObject = (root, visited, depth = 0) => {
-          if (!root || typeof root !== "object") return null;
-          if (visited.has(root) || depth > 2) return null;
-          visited.add(root);
-          let names = [];
-          try { names = Object.getOwnPropertyNames(root).slice(0, 60); } catch {}
-          for (const name of names) {
-            try {
-              const value = root[name];
-              if (looksLikeGame(value)) return value;
-              if (value && typeof value === "object") {
-                const nested = scanObject(value, visited, depth + 1);
-                if (nested) return nested;
-              }
-            } catch {}
-          }
-          return null;
-        };
-        try {
-          const visited = new WeakSet();
-          const roots = [];
-          for (const name of ["Ai", "ai", "game", "Game", "app", "room", "match", "core", "engine", "tetrio"]) {
-            try {
-              const value = eval(name);
-              if (value !== undefined) {
-                roots.push({ name, value });
-              }
-            } catch {}
-          }
-          try { roots.push({ name: "this", value: this }); } catch {}
-          try { roots.push({ name: "window", value: window }); } catch {}
-          for (const root of roots) {
-            if (looksLikeGame(root.value)) {
-              window.__fusionTetrioGame = root.value;
-              return {
-                ok: true,
-                source: "closure:" + root.name,
-                at: Date.now(),
-                href: location.href
-              };
-            }
-            const nested = scanObject(root.value, visited, 0);
-            if (nested) {
-              window.__fusionTetrioGame = nested;
-              return {
-                ok: true,
-                source: "closure_scan:" + root.name,
-                at: Date.now(),
-                href: location.href
-              };
-            }
-          }
-        } catch {}
-        return { ok: false };
-      })()`,
-      returnByValue: true,
-      silent: true
-    }).catch(() => null);
-
-    const value = result?.result?.value;
-    if (value?.ok) return value;
   }
   return { ok: false, reason: "TETR.IO active game variable was not in paused scopes" };
 }
