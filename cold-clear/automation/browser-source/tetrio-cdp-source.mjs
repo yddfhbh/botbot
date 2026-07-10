@@ -15,6 +15,7 @@ const DEFAULT_STATE_POLL_MS = 40;
 const DEFAULT_MIN_STATE_POLL_MS = 16;
 const PROBE_TIMEOUT_MS = 120;
 const PROBE_COOLDOWN_MS = 10_000;
+const UNCAPTURED_PROBE_COOLDOWN_MS = 2_000;
 const PERF_LOG_INTERVAL_MS = 5000;
 
 export function normalizeDebuggerProbeMode(value) {
@@ -49,7 +50,11 @@ export function shouldAttemptDebuggerProbe({
   if (normalizeDebuggerProbeMode(mode) !== "startup_only") return false;
   if (gameCaptured) return false;
   if (playing || lastKnownPlaying) return false;
-  return now - lastAttemptAt >= cooldownMs;
+  const effectiveCooldownMs =
+    !gameCaptured && !playing && !lastKnownPlaying
+      ? Math.min(cooldownMs, UNCAPTURED_PROBE_COOLDOWN_MS)
+      : cooldownMs;
+  return now - lastAttemptAt >= effectiveCooldownMs;
 }
 
 export function shouldDecodeRibbonFrame({ mode, seedCaptured, direction }) {
@@ -558,12 +563,12 @@ function finiteNumber(value) {
 }
 
 async function readTetrioState(cdp, options) {
-  const readRawState = async (allowShallowScan) => {
+  const readRawState = async () => {
     const startedAt = Date.now();
     const raw = await safeRuntimeEvaluate(
       cdp,
       {
-        expression: captureTetrioExportExpression({ allowShallowScan }),
+        expression: captureTetrioExportExpression(),
         returnByValue: true,
         awaitPromise: true
       },
@@ -579,7 +584,7 @@ async function readTetrioState(cdp, options) {
     const value = raw?.result?.value ?? { ok: false, reason: "page probe returned empty" };
     const elapsedMs = Date.now() - startedAt;
     options.perf?.recordStateEval(elapsedMs);
-    if (options.perf?.enabled && (!value?.quick || allowShallowScan || elapsedMs >= 8)) {
+    if (options.perf?.enabled && (!value?.quick || elapsedMs >= 8)) {
       console.log(
         `[perf][state] quick=${Boolean(value?.quick)} scan=${Boolean(value?.scanUsed)} eval_ms=${elapsedMs}`
       );
@@ -587,7 +592,7 @@ async function readTetrioState(cdp, options) {
     return value;
   };
 
-  let rawState = await readRawState(!options.probeState.gameCaptured);
+  let rawState = await readRawState();
   const snapshotFromRaw = (value) =>
     resolveGameStateSnapshot({
       exported: value?.exported ?? null,
@@ -629,7 +634,7 @@ async function readTetrioState(cdp, options) {
     if (capture.ok) {
       options.probeState.gameCaptured = true;
       console.log(`[browser] page probe exposed game object via ${capture.source}`);
-      rawState = await readRawState(false);
+      rawState = await readRawState();
       state = rawState.ok ? snapshotFromRaw(rawState) : buildNoGameFailure(rawState, options);
     } else if (state.reason) {
       state = {
@@ -678,115 +683,29 @@ function buildNoGameFailure(rawState, options) {
   };
 }
 
-function captureTetrioExportExpression({ allowShallowScan }) {
+function captureTetrioExportExpression() {
   return `(() => {
-    const allowShallowScan = ${allowShallowScan ? "true" : "false"};
     const looksLikeGame = (value) =>
       value &&
       typeof value === "object" &&
       typeof value.ejectState === "function" &&
       typeof value.ejectBoardState === "function";
-    const scanObject = (root, path, visited, depth = 0, limit = { count: 0 }, hits = []) => {
-      if (!root || typeof root !== "object") return null;
-      if (visited.has(root) || depth > 2 || limit.count >= 120) return null;
-      visited.add(root);
-      limit.count += 1;
-      let names = [];
-      try { names = Object.getOwnPropertyNames(root).slice(0, 40); } catch {}
-      for (const name of names) {
-        try {
-          const value = root[name];
-          const nextPath = path ? path + "." + name : name;
-          if (looksLikeGame(value)) {
-            hits.push(nextPath);
-            return value;
-          }
-          if (value && typeof value === "object") {
-            const nested = scanObject(value, nextPath, visited, depth + 1, limit, hits);
-            if (nested) return nested;
-          }
-        } catch {}
-      }
-      return null;
-    };
-    const tryDirectGame = () => {
-      const directGame = window.__fusionTetrioGame;
-      if (looksLikeGame(directGame)) {
-        return {
+    const directGame = window.__fusionTetrioGame;
+    const located = looksLikeGame(directGame)
+      ? {
           game: directGame,
           quick: true,
           scanUsed: false
-        };
-      }
-      return null;
-    };
-    const findGameByScan = () => {
-      const visited = new WeakSet();
-      const hits = [];
-      const limit = { count: 0 };
-      const direct = [window.tetrioGame, window.TETRIO_GAME, window.game, window.app, window.tetrio];
-      for (const candidate of direct) {
-        if (looksLikeGame(candidate)) {
-          return {
-            game: candidate,
-            quick: false,
-            scanUsed: true
-          };
         }
-        const nested = scanObject(candidate, "direct", visited, 0, limit, hits);
-        if (nested) {
-          return {
-            game: nested,
-            quick: false,
-            scanUsed: true
-          };
-        }
-      }
-      const names = Object.getOwnPropertyNames(window).slice(0, 160);
-      for (const name of names) {
-        try {
-          const value = window[name];
-          if (looksLikeGame(value)) {
-            return {
-              game: value,
-              quick: false,
-              scanUsed: true
-            };
-          }
-          if (value && typeof value === "object") {
-            const nested = scanObject(value, "window." + name, visited, 0, limit, hits);
-            if (nested) {
-              return {
-                game: nested,
-                quick: false,
-                scanUsed: true
-              };
-            }
-          }
-        } catch {}
-      }
-      return null;
-    };
-
-    const quick = tryDirectGame();
-    const located = quick ?? (allowShallowScan ? findGameByScan() : null);
+      : null;
     if (!located?.game) {
-      let windowKeys = [];
-      try { windowKeys = Object.getOwnPropertyNames(window).slice(0, 120); } catch {}
       return {
         ok: false,
         quick: false,
-        scanUsed: allowShallowScan,
-        reason: allowShallowScan
-          ? "TETR.IO game instance not captured yet"
-          : "TETR.IO game instance is unavailable on quick path",
+        scanUsed: false,
+        reason: "TETR.IO game instance not captured yet",
         href: location.href,
-        pageTitle: document.title,
-        windowKeys,
-        directCandidatePaths: windowKeys.filter((name) => /game|tetr|room|match|board|ribbon/i.test(name)).slice(0, 40),
-        gameSearchStats: {
-          topLevelWindowKeys: windowKeys.length
-        }
+        pageTitle: document.title
       };
     }
     const game = located.game;
@@ -906,6 +825,11 @@ function isMissingExecutionContextError(error) {
 
 async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent) {
   for (const callFrame of pausedEvent.callFrames ?? []) {
+    const scopeCapture = await exposeTetrioGameFromScopeChain(cdp, callFrame);
+    if (scopeCapture.ok) {
+      return scopeCapture;
+    }
+
     const result = await cdp.send("Debugger.evaluateOnCallFrame", {
       callFrameId: callFrame.callFrameId,
       expression: `(() => {
@@ -977,6 +901,77 @@ async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent) {
     if (value?.ok) return value;
   }
   return { ok: false, reason: "TETR.IO active game variable was not in paused scopes" };
+}
+
+async function exposeTetrioGameFromScopeChain(cdp, callFrame) {
+  for (const scope of callFrame.scopeChain ?? []) {
+    const objectId = scope?.object?.objectId;
+    if (!objectId) {
+      continue;
+    }
+    const captured = await captureTetrioGameFromScopeObject(
+      cdp,
+      objectId,
+      `scope:${scope.type ?? "unknown"}`
+    );
+    if (captured.ok) {
+      return captured;
+    }
+  }
+  return { ok: false };
+}
+
+async function captureTetrioGameFromScopeObject(cdp, objectId, sourceLabel) {
+  const result = await cdp.send("Runtime.callFunctionOn", {
+    objectId,
+    functionDeclaration: `function() {
+      const sourceLabel = ${JSON.stringify(sourceLabel)};
+      const looksLikeGame = (value) =>
+        value &&
+        typeof value === "object" &&
+        typeof value.ejectState === "function" &&
+        typeof value.ejectBoardState === "function";
+      const visited = new WeakSet();
+      const scanObject = (root, path, depth = 0) => {
+        if (!root || typeof root !== "object") return null;
+        if (visited.has(root) || depth > 3) return null;
+        visited.add(root);
+        if (looksLikeGame(root)) {
+          return { game: root, path };
+        }
+        let names = [];
+        try { names = Object.getOwnPropertyNames(root).slice(0, 80); } catch {}
+        for (const name of names) {
+          try {
+            const value = root[name];
+            const nested = scanObject(value, path ? path + "." + name : name, depth + 1);
+            if (nested) return nested;
+          } catch {}
+        }
+        return null;
+      };
+      try {
+        const found = scanObject(this, sourceLabel, 0);
+        if (!found?.game) {
+          return { ok: false };
+        }
+        window.__fusionTetrioGame = found.game;
+        return {
+          ok: true,
+          source: found.path,
+          at: Date.now(),
+          href: location.href
+        };
+      } catch {
+        return { ok: false };
+      }
+    }`,
+    returnByValue: true,
+    awaitPromise: true,
+    silent: true
+  }).catch(() => null);
+
+  return result?.result?.value ?? { ok: false };
 }
 
 function buildSeedFallbackState(network) {
