@@ -125,6 +125,9 @@ impl LauncherState {
         self.snapshot_provider = SnapshotProviderConfig::BrowserCdp;
         self.input_backend = InputBackendConfig::BrowserCdp;
         self.browser = BrowserCdpConfig::default();
+        self.bot.threads = BotConfig::default().threads;
+        self.bot.min_nodes = BotConfig::default().min_nodes;
+        self.bot.max_nodes = BotConfig::default().max_nodes;
         self.bot.speculate = false;
         self.bot.movement_mode = MovementModeConfig::ZeroGSafe;
         self.bot.spawn_rule = SpawnRuleConfig::Row19Or20;
@@ -240,7 +243,15 @@ impl LauncherApp {
     }
 
     fn push_log(&mut self, line: impl Into<String>) {
-        self.logs.push(line.into());
+        let line = line.into();
+        if line.contains("[automation] idle waiting for next live game") {
+            self.status = "Waiting".to_owned();
+        } else if line.contains("[automation] live game resumed")
+            || line.contains("[automation] source=")
+        {
+            self.status = "Running".to_owned();
+        }
+        self.logs.push(line);
         if self.logs.len() > 400 {
             let drain = self.logs.len() - 400;
             self.logs.drain(0..drain);

@@ -32,8 +32,8 @@
     "bootstrap_timeout_ms": 2500
   },
   "bot": {
-    "threads": 1,
-    "min_nodes": 0,
+    "threads": 4,
+    "min_nodes": 4000,
     "max_nodes": 400000,
     "use_hold": true,
     "speculate": false,

@@ -76,6 +76,8 @@ The built-in live presets now apply a `TETR.IO Safe preset` aimed at personal so
 - `Target`: `TETR.IO`
 - `Movement`: `ZeroG Safe` by default
 - `Spawn`: `Row 19 or 20`
+- `Planner threads`: auto-detect up to `4`
+- `Planner min nodes`: `4000`
 - `Legacy Tap`: `60ms`
 - `Move Tap`: `55ms`
 - `Rotate Tap`: `70ms`
@@ -111,6 +113,7 @@ profile:
 - `Input backend`: `Browser CDP`
 - `Movement`: `ZeroG Safe`
 - `Spawn`: `Row 19 or 20`
+- `Planner`: auto-detect up to `4` threads, `4000` min nodes
 - `IRS/IHS`: `Off` first, then experiment with tap buffering only after the base profile is stable
 
 Movement taps are clamped below DAS with a safety margin, while rotate / hard drop keep their own

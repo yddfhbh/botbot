@@ -71,6 +71,7 @@ pub struct JsonFileScanner {
 #[derive(Clone, Debug)]
 struct PieceTransitionGuard {
     queue: Vec<PieceToken>,
+    piece_counter: Option<u32>,
 }
 
 impl JsonFileScanner {
@@ -91,6 +92,7 @@ impl SnapshotScanner for JsonFileScanner {
     fn arm_piece_transition(&mut self, previous: &GameSnapshot) {
         self.piece_transition_guard = Some(PieceTransitionGuard {
             queue: previous.queue.clone(),
+            piece_counter: previous.piece_counter,
         });
     }
 
@@ -148,7 +150,7 @@ impl SnapshotScanner for JsonFileScanner {
         }
 
         if let Some(guard) = &self.piece_transition_guard {
-            if !queue_transitioned(&guard.queue, &snapshot.queue) {
+            if !queue_transitioned(&guard.queue, guard.piece_counter, &snapshot) {
                 return Ok(None);
             }
         }
@@ -177,8 +179,18 @@ fn parse_snapshot_json(raw: &str) -> Result<GameSnapshot> {
     }
 }
 
-fn queue_transitioned(previous: &[PieceToken], candidate: &[PieceToken]) -> bool {
-    previous != candidate
+fn queue_transitioned(
+    previous_queue: &[PieceToken],
+    previous_piece_counter: Option<u32>,
+    candidate: &GameSnapshot,
+) -> bool {
+    if previous_queue != candidate.queue {
+        return true;
+    }
+    if let (Some(previous), Some(current)) = (previous_piece_counter, candidate.piece_counter) {
+        return current != previous;
+    }
+    false
 }
 
 fn default_snapshot_source() -> String {
@@ -221,13 +233,56 @@ mod tests {
 
     #[test]
     fn queue_transition_requires_queue_change() {
+        let same_snapshot = GameSnapshot {
+            source: "browser_cdp".to_owned(),
+            token: "browser-4".to_owned(),
+            field: vec![[false; 10]; 40],
+            queue: vec![PieceToken::T, PieceToken::I, PieceToken::O],
+            hold: None,
+            combo: 0,
+            b2b: false,
+            incoming: 0,
+            piece_counter: Some(4),
+            playing: true,
+            countdown: false,
+        };
         assert!(!queue_transitioned(
             &[PieceToken::T, PieceToken::I, PieceToken::O],
-            &[PieceToken::T, PieceToken::I, PieceToken::O]
+            Some(4),
+            &same_snapshot
         ));
+        let changed_queue = GameSnapshot {
+            token: "browser-5".to_owned(),
+            queue: vec![PieceToken::I, PieceToken::O, PieceToken::L],
+            piece_counter: Some(5),
+            ..same_snapshot.clone()
+        };
         assert!(queue_transitioned(
             &[PieceToken::T, PieceToken::I, PieceToken::O],
-            &[PieceToken::I, PieceToken::O, PieceToken::L]
+            Some(4),
+            &changed_queue
+        ));
+    }
+
+    #[test]
+    fn queue_transition_allows_new_game_even_if_queue_repeats() {
+        let candidate = GameSnapshot {
+            source: "browser_cdp".to_owned(),
+            token: "browser-0".to_owned(),
+            field: vec![[false; 10]; 40],
+            queue: vec![PieceToken::T, PieceToken::I, PieceToken::O],
+            hold: None,
+            combo: 0,
+            b2b: false,
+            incoming: 0,
+            piece_counter: Some(0),
+            playing: true,
+            countdown: false,
+        };
+        assert!(queue_transitioned(
+            &[PieceToken::T, PieceToken::I, PieceToken::O],
+            Some(12),
+            &candidate
         ));
     }
 

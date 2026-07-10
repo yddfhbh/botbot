@@ -16,7 +16,7 @@
     "use_seed_simulation_fallback": true,
     "bootstrap_timeout_ms": 2500
   },
-  "always_on_top": true,
+  "always_on_top": false,
   "dry_run": false,
   "poll_interval_ms": 16,
   "tap_duration_ms": 60,
@@ -32,12 +32,12 @@
   "min_snapshot_age_ms": 40,
   "input_backend": "scan_code",
   "bot": {
-    "threads": 1,
-    "min_nodes": 0,
+    "threads": 4,
+    "min_nodes": 4000,
     "max_nodes": 400000,
     "use_hold": true,
     "speculate": false,
-    "movement_mode": "hard_drop_only",
+    "movement_mode": "zero_g_safe",
     "spawn_rule": "row19_or20"
   },
   "handling": {

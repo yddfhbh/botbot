@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use cold_clear::evaluation::Standard;
-use cold_clear::Interface;
+use cold_clear::{Info, Interface};
 use libtetris::{
     find_moves, Board, FallingPiece, Move, MovementMode, Piece, PieceMovement, Placement,
     RotationState, SpawnRule,
@@ -144,6 +144,9 @@ where
         previous_snapshot.token,
         queue_labels(&previous_snapshot.queue)
     ));
+    let idle_threshold = Duration::from_millis(1500);
+    let mut waited = Duration::ZERO;
+    let mut idle_logged = false;
 
     loop {
         if stop.load(AtomicOrdering::Relaxed) {
@@ -151,6 +154,13 @@ where
         }
         match scanner.next_snapshot()? {
             Some(snapshot) => {
+                if idle_logged {
+                    log(format!(
+                        "[automation] live game resumed token={} queue={}",
+                        snapshot.token,
+                        queue_labels(&snapshot.queue)
+                    ));
+                }
                 if !piece_interval.is_zero() {
                     log(format!(
                         "[automation] piece_interval {}ms before next token={}",
@@ -166,7 +176,17 @@ where
                 ));
                 return Ok(Some(snapshot));
             }
-            None => thread::sleep(poll_delay),
+            None => {
+                thread::sleep(poll_delay);
+                waited = waited.saturating_add(poll_delay);
+                if !idle_logged && waited >= idle_threshold {
+                    log(format!(
+                        "[automation] idle waiting for next live game after token={}",
+                        previous_snapshot.token
+                    ));
+                    idle_logged = true;
+                }
+            }
         }
     }
 }
@@ -192,6 +212,7 @@ fn skip_snapshot_reason(
 #[derive(Clone, Debug)]
 struct PreparedExecution {
     planned_move: Move,
+    planner_info: Info,
     movement_mode_used: MovementModeConfig,
     spawn_rule_used: SpawnRuleConfig,
     fallback_from: Option<MovementModeConfig>,
@@ -252,10 +273,21 @@ fn prepare_execution<F>(
 where
     F: FnMut(String),
 {
-    let planned_move = plan_move_for_mode(config, snapshot, config.bot.movement_mode)?;
+    let Some((planned_move, planner_info)) =
+        plan_move_for_mode(config, snapshot, config.bot.movement_mode)?
+    else {
+        log(format!(
+            "[automation] source={} token={} planner produced no move for mode={}; waiting for fresher snapshot",
+            snapshot.source,
+            snapshot.token,
+            movement_mode_label(config.bot.movement_mode),
+        ));
+        return Ok(None);
+    };
     match build_execution_plan(config, snapshot, &planned_move, config.bot.movement_mode) {
         Ok(result) => Ok(Some(PreparedExecution {
             planned_move,
+            planner_info,
             movement_mode_used: config.bot.movement_mode,
             spawn_rule_used: config.bot.spawn_rule,
             fallback_from: None,
@@ -282,10 +314,21 @@ where
             ));
 
             let fallback_mode = MovementModeConfig::HardDropOnly;
-            let fallback_move = plan_move_for_mode(config, snapshot, fallback_mode)?;
+            let Some((fallback_move, fallback_info)) =
+                plan_move_for_mode(config, snapshot, fallback_mode)?
+            else {
+                log(format!(
+                    "[automation] source={} token={} planner produced no move for fallback mode={}; waiting for fresher snapshot",
+                    snapshot.source,
+                    snapshot.token,
+                    movement_mode_label(fallback_mode),
+                ));
+                return Ok(None);
+            };
             match build_execution_plan(config, snapshot, &fallback_move, fallback_mode) {
                 Ok(result) => Ok(Some(PreparedExecution {
                     planned_move: fallback_move,
+                    planner_info: fallback_info,
                     movement_mode_used: fallback_mode,
                     spawn_rule_used: config.bot.spawn_rule,
                     fallback_from: Some(config.bot.movement_mode),
@@ -353,6 +396,10 @@ where
         target.x, target.y, target.kind.1
     ));
     log(format!(
+        "[automation] planner={}",
+        format_planner_info(&prepared.planner_info)
+    ));
+    log(format!(
         "[automation] routes={} chosen={} actions={:?}",
         prepared.route_selection.candidate_count,
         prepared.route_selection.route_kind,
@@ -405,7 +452,8 @@ fn spawn_rule_label(rule: SpawnRuleConfig) -> &'static str {
 #[cfg_attr(not(test), allow(dead_code))]
 fn plan_move(config: &AutomationConfig, snapshot: &GameSnapshot) -> Result<(Move, &'static str)> {
     let movement_mode = config.bot.movement_mode;
-    let planned_move = plan_move_for_mode(config, snapshot, movement_mode)?;
+    let (planned_move, _) = plan_move_for_mode(config, snapshot, movement_mode)?
+        .context("bot failed to produce a move for the current snapshot")?;
     Ok((planned_move, movement_mode_label(movement_mode)))
 }
 
@@ -413,7 +461,7 @@ fn plan_move_for_mode(
     config: &AutomationConfig,
     snapshot: &GameSnapshot,
     movement_mode: MovementModeConfig,
-) -> Result<Move> {
+) -> Result<Option<(Move, Info)>> {
     let queue = snapshot.queue_pieces();
     if queue.is_empty() {
         anyhow::bail!("snapshot queue must include the active piece as the first element");
@@ -449,10 +497,21 @@ fn plan_move_for_mode(
         Option::<Arc<cold_clear::Book>>::None,
     );
     interface.suggest_next_move(snapshot.incoming);
-    let (planned_move, _) = interface
+    let planned_move = interface
         .block_next_move()
-        .context("bot failed to produce a move for the current snapshot")?;
+        .map(|(planned_move, info)| (planned_move, info));
     Ok(planned_move)
+}
+
+fn format_planner_info(info: &Info) -> String {
+    match info {
+        Info::Book => "book".to_owned(),
+        Info::PcLoop(_) => "pcloop".to_owned(),
+        Info::Normal(details) => format!(
+            "normal nodes={} depth={} rank={}",
+            details.nodes, details.depth, details.original_rank
+        ),
+    }
 }
 
 fn movement_mode_for_planning(mode: MovementModeConfig) -> MovementMode {

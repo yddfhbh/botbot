@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::thread;
 
 use serde::{Deserialize, Serialize};
 
@@ -127,8 +128,8 @@ pub struct BotConfig {
 impl Default for BotConfig {
     fn default() -> Self {
         Self {
-            threads: 1,
-            min_nodes: 0,
+            threads: default_bot_threads(),
+            min_nodes: 4_000,
             max_nodes: 400_000,
             use_hold: true,
             speculate: false,
@@ -234,4 +235,11 @@ impl Default for KeyBindings {
             hard_drop: "SPACE".to_owned(),
         }
     }
+}
+
+fn default_bot_threads() -> u32 {
+    let detected = thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+    detected.min(4) as u32
 }
