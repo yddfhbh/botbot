@@ -41,15 +41,7 @@ async function main() {
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
   await cdp.send("Page.enable").catch(() => undefined);
   await cdp.send("Runtime.enable").catch(() => undefined);
-  await cdp.send("Page.bringToFront").catch(() => undefined);
   await installBackgroundInputKeepalive(cdp);
-  await safeRuntimeEvaluate(
-    cdp,
-    {
-      expression: "window.focus(); document.body && document.body.focus && document.body.focus(); true"
-    },
-    null
-  ).catch(() => undefined);
 
   console.log(`[browser] connected to ${target.title || target.url} on port ${port}`);
   console.log(
