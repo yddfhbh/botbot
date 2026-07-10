@@ -430,11 +430,7 @@ impl LauncherApp {
             .arg("--target")
             .arg(&self.state.browser.target_hint)
             .arg("--connect-only")
-            .arg(if self.state.browser.connect_only {
-                "1"
-            } else {
-                "0"
-            })
+            .arg("1")
             .arg("--manual-capture-once")
             .arg("1")
             .current_dir(&self.paths.workspace_root);
@@ -459,6 +455,9 @@ impl LauncherApp {
                         "[launcher] manual game-object capture failed status={}",
                         output.status
                     ));
+                    self.push_log(
+                        "[launcher] open TETR.IO first, wait for the page to finish loading, then try Capture game object again",
+                    );
                     false
                 }
             }
@@ -466,6 +465,9 @@ impl LauncherApp {
                 self.push_log(format!(
                     "[launcher] failed to run manual game-object capture: {err}"
                 ));
+                self.push_log(
+                    "[launcher] open TETR.IO first, wait for the page to finish loading, then try Capture game object again",
+                );
                 false
             }
         }
@@ -475,6 +477,7 @@ impl LauncherApp {
         self.state.snapshot_provider == SnapshotProviderConfig::BrowserCdp
             && self.state.browser.probe_page_state
             && self.state.browser.debugger_probe_mode == DebuggerProbeMode::Manual
+            && self.state.browser.connect_only
     }
 
     fn start(&mut self) {
@@ -718,7 +721,11 @@ impl eframe::App for LauncherApp {
                         }
                     });
                     if self.state.browser.debugger_probe_mode == DebuggerProbeMode::Manual {
-                        ui.small("`Start` will try one capture first. If it fails, the session will not start.");
+                        if self.state.browser.connect_only {
+                            ui.small("`Start` will try one capture first. If it fails, the session will not start.");
+                        } else {
+                            ui.small("Open TETR.IO, press `Start`, then use `Capture game object` after the page finishes loading.");
+                        }
                     }
                     ui.checkbox(&mut self.show_browser_advanced, "Show advanced browser options");
                     if self.show_browser_advanced {
