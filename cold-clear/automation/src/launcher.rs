@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -285,6 +285,7 @@ enum LauncherEvent {
 
 struct RunningSession {
     stop: Arc<AtomicBool>,
+    live_target_pps: Arc<AtomicU32>,
     automation_thread: Option<JoinHandle<()>>,
 }
 
@@ -383,16 +384,24 @@ impl LauncherApp {
 
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let live_target_pps = Arc::new(AtomicU32::new(self.state.target_pps.to_bits()));
 
         let config = self.state.to_automation_config(&self.paths);
         let paths = self.paths.clone();
         let worker_stop = stop.clone();
+        let worker_target_pps = live_target_pps.clone();
         let worker_tx = tx.clone();
         let worker_log_tx = worker_tx.clone();
         let automation_thread = thread::spawn(move || {
-            let result = run_automation(paths, config, &worker_stop, move |line| {
-                let _ = worker_log_tx.send(LauncherEvent::Log(line));
-            })
+            let result = run_automation(
+                paths,
+                config,
+                worker_target_pps,
+                &worker_stop,
+                move |line| {
+                    let _ = worker_log_tx.send(LauncherEvent::Log(line));
+                },
+            )
             .map_err(|err| format!("{err:#}"));
             let _ = worker_tx.send(LauncherEvent::AutomationExited(result));
         });
@@ -402,8 +411,22 @@ impl LauncherApp {
         self.event_rx = Some(rx);
         self.running = Some(RunningSession {
             stop,
+            live_target_pps,
             automation_thread: Some(automation_thread),
         });
+    }
+
+    fn sync_live_target_pps(&mut self) {
+        let Some(running) = self.running.as_ref() else {
+            return;
+        };
+        running
+            .live_target_pps
+            .store(self.state.target_pps.to_bits(), Ordering::Relaxed);
+        self.push_log(format!(
+            "[launcher] live target PPS updated to {:.2}",
+            self.state.target_pps
+        ));
     }
 
     fn clear_snapshot_file(&mut self) {
@@ -479,6 +502,7 @@ impl eframe::App for LauncherApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level(
             self.state.always_on_top,
         )));
+        let mut target_pps_changed = false;
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -576,11 +600,13 @@ impl eframe::App for LauncherApp {
                 ui.label("Poll");
                 ui.add(egui::DragValue::new(&mut self.state.poll_interval_ms).speed(1));
                 ui.label("Target PPS");
-                ui.add(
+                target_pps_changed |= ui
+                    .add(
                     egui::DragValue::new(&mut self.state.target_pps)
                         .speed(0.05)
                         .range(0.0..=20.0),
-                );
+                )
+                    .changed();
                 ui.small("0 = unlimited");
             });
             ui.horizontal(|ui| {
@@ -688,6 +714,10 @@ impl eframe::App for LauncherApp {
                     }
                 });
         });
+
+        if target_pps_changed {
+            self.sync_live_target_pps();
+        }
 
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }

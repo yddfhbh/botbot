@@ -9,7 +9,8 @@ mod scanner;
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use config::AutomationConfig;
@@ -52,7 +53,8 @@ fn run_cli(paths: AppPaths, first_arg: String, rest_args: Vec<String>) -> Result
         serde_json::from_str(&raw_config).context("failed to parse automation config JSON")?;
     apply_cli_overrides(&mut config, &overrides)?;
     let stop = AtomicBool::new(false);
-    run_automation(paths, config, &stop, |line| {
+    let live_target_pps = Arc::new(AtomicU32::new(config.target_pps.to_bits()));
+    run_automation(paths, config, live_target_pps, &stop, |line| {
         println!("{}", line);
     })
 }

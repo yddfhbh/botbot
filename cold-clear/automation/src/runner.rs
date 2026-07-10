@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -31,15 +31,24 @@ pub fn run_loop<S: SnapshotScanner, D: InputBackend + ?Sized>(
     driver: &mut D,
 ) -> Result<()> {
     let stop = AtomicBool::new(false);
-    run_loop_until(config, scanner, driver, &stop, |line| {
-        println!("{}", line);
-    })
+    let live_target_pps = Arc::new(AtomicU32::new(config.target_pps.to_bits()));
+    run_loop_until(
+        config,
+        scanner,
+        driver,
+        live_target_pps.as_ref(),
+        &stop,
+        |line| {
+            println!("{}", line);
+        },
+    )
 }
 
 pub fn run_loop_until<S, D, F>(
     config: &AutomationConfig,
     scanner: &mut S,
     driver: &mut D,
+    live_target_pps: &AtomicU32,
     stop: &AtomicBool,
     mut log: F,
 ) -> Result<()>
@@ -50,7 +59,6 @@ where
 {
     let poll_delay = Duration::from_millis(config.poll_interval_ms);
     let piece_interval = Duration::from_millis(config.piece_interval_ms);
-    let target_piece_time = target_pps_interval(config.target_pps);
     let mut last_piece_counter = None;
     let mut last_hard_drop_started_at = None;
     let execution_timings = ExecutionTimings {
@@ -114,10 +122,13 @@ where
                                 &mut log,
                             )? {
                                 HardDropDecision::Proceed => {
+                                    let current_target_pps = f32::from_bits(
+                                        live_target_pps.load(AtomicOrdering::Relaxed),
+                                    );
                                     if !wait_for_target_pps(
-                                        target_piece_time,
+                                        target_pps_interval(current_target_pps),
                                         last_hard_drop_started_at,
-                                        config.target_pps,
+                                        current_target_pps,
                                         stop,
                                         &mut log,
                                     ) {

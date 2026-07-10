@@ -42,6 +42,7 @@ Running without arguments opens the launcher. The launcher is now Browser CDP on
 - set Chrome path, CDP port, URL, and target hint
 - toggle page probing, ribbon websocket capture, and seed simulation fallback
 - tune dry-run, target PPS, tap timings, and planner limits
+- `Target PPS` changes apply immediately while a session is running
 - start or stop the bot session
 
 ## TETR.IO Safe preset

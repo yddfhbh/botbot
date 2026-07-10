@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,6 +14,7 @@ use crate::scanner::JsonFileScanner;
 pub fn run_automation<F>(
     paths: AppPaths,
     config: AutomationConfig,
+    live_target_pps: Arc<AtomicU32>,
     stop: &AtomicBool,
     log: F,
 ) -> Result<()>
@@ -27,7 +28,7 @@ where
             "[automation] watching {} dry_run={} target_pps={:.2}",
             config.snapshot_path.display(),
             config.dry_run,
-            config.target_pps
+            f32::from_bits(live_target_pps.load(Ordering::Relaxed))
         ),
     );
     let provider = ProviderProcess::start(&paths, &config, logger.clone())?;
@@ -37,9 +38,16 @@ where
     );
     let mut backend = create_input_backend(&paths, &config)?;
     let logger_for_loop = logger.clone();
-    let result = run_loop_until(&config, &mut scanner, backend.as_mut(), stop, move |line| {
-        emit_log(&logger_for_loop, line);
-    });
+    let result = run_loop_until(
+        &config,
+        &mut scanner,
+        backend.as_mut(),
+        live_target_pps.as_ref(),
+        stop,
+        move |line| {
+            emit_log(&logger_for_loop, line);
+        },
+    );
     let release_result = backend.release_all_keys();
     drop(provider);
     result.and(release_result)

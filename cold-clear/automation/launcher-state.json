@@ -16,7 +16,7 @@
   "always_on_top": false,
   "dry_run": false,
   "poll_interval_ms": 2,
-  "target_pps": 0.0,
+  "target_pps": 1.5,
   "tap_duration_ms": 60,
   "movement_tap_duration_ms": 12,
   "rotate_tap_duration_ms": 14,
