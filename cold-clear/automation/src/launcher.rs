@@ -170,7 +170,8 @@ impl LauncherState {
             && (self.matches_first_safe_preset_family()
                 || self.matches_second_safe_preset_family()
                 || self.matches_third_safe_preset_family()
-                || self.matches_fourth_safe_preset_family())
+                || self.matches_fourth_safe_preset_family()
+                || self.matches_fifth_safe_preset_family())
     }
 
     fn matches_first_safe_preset_family(&self) -> bool {
@@ -226,6 +227,22 @@ impl LauncherState {
             && self.hold_tap_duration_ms == 20
             && self.hard_drop_tap_duration_ms == 20
             && self.soft_drop_tap_duration_ms == 16
+            && self.movement_interval_ms == 0
+            && self.rotation_interval_ms == 0
+            && self.piece_interval_ms == 0
+            && self.hard_drop_interval_ms == 0
+            && self.min_snapshot_age_ms == 0
+            && self.handling.action_settle_ms == 0
+            && !self.handling.release_after_each_action
+    }
+
+    fn matches_fifth_safe_preset_family(&self) -> bool {
+        self.poll_interval_ms == 2
+            && self.movement_tap_duration_ms == 12
+            && self.rotate_tap_duration_ms == 14
+            && self.hold_tap_duration_ms == 16
+            && self.hard_drop_tap_duration_ms == 16
+            && self.soft_drop_tap_duration_ms == 12
             && self.movement_interval_ms == 0
             && self.rotation_interval_ms == 0
             && self.piece_interval_ms == 0
@@ -746,6 +763,9 @@ mod tests {
         assert_eq!(state.piece_interval_ms, 0);
         assert_eq!(state.hard_drop_interval_ms, 0);
         assert_eq!(state.min_snapshot_age_ms, 0);
+        assert_eq!(state.bot.threads, 4);
+        assert_eq!(state.bot.min_nodes, 4_000);
+        assert_eq!(state.bot.max_nodes, 400_000);
         assert!(state.handling.allow_post_softdrop_actions);
         assert!(!state.handling.allow_post_softdrop_horizontal);
         assert!(!state.handling.release_after_each_action);
@@ -801,6 +821,9 @@ mod tests {
         assert_eq!(state.piece_interval_ms, 0);
         assert_eq!(state.hard_drop_interval_ms, 0);
         assert_eq!(state.min_snapshot_age_ms, 0);
+        assert_eq!(state.bot.threads, 4);
+        assert_eq!(state.bot.min_nodes, 4_000);
+        assert_eq!(state.bot.max_nodes, 400_000);
         assert_eq!(state.handling.action_settle_ms, 0);
         assert!(!state.handling.release_after_each_action);
     }

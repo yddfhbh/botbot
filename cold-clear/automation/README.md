@@ -55,9 +55,9 @@ The built-in presets now target a faster Browser CDP setup for personal practice
 - `Target`: `TETR.IO`
 - `Movement`: `ZeroG Safe`
 - `Spawn`: `Row 19 or 20`
-- `Planner threads`: `1`
-- `Planner min nodes`: `50`
-- `Planner max nodes`: `800`
+- `Planner threads`: `4`
+- `Planner min nodes`: `4000`
+- `Planner max nodes`: `400000`
 - `Target PPS`: `0.0` (`0 = unlimited`)
 - `Poll`: `2ms`
 - `Move Tap`: `12ms`
@@ -81,7 +81,7 @@ If you need a simpler emergency path, switch `Movement` to `Hard Drop Only`.
 
 ## Speed Notes
 
-If the bot still feels capped around low PPS, the likely bottleneck is planner cost rather than tap delay.
+If the bot still feels capped around low PPS, planner cost is one of the main bottlenecks. This preset now keeps the stronger planner defaults instead of aggressively cutting search quality.
 
 - lower `Planner min nodes` and `Planner max nodes` first
 - keep `Target PPS` at `0` while testing raw speed

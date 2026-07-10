@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -512,9 +512,14 @@ async function readTetrioState(cdp, options) {
   };
 
   let state = await read();
+  const shouldRecaptureGame =
+    !state.ok ||
+    !state.ready ||
+    !state.playing ||
+    state.countdown;
   const shouldCapture =
     options.probePageState &&
-    !state.ok &&
+    shouldRecaptureGame &&
     Date.now() - (options.probeState?.lastCaptureAt ?? 0) >= 2000 &&
     Date.now() - (options.network?.lastPageProbeAt ?? 0) >= 2000;
 
@@ -945,8 +950,12 @@ function writeSnapshot(snapshotPath, payload) {
   mkdirSync(directory, { recursive: true });
   const temporaryPath = `${snapshotPath}.tmp`;
   writeFileSync(temporaryPath, JSON.stringify(payload, null, 2));
-  rmSync(snapshotPath, { force: true });
-  renameSync(temporaryPath, snapshotPath);
+  try {
+    renameSync(temporaryPath, snapshotPath);
+  } catch {
+    copyFileSync(temporaryPath, snapshotPath);
+    rmSync(temporaryPath, { force: true });
+  }
 }
 
 function sleep(ms) {
