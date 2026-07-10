@@ -540,6 +540,7 @@ impl eframe::App for LauncherApp {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.state.dry_run, "Dry run");
                 ui.checkbox(&mut self.state.bot.use_hold, "Use hold");
+                ui.checkbox(&mut self.state.bot.speculate, "Speculate");
                 ui.checkbox(
                     &mut self.state.handling.allow_post_softdrop_actions,
                     "Allow spin routes",
@@ -627,6 +628,22 @@ impl eframe::App for LauncherApp {
                     });
                 ui.label("Planner");
                 ui.monospace("Safe spawn tap route");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Threads");
+                ui.add(egui::DragValue::new(&mut self.state.bot.threads).range(1..=8).speed(1));
+                ui.label("Min Nodes");
+                ui.add(
+                    egui::DragValue::new(&mut self.state.bot.min_nodes)
+                        .range(50..=50_000)
+                        .speed(50),
+                );
+                ui.label("Max Nodes");
+                ui.add(
+                    egui::DragValue::new(&mut self.state.bot.max_nodes)
+                        .range(100..=500_000)
+                        .speed(100),
+                );
             });
 
             ui.separator();

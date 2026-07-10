@@ -95,7 +95,7 @@ where
                 }
                 match prepare_execution(config, &snapshot, &mut log)? {
                     Some(prepared) => {
-                        emit_move_logs(&snapshot, &prepared, &mut log);
+                        emit_move_logs(config, &snapshot, &prepared, &mut log);
                         execute_plan_until_hard_drop(
                             driver,
                             &prepared.execution_plan,
@@ -446,6 +446,7 @@ fn sleep_with_stop(stop: &AtomicBool, duration: Duration) -> bool {
 struct PreparedExecution {
     planned_move: Move,
     planner_info: Info,
+    planner_elapsed_ms: u128,
     movement_mode_used: MovementModeConfig,
     spawn_rule_used: SpawnRuleConfig,
     fallback_from: Option<MovementModeConfig>,
@@ -515,6 +516,7 @@ fn prepare_execution<F>(
 where
     F: FnMut(String),
 {
+    let planner_started_at = Instant::now();
     let Some((planned_move, planner_info)) =
         plan_move_for_mode(config, snapshot, config.bot.movement_mode)?
     else {
@@ -530,6 +532,7 @@ where
         Ok(result) => Ok(Some(PreparedExecution {
             planned_move,
             planner_info,
+            planner_elapsed_ms: planner_started_at.elapsed().as_millis(),
             movement_mode_used: config.bot.movement_mode,
             spawn_rule_used: config.bot.spawn_rule,
             fallback_from: None,
@@ -573,6 +576,7 @@ where
                     .as_deref()
                     .unwrap_or("unknown")
             ));
+            let fallback_started_at = Instant::now();
             let Some((fallback_move, fallback_info)) =
                 plan_move_for_mode(config, snapshot, fallback_mode)?
             else {
@@ -588,6 +592,7 @@ where
                 Ok(result) => Ok(Some(PreparedExecution {
                     planned_move: fallback_move,
                     planner_info: fallback_info,
+                    planner_elapsed_ms: fallback_started_at.elapsed().as_millis(),
                     movement_mode_used: fallback_mode,
                     spawn_rule_used: config.bot.spawn_rule,
                     fallback_from: Some(config.bot.movement_mode),
@@ -632,8 +637,12 @@ fn log_route_skip<F>(
     }
 }
 
-fn emit_move_logs<F>(snapshot: &GameSnapshot, prepared: &PreparedExecution, log: &mut F)
-where
+fn emit_move_logs<F>(
+    config: &AutomationConfig,
+    snapshot: &GameSnapshot,
+    prepared: &PreparedExecution,
+    log: &mut F,
+) where
     F: FnMut(String),
 {
     let active_piece = snapshot
@@ -662,8 +671,14 @@ where
         target.x, target.y, target.kind.1
     ));
     log(format!(
-        "[automation] planner={}",
-        format_planner_info(&prepared.planner_info)
+        "[automation] planner={} elapsed_ms={} threads={} min_nodes={} max_nodes={} use_hold={} speculate={}",
+        format_planner_info(&prepared.planner_info),
+        prepared.planner_elapsed_ms,
+        config.bot.threads,
+        config.bot.min_nodes,
+        config.bot.max_nodes,
+        config.bot.use_hold,
+        config.bot.speculate
     ));
     log(format!(
         "[automation] routes={} chosen={} actions={:?}",

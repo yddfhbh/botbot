@@ -130,9 +130,9 @@ pub struct BotConfig {
 impl Default for BotConfig {
     fn default() -> Self {
         Self {
-            threads: default_bot_threads(),
-            min_nodes: 4_000,
-            max_nodes: 400_000,
+            threads: 1,
+            min_nodes: 500,
+            max_nodes: 5_000,
             use_hold: true,
             speculate: false,
             movement_mode: MovementModeConfig::ZeroGSafe,
