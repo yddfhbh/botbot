@@ -9,6 +9,7 @@ const DEFAULT_URL = "https://tetr.io/";
 const DEFAULT_PORT = 9222;
 const DEFAULT_NEXT_COUNT = 6;
 const DEFAULT_STATUS_MS = 2500;
+const MIN_STABLE_POLL_MS = 8;
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -155,7 +156,9 @@ async function main() {
       }
     }
 
-    await sleep(pollMs);
+    const nextPollMs =
+      signature === lastWrittenSignature ? Math.max(pollMs, MIN_STABLE_POLL_MS) : pollMs;
+    await sleep(nextPollMs);
   }
 }
 

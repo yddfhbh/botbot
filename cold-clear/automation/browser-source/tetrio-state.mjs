@@ -466,6 +466,39 @@ function addCandidateObject(player, pathLabel, state, boardState, candidates, se
   candidates.push(candidate);
 }
 
+function boardSignature(board) {
+  if (!Array.isArray(board)) return "";
+  return board
+    .map((row) => (Array.isArray(row) ? row.join("") : ""))
+    .join("|");
+}
+
+function candidateSignature(candidate) {
+  return [
+    candidate.current ?? "-",
+    candidate.hold ?? "-",
+    candidate.queue.join(""),
+    candidate.activeX ?? "-",
+    candidate.activeY ?? "-",
+    candidate.activeRotation ?? "-",
+    candidate.nickname ?? "-",
+    candidate.userId ?? "-",
+    boardSignature(candidate.board)
+  ].join("::");
+}
+
+function dedupeCandidates(candidates) {
+  const seen = new Set();
+  const deduped = [];
+  for (const candidate of candidates) {
+    const signature = candidateSignature(candidate);
+    if (seen.has(signature)) continue;
+    seen.add(signature);
+    deduped.push(candidate);
+  }
+  return deduped;
+}
+
 function collectRecursiveCandidates(root, rootPath, state, boardState, candidates, seenPlayers) {
   const seenObjects = new WeakSet();
   const stack = [{ value: root, path: rootPath, depth: 0 }];
@@ -545,7 +578,9 @@ export function extractLocalPlayerState({ exported, state, boardState, selector 
     collectRecursiveCandidates(exported, "exported", state, boardState, candidates, seenPlayers);
   }
 
-  const validCandidates = candidates.filter((candidate) => hasBoardCurrentQueue(candidate));
+  const validCandidates = dedupeCandidates(
+    candidates.filter((candidate) => hasBoardCurrentQueue(candidate))
+  );
   const selected = selectPlayerCandidate(validCandidates, normalized);
   const mode =
     validCandidates.length <= 1 && selected?.candidate?.path === "state"
@@ -836,7 +871,10 @@ export function resolveGameStateSnapshot({
 
   const field = boardToField(selected.board);
   const playingState = classifyPlayingState(selected, state, boardState, pageHints);
-  const pieceCounter = selected.pieceCounter;
+  const pieceCounter =
+    Number.isFinite(selected.pieceCounter) && selected.pieceCounter > 0
+      ? selected.pieceCounter
+      : null;
   const previewQueue = normalizePreviewQueue(selected.current, selected.queue);
   const fallbackToken = `browser-fallback-${selected.current}-${previewQueue.join("")}-${selected.hold ?? "-"}-${selected.activeX ?? "-"}-${selected.activeY ?? "-"}-${selected.activeRotation ?? "-"}-${hashField(field)}`;
   const token =

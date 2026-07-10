@@ -108,6 +108,55 @@ test("missing pieceCounter still generates a fallback token", () => {
   assert.match(snapshot.token, /^browser-fallback-/);
 });
 
+test("pieceCounter zero is treated like missing and does not block fallback tokens", () => {
+  const fixture = readFixture("solo-eject-state.json");
+  const stateRoot = fixture.exported?.game ?? fixture.exported;
+  stateRoot.stats = {
+    ...(stateRoot.stats ?? {}),
+    piecesplaced: 0,
+    piecesPlaced: 0,
+    pieces: 0
+  };
+  stateRoot.pieceCounter = 0;
+  stateRoot.piececount = 0;
+  stateRoot.lockCounter = 0;
+  stateRoot.frame = 0;
+  stateRoot.tick = 0;
+  fixture.boardState = {
+    ...(fixture.boardState ?? {}),
+    tick: 0
+  };
+
+  const snapshot = resolveGameStateSnapshot({
+    ...fixture,
+    selector: { playerSelector: "auto" },
+    targetTitle: "TETR.IO",
+    targetUrl: "https://tetr.io/"
+  });
+
+  assert.equal(snapshot.ok, true);
+  assert.equal(snapshot.pieceCounter, undefined);
+  assert.match(snapshot.token, /^browser-fallback-/);
+});
+
+test("solo duplicate clone candidates are deduped and stay in solo mode", () => {
+  const fixture = readFixture("solo-eject-state.json");
+  const stateRoot = fixture.exported?.game ?? fixture.exported;
+  fixture.exported.mirrorState = JSON.parse(JSON.stringify(stateRoot));
+
+  const snapshot = resolveGameStateSnapshot({
+    ...fixture,
+    selector: { playerSelector: "auto" },
+    targetTitle: "TETR.IO",
+    targetUrl: "https://tetr.io/"
+  });
+
+  assert.equal(snapshot.ok, true);
+  assert.equal(snapshot.mode, "solo");
+  assert.equal(snapshot.candidateCount, 1);
+  assert.equal(snapshot.selectedPath, "state");
+});
+
 test("missing board/current/queue returns ok:false and writes a dump", () => {
   const dumpDir = mkdtempSync(path.join(os.tmpdir(), "tetrio-state-test-"));
   const dumpPath = path.join(dumpDir, "state-dump.json");
