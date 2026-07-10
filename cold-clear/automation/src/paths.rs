@@ -6,6 +6,7 @@ pub struct AppPaths {
     pub workspace_root: PathBuf,
     pub launcher_state_path: PathBuf,
     pub browser_snapshot_script_path: PathBuf,
+    pub browser_websocket_seed_script_path: PathBuf,
     pub browser_input_script_path: PathBuf,
 }
 
@@ -19,6 +20,9 @@ impl AppPaths {
             browser_snapshot_script_path: automation_dir
                 .join("browser-source")
                 .join("tetrio-cdp-source.mjs"),
+            browser_websocket_seed_script_path: automation_dir
+                .join("browser-source")
+                .join("tetrio-websocket-seed-source.mjs"),
             browser_input_script_path: automation_dir
                 .join("browser-source")
                 .join("browser-cdp-input.mjs"),

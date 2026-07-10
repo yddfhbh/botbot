@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     AutomationConfig, BotConfig, BrowserCdpConfig, BufferModeConfig, HandlingConfig, KeyBindings,
-    MovementModeConfig, PlayerSelectorConfig, SoftDropModeConfig, SpawnRuleConfig,
+    MovementModeConfig, PlayerSelectorConfig, SnapshotProviderConfig, SoftDropModeConfig,
+    SpawnRuleConfig,
 };
 use crate::driver::create_input_backend;
 use crate::paths::AppPaths;
@@ -39,6 +40,7 @@ impl ModePreset {
 struct LauncherState {
     preset: ModePreset,
     snapshot_path: String,
+    snapshot_provider: SnapshotProviderConfig,
     browser: BrowserCdpConfig,
     always_on_top: bool,
     dry_run: bool,
@@ -65,6 +67,7 @@ impl Default for LauncherState {
         Self {
             preset: ModePreset::VsLeft1080p,
             snapshot_path: "automation/live-snapshot.json".to_owned(),
+            snapshot_provider: SnapshotProviderConfig::BrowserCdp,
             browser: BrowserCdpConfig::default(),
             always_on_top: false,
             dry_run: true,
@@ -105,6 +108,7 @@ pub fn launcher_viewport(paths: &AppPaths) -> egui::ViewportBuilder {
 
 impl LauncherState {
     fn apply_tetrio_safe_preset(&mut self) {
+        self.snapshot_provider = SnapshotProviderConfig::BrowserCdp;
         self.target_pps = 0.0;
         self.tap_duration_ms = 60;
         self.poll_interval_ms = 2;
@@ -255,6 +259,7 @@ impl LauncherState {
     fn to_automation_config(&self, paths: &AppPaths) -> AutomationConfig {
         AutomationConfig {
             snapshot_path: paths.resolve_workspace_path(&self.snapshot_path),
+            snapshot_provider: self.snapshot_provider,
             dry_run: self.dry_run,
             poll_interval_ms: self.poll_interval_ms,
             target_pps: self.target_pps,
@@ -540,67 +545,150 @@ impl eframe::App for LauncherApp {
                 }
             });
 
-            ui.label("Browser CDP mode only. The snapshot file is only internal transport between helper and runner.");
             ui.horizontal(|ui| {
-                ui.label("Chrome Path");
-                ui.text_edit_singleline(&mut self.state.browser.chrome_path);
-            });
-            ui.horizontal(|ui| {
-                ui.label("CDP Port");
-                ui.add(egui::DragValue::new(&mut self.state.browser.cdp_port).speed(1));
-                ui.label("URL");
-                ui.text_edit_singleline(&mut self.state.browser.url);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Target");
-                ui.text_edit_singleline(&mut self.state.browser.target_hint);
-                ui.checkbox(&mut self.state.browser.connect_only, "Connect only");
-            });
-            ui.horizontal(|ui| {
-                ui.label("Player");
-                egui::ComboBox::from_id_salt("player_selector")
-                    .selected_text(player_selector_label(self.state.browser.player_selector))
+                ui.label("Provider");
+                egui::ComboBox::from_id_salt("snapshot_provider")
+                    .selected_text(snapshot_provider_label(self.state.snapshot_provider))
                     .show_ui(ui, |ui| {
-                        for selector in [
-                            PlayerSelectorConfig::Auto,
-                            PlayerSelectorConfig::Left,
-                            PlayerSelectorConfig::Right,
-                            PlayerSelectorConfig::Nickname,
-                            PlayerSelectorConfig::UserId,
+                        for provider in [
+                            SnapshotProviderConfig::BrowserCdp,
+                            SnapshotProviderConfig::WebsocketSeed,
+                            SnapshotProviderConfig::File,
                         ] {
                             ui.selectable_value(
-                                &mut self.state.browser.player_selector,
-                                selector,
-                                player_selector_label(selector),
+                                &mut self.state.snapshot_provider,
+                                provider,
+                                snapshot_provider_label(provider),
                             );
                         }
                     });
-                ui.label("Nickname");
-                ui.text_edit_singleline(&mut self.state.browser.player_nickname);
             });
             ui.horizontal(|ui| {
-                ui.label("User ID");
-                ui.text_edit_singleline(&mut self.state.browser.player_user_id);
-                ui.checkbox(
-                    &mut self.state.browser.dump_state_on_fail,
-                    "Dump state on fail",
-                );
+                ui.label("Snapshot");
+                ui.text_edit_singleline(&mut self.state.snapshot_path);
             });
-            ui.horizontal(|ui| {
-                ui.label("Dump Path");
-                ui.text_edit_singleline(&mut self.state.browser.dump_state_path);
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.state.browser.probe_page_state, "Probe page state");
-                ui.checkbox(
-                    &mut self.state.browser.use_ribbon_websocket,
-                    "Use ribbon websocket",
-                );
-                ui.checkbox(
-                    &mut self.state.browser.use_seed_simulation_fallback,
-                    "Use seed simulation fallback",
-                );
-            });
+            match self.state.snapshot_provider {
+                SnapshotProviderConfig::BrowserCdp => {
+                    ui.label("Browser CDP direct mode. The snapshot file is only internal transport between helper and runner.");
+                    ui.horizontal(|ui| {
+                        ui.label("Chrome Path");
+                        ui.text_edit_singleline(&mut self.state.browser.chrome_path);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("CDP Port");
+                        ui.add(egui::DragValue::new(&mut self.state.browser.cdp_port).speed(1));
+                        ui.label("URL");
+                        ui.text_edit_singleline(&mut self.state.browser.url);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Target");
+                        ui.text_edit_singleline(&mut self.state.browser.target_hint);
+                        ui.checkbox(&mut self.state.browser.connect_only, "Connect only");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Player");
+                        egui::ComboBox::from_id_salt("player_selector")
+                            .selected_text(player_selector_label(self.state.browser.player_selector))
+                            .show_ui(ui, |ui| {
+                                for selector in [
+                                    PlayerSelectorConfig::Auto,
+                                    PlayerSelectorConfig::Left,
+                                    PlayerSelectorConfig::Right,
+                                    PlayerSelectorConfig::Nickname,
+                                    PlayerSelectorConfig::UserId,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.state.browser.player_selector,
+                                        selector,
+                                        player_selector_label(selector),
+                                    );
+                                }
+                            });
+                        ui.label("Nickname");
+                        ui.text_edit_singleline(&mut self.state.browser.player_nickname);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("User ID");
+                        ui.text_edit_singleline(&mut self.state.browser.player_user_id);
+                        ui.checkbox(
+                            &mut self.state.browser.dump_state_on_fail,
+                            "Dump state on fail",
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Dump Path");
+                        ui.text_edit_singleline(&mut self.state.browser.dump_state_path);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.state.browser.probe_page_state, "Probe page state");
+                        ui.checkbox(
+                            &mut self.state.browser.use_ribbon_websocket,
+                            "Use ribbon websocket",
+                        );
+                        ui.checkbox(
+                            &mut self.state.browser.use_seed_simulation_fallback,
+                            "Use seed simulation fallback",
+                        );
+                    });
+                }
+                SnapshotProviderConfig::WebsocketSeed => {
+                    let snapshot_status = load_websocket_seed_status(
+                        &self.paths.resolve_workspace_path(&self.state.snapshot_path),
+                    );
+                    ui.label("WebSocket seed provider for VS room experiments. It captures seed/options and reconstructs only current/queue.");
+                    ui.horizontal(|ui| {
+                        ui.label("Chrome Path");
+                        ui.text_edit_singleline(&mut self.state.browser.chrome_path);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("CDP Port");
+                        ui.add(egui::DragValue::new(&mut self.state.browser.cdp_port).speed(1));
+                        ui.label("URL");
+                        ui.text_edit_singleline(&mut self.state.browser.url);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Target");
+                        ui.text_edit_singleline(&mut self.state.browser.target_hint);
+                        ui.checkbox(&mut self.state.browser.connect_only, "Connect only");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Seed captured");
+                        ui.monospace(if snapshot_status
+                            .as_ref()
+                            .map(|status| status.seed_captured)
+                            .unwrap_or(false)
+                        {
+                            "yes"
+                        } else {
+                            "no"
+                        });
+                        ui.label("Bagtype");
+                        ui.monospace(
+                            snapshot_status
+                                .as_ref()
+                                .map(|status| {
+                                    if status.bagtype.is_empty() {
+                                        "-".to_owned()
+                                    } else {
+                                        status.bagtype.clone()
+                                    }
+                                })
+                                .unwrap_or_else(|| "-".to_owned()),
+                        );
+                        ui.label("PieceIndex");
+                        ui.monospace(
+                            snapshot_status
+                                .as_ref()
+                                .and_then(|status| status.piece_index)
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "-".to_owned()),
+                        );
+                    });
+                }
+                SnapshotProviderConfig::File => {
+                    ui.label("File provider reads the snapshot path as-is and does not launch a browser helper.");
+                }
+            }
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.state.always_on_top, "Always on top");
             });
@@ -764,6 +852,29 @@ impl Drop for LauncherApp {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct WebsocketSeedSnapshotStatus {
+    #[serde(default)]
+    source: String,
+    #[serde(default, rename = "seedCaptured")]
+    seed_captured: bool,
+    #[serde(default)]
+    bagtype: String,
+    #[serde(default, rename = "pieceIndex")]
+    piece_index: Option<u32>,
+}
+
+fn load_websocket_seed_status(
+    snapshot_path: &std::path::Path,
+) -> Option<WebsocketSeedSnapshotStatus> {
+    let raw = fs::read_to_string(snapshot_path).ok()?;
+    let parsed: WebsocketSeedSnapshotStatus = serde_json::from_str(&raw).ok()?;
+    if parsed.source != "websocket_seed" {
+        return None;
+    }
+    Some(parsed)
+}
+
 fn load_launcher_state(paths: &AppPaths) -> Result<LauncherState> {
     let raw = fs::read_to_string(&paths.launcher_state_path).with_context(|| {
         format!(
@@ -802,6 +913,14 @@ fn spawn_rule_label(rule: SpawnRuleConfig) -> &'static str {
     }
 }
 
+fn snapshot_provider_label(provider: SnapshotProviderConfig) -> &'static str {
+    match provider {
+        SnapshotProviderConfig::BrowserCdp => "Browser CDP Direct",
+        SnapshotProviderConfig::WebsocketSeed => "WebSocket Seed",
+        SnapshotProviderConfig::File => "File",
+    }
+}
+
 fn player_selector_label(selector: PlayerSelectorConfig) -> &'static str {
     match selector {
         PlayerSelectorConfig::Auto => "Auto",
@@ -822,6 +941,7 @@ mod tests {
         state.preset = ModePreset::Solo1080p;
         state.apply_preset();
 
+        assert_eq!(state.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
         assert_eq!(state.bot.movement_mode, MovementModeConfig::ZeroGSafe);
         assert_eq!(state.bot.spawn_rule, SpawnRuleConfig::Row19Or20);
         assert_eq!(state.target_pps, 0.0);
@@ -866,6 +986,7 @@ mod tests {
         assert!(readme.contains("Advanced/Experimental"));
         assert!(readme.contains("VS room"));
         assert!(readme.contains("\"player_selector\": \"auto\""));
+        assert!(readme.contains("WebSocket Seed"));
     }
 
     #[test]

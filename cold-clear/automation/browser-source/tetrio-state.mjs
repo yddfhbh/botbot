@@ -160,6 +160,16 @@ function boardToField(board) {
   });
 }
 
+function normalizePreviewQueue(current, queue) {
+  if (!current || !Array.isArray(queue) || queue.length === 0) {
+    return Array.isArray(queue) ? queue : [];
+  }
+  if (queue[0] === current) {
+    return queue.slice(1);
+  }
+  return queue;
+}
+
 function safeKeys(value) {
   if (!value || typeof value !== "object") return [];
   try {
@@ -827,10 +837,10 @@ export function resolveGameStateSnapshot({
   const field = boardToField(selected.board);
   const playingState = classifyPlayingState(selected, state, boardState, pageHints);
   const pieceCounter = selected.pieceCounter;
+  const previewQueue = normalizePreviewQueue(selected.current, selected.queue);
+  const fallbackToken = `browser-fallback-${selected.current}-${previewQueue.join("")}-${selected.hold ?? "-"}-${selected.activeX ?? "-"}-${selected.activeY ?? "-"}-${selected.activeRotation ?? "-"}-${hashField(field)}`;
   const token =
-    pieceCounter !== null
-      ? `browser-${pieceCounter}`
-      : `browser-fallback-${selected.current}-${selected.queue.join("")}-${selected.hold ?? "-"}-${selected.activeX ?? "-"}-${selected.activeY ?? "-"}-${selected.activeRotation ?? "-"}-${hashField(field)}`;
+    pieceCounter !== null && pieceCounter > 0 ? `browser-${pieceCounter}` : fallbackToken;
   const snapshot = {
     ok: true,
     ready: playingState.ready,
@@ -838,7 +848,7 @@ export function resolveGameStateSnapshot({
     field,
     current: selected.current,
     hold: selected.hold,
-    queue: selected.queue,
+    queue: previewQueue,
     b2b: Math.max(0, numberFrom(selected.stats?.b2b, state?.b2b, 0) ?? 0) > 0,
     combo: Math.max(0, numberFrom(selected.stats?.combo, state?.combo, 0) ?? 0),
     incoming: Math.max(
@@ -862,9 +872,9 @@ export function resolveGameStateSnapshot({
     userId: selected.userId,
     logs: [
       `[browser] mode=${selection.mode} candidates=${selection.validCandidates.length} selector=${normalizedSelector.playerSelector} selected=${selected.path} reason=${selection.selectedReason}`,
-      `[browser] selected nickname=${selected.nickname || "-"} current=${selected.current.toUpperCase()} hold=${selected.hold ? selected.hold.toUpperCase() : "-"} queue=${selected.queue.map((piece) => piece.toUpperCase()).join(",")}`,
+      `[browser] selected nickname=${selected.nickname || "-"} current=${selected.current.toUpperCase()} hold=${selected.hold ? selected.hold.toUpperCase() : "-"} queue=${previewQueue.map((piece) => piece.toUpperCase()).join(",")}`,
       `[browser] playing=${playingState.playing} countdown=${playingState.countdown} dead=${playingState.dead} source=${playingState.source}`,
-      `[browser] boardRows=${selected.board.length} current=${selected.current.toUpperCase()} hold=${selected.hold ? selected.hold.toUpperCase() : "-"} queue=${selected.queue.map((piece) => piece.toUpperCase()).join(",")}`,
+      `[browser] boardRows=${selected.board.length} current=${selected.current.toUpperCase()} hold=${selected.hold ? selected.hold.toUpperCase() : "-"} queue=${previewQueue.map((piece) => piece.toUpperCase()).join(",")}`,
       `[browser] token=${token}`
     ]
   };

@@ -3,6 +3,7 @@
 This crate turns the Cold Clear planner into a Browser CDP driven TETR.IO automation runner.
 
 - Browser CDP mode is the recommended mode for TETR.IO solo/custom practice.
+- `WebSocket Seed` is an experimental VS room snapshot provider that only reconstructs `current` / `queue`.
 - Screen scanner support has been removed from the launcher and runtime flow.
 - Browser mode avoids color recognition errors and many Windows foreground `SendInput` issues.
 - Use only in private/solo/custom practice, not public matchmaking.
@@ -28,6 +29,10 @@ cargo run -p automation -- automation/config.example.json
 cargo run -p automation -- --input-backend browser_cdp --cdp-port 9222 --url https://tetr.io/ --target TETR.IO
 ```
 
+```powershell
+cargo run -p automation -- --snapshot-provider websocket_seed --input-backend browser_cdp --cdp-port 9222 --url https://tetr.io/ --target TETR.IO
+```
+
 `dry_run: true` leaves the keyboard untouched and only prints planned actions.
 
 ## Launcher
@@ -36,10 +41,11 @@ cargo run -p automation -- --input-backend browser_cdp --cdp-port 9222 --url htt
 cargo run -p automation
 ```
 
-Running without arguments opens the launcher. The launcher is now Browser CDP only.
+Running without arguments opens the launcher.
 
 - choose `2P Left 1080p`, `Solo 1080p`, or `Custom`
-- set Chrome path, CDP port, URL, and target hint
+- choose `Browser CDP Direct`, `WebSocket Seed`, or `File`
+- set snapshot path, Chrome path, CDP port, URL, and target hint
 - choose `Player` selector plus optional nickname / user id when using VS rooms
 - toggle page probing, ribbon websocket capture, and seed simulation fallback
 - tune dry-run, target PPS, tap timings, and planner limits
@@ -51,6 +57,7 @@ Running without arguments opens the launcher. The launcher is now Browser CDP on
 The built-in presets now target a faster Browser CDP setup for personal practice.
 
 - `Snapshot transport`: internal `live-snapshot.json`
+- `Snapshot provider`: `Browser CDP Direct`
 - `Input backend`: `Browser CDP`
 - `URL`: `https://tetr.io/`
 - `CDP Port`: `9222`
@@ -100,6 +107,22 @@ Browser CDP mode attaches to Chromium launched with `--remote-debugging-port=922
 
 The runtime will not input while `playing=false` or `countdown=true`, and it skips duplicate `pieceCounter` values.
 
+## WebSocket Seed
+
+`WebSocket Seed` is the first VS room experimental provider.
+
+- it listens to TETR.IO websocket frames over CDP
+- it decodes msgpack payloads and searches for `seed`, `bagtype`, `nextcount`, and board size
+- it reproduces the 7-bag queue from `seed` and writes `automation/live-snapshot.json`
+- launcher status shows `seed captured`, `bagtype`, and `pieceIndex`
+
+Current phase-1 limitations:
+
+- no board feedback updates
+- no garbage / incoming reconstruction
+- no hold progression or piece index advancement after the initial snapshot
+- use it only to verify VS room seed/options capture and initial `current` / `queue`
+
 ## VS Room
 
 Browser CDP VS room settings:
@@ -119,6 +142,20 @@ Browser CDP VS room settings:
 - `player_selector=auto` first prefers `isLocal`/`local` style flags, then user id, then nickname, then the first alive candidate with a current piece
 - `player_selector=left` or `right` forces index `0` or `1` among valid player candidates
 - `player_selector=nickname` and `user_id` only select exact matches
+
+WebSocket Seed example:
+
+```json
+{
+  "snapshot_provider": "websocket_seed",
+  "browser": {
+    "cdp_port": 9222,
+    "url": "https://tetr.io/",
+    "target_hint": "TETR.IO",
+    "connect_only": false
+  }
+}
+```
 
 If VS room state detection fails, check these in order:
 

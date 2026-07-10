@@ -6,6 +6,7 @@ import readline from "node:readline";
 
 const DEFAULT_URL = "https://tetr.io/";
 const DEFAULT_PORT = 9222;
+const FOCUS_REUSE_MS = 250;
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -25,6 +26,14 @@ async function main() {
 
   await waitForCdp(port);
   let cdp = await connectToTarget({ port, url, targetHint });
+  const pressedKeys = new Set();
+  let lastFocus = {
+    at: 0,
+    activeBefore: "UNKNOWN",
+    activeAfter: "UNKNOWN",
+    blurred: false,
+    cached: false
+  };
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -52,17 +61,17 @@ async function main() {
     try {
       if (message.type === "releaseAll") {
         cdp = await ensureConnected(cdp, { port, url, targetHint });
-        const focus = await focusPage(cdp);
+        const releaseResult = await releaseAllKeys(cdp, pressedKeys);
         logInput(
-          `focus activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred}`
+          `releaseAll ok released=${releaseResult.releasedCount} skipped=${releaseResult.skipped}`
         );
-        await releaseAllKeys(cdp);
-        logInput("releaseAll ok");
         writeResponse({
           ok: true,
           id: message.id ?? null,
           type: "releaseAll",
-          focus
+          focus: null,
+          releasedCount: releaseResult.releasedCount,
+          skipped: releaseResult.skipped
         });
         return;
       }
@@ -79,23 +88,36 @@ async function main() {
           return;
         }
         cdp = await ensureConnected(cdp, { port, url, targetHint });
-        const focus = await focusPage(cdp);
-        logInput(
-          `focus activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred}`
-        );
         const durationMs = numberArg(message.durationMs, 55);
-        const preKeyDownFocus = await focusPage(cdp);
+        const preKeyDownFocus = await ensureFocused(cdp, lastFocus);
+        lastFocus = preKeyDownFocus;
         logInput(
-          `focus activeBefore=${preKeyDownFocus.activeBefore} activeAfter=${preKeyDownFocus.activeAfter} blurred=${preKeyDownFocus.blurred}`
+          `focus activeBefore=${preKeyDownFocus.activeBefore} activeAfter=${preKeyDownFocus.activeAfter} blurred=${preKeyDownFocus.blurred} cached=${preKeyDownFocus.cached}`
         );
         await dispatchWithReconnect(cdp, spec, "keyDown", { port, url, targetHint }, (nextCdp) => {
           cdp = nextCdp;
+          lastFocus = {
+            at: 0,
+            activeBefore: "UNKNOWN",
+            activeAfter: "UNKNOWN",
+            blurred: false,
+            cached: false
+          };
         });
+        pressedKeys.add(message.key);
         logInput(`dispatch keyDown key=${message.key}`);
         await sleep(durationMs);
         await dispatchWithReconnect(cdp, spec, "keyUp", { port, url, targetHint }, (nextCdp) => {
           cdp = nextCdp;
+          lastFocus = {
+            at: 0,
+            activeBefore: "UNKNOWN",
+            activeAfter: "UNKNOWN",
+            blurred: false,
+            cached: false
+          };
         });
+        pressedKeys.delete(message.key);
         logInput(`dispatch keyUp key=${message.key}`);
         logInput(`tap key=${message.key} durationMs=${durationMs}`);
         writeResponse({
@@ -144,10 +166,39 @@ function keySpec(key, code, windowsVirtualKeyCode, text = "") {
   };
 }
 
-async function releaseAllKeys(cdp) {
-  for (const spec of Object.values(KEY_MAP)) {
+async function releaseAllKeys(cdp, pressedKeys) {
+  const keysToRelease =
+    pressedKeys.size > 0 ? [...pressedKeys].map((key) => KEY_MAP[key]).filter(Boolean) : [];
+  if (keysToRelease.length === 0) {
+    return {
+      releasedCount: 0,
+      skipped: true
+    };
+  }
+  for (const spec of keysToRelease) {
     await dispatchKey(cdp, spec, "keyUp");
   }
+  pressedKeys.clear();
+  return {
+    releasedCount: keysToRelease.length,
+    skipped: false
+  };
+}
+
+async function ensureFocused(cdp, lastFocus) {
+  const ageMs = Date.now() - (lastFocus?.at ?? 0);
+  if (lastFocus?.at && ageMs <= FOCUS_REUSE_MS) {
+    return {
+      ...lastFocus,
+      cached: true
+    };
+  }
+  const focused = await focusPage(cdp);
+  return {
+    ...focused,
+    at: Date.now(),
+    cached: false
+  };
 }
 
 async function focusPage(cdp) {
@@ -237,7 +288,7 @@ async function connectToTarget({ port, url, targetHint }) {
     blurred: false
   }));
   logInput(
-    `focus activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred}`
+    `focus activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred} cached=false`
   );
   return cdp;
 }

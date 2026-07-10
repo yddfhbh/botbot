@@ -21,7 +21,7 @@ pub fn emit_log(logger: &SharedLogger, line: impl Into<String>) {
 }
 
 pub struct ProviderProcess {
-    child: Child,
+    child: Option<Child>,
     log_threads: Vec<JoinHandle<()>>,
 }
 
@@ -35,8 +35,10 @@ impl ProviderProcess {
     }
 
     pub fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         for handle in self.log_threads.drain(..) {
             let _ = handle.join();
         }
@@ -122,7 +124,44 @@ fn spawn_browser_provider(
     config: &AutomationConfig,
     logger: SharedLogger,
 ) -> Result<ProviderProcess> {
-    let script = &paths.browser_snapshot_script_path;
+    match config.snapshot_provider {
+        crate::config::SnapshotProviderConfig::BrowserCdp => spawn_node_provider(
+            &paths.browser_snapshot_script_path,
+            paths,
+            config,
+            logger,
+            "browser_cdp",
+        ),
+        crate::config::SnapshotProviderConfig::WebsocketSeed => spawn_node_provider(
+            &paths.browser_websocket_seed_script_path,
+            paths,
+            config,
+            logger,
+            "websocket_seed",
+        ),
+        crate::config::SnapshotProviderConfig::File => {
+            emit_log(
+                &logger,
+                format!(
+                    "[automation] file snapshot provider active path={}",
+                    config.snapshot_path.display()
+                ),
+            );
+            Ok(ProviderProcess {
+                child: None,
+                log_threads: Vec::new(),
+            })
+        }
+    }
+}
+
+fn spawn_node_provider(
+    script: &PathBuf,
+    paths: &AppPaths,
+    config: &AutomationConfig,
+    logger: SharedLogger,
+    provider_name: &str,
+) -> Result<ProviderProcess> {
     let snapshot_path = config.snapshot_path.clone();
     let mut command = Command::new(&config.browser.node_command);
     command.arg(script);
@@ -154,11 +193,14 @@ fn spawn_browser_provider(
     emit_log(
         &logger,
         format!(
-            "[browser] helper running on port {} target={}",
-            config.browser.cdp_port, config.browser.target_hint
+            "[browser] helper running provider={} port={} target={}",
+            provider_name, config.browser.cdp_port, config.browser.target_hint
         ),
     );
-    Ok(ProviderProcess { child, log_threads })
+    Ok(ProviderProcess {
+        child: Some(child),
+        log_threads,
+    })
 }
 
 fn build_browser_provider_args(config: &AutomationConfig, snapshot_path: &PathBuf) -> Vec<String> {
@@ -245,7 +287,9 @@ where
                     let line = String::from_utf8_lossy(&buffer)
                         .trim_end_matches(['\r', '\n'])
                         .to_string();
-                    if line.starts_with(prefix.trim_end()) {
+                    if prefix == "[browser] " && line.starts_with('[') {
+                        emit_log(&logger, line);
+                    } else if line.starts_with(prefix.trim_end()) {
                         emit_log(&logger, line);
                     } else {
                         emit_log(&logger, format!("{prefix}{line}"));
@@ -362,6 +406,23 @@ mod tests {
         assert!(
             output.status.success(),
             "node tests failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn node_tetrio_ws_seed_tests_pass() {
+        let output = Command::new("node")
+            .arg("--test")
+            .arg("browser-source/tetrio-ws-seed.test.mjs")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("failed to run node websocket seed tests");
+
+        assert!(
+            output.status.success(),
+            "node websocket seed tests failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );

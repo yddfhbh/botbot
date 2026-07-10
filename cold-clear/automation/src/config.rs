@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct AutomationConfig {
     pub snapshot_path: PathBuf,
+    pub snapshot_provider: SnapshotProviderConfig,
     pub dry_run: bool,
     pub poll_interval_ms: u64,
     pub target_pps: f32,
@@ -31,6 +32,7 @@ impl Default for AutomationConfig {
     fn default() -> Self {
         Self {
             snapshot_path: PathBuf::from("automation/live-snapshot.json"),
+            snapshot_provider: SnapshotProviderConfig::BrowserCdp,
             dry_run: true,
             poll_interval_ms: 2,
             target_pps: 0.0,
@@ -52,6 +54,14 @@ impl Default for AutomationConfig {
             keys: KeyBindings::default(),
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotProviderConfig {
+    BrowserCdp,
+    WebsocketSeed,
+    File,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -241,6 +251,28 @@ impl Default for KeyBindings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automation_config_defaults_to_browser_cdp_snapshot_provider() {
+        let config = AutomationConfig::default();
+
+        assert_eq!(config.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
+    }
+
+    #[test]
+    fn automation_config_deserializes_websocket_seed_snapshot_provider() {
+        let parsed: AutomationConfig = serde_json::from_str(
+            r#"{
+                "snapshot_provider": "websocket_seed"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.snapshot_provider,
+            SnapshotProviderConfig::WebsocketSeed
+        );
+    }
 
     #[test]
     fn browser_cdp_config_defaults_include_vs_selector_and_dump_settings() {

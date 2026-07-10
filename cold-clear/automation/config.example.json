@@ -1,5 +1,6 @@
 {
   "snapshot_path": "automation/live-snapshot.json",
+  "snapshot_provider": "browser_cdp",
   "dry_run": true,
   "poll_interval_ms": 2,
   "target_pps": 0.0,

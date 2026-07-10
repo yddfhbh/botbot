@@ -91,6 +91,16 @@ fn apply_cli_overrides(config: &mut AutomationConfig, args: &[String]) -> Result
                 };
                 index += 2;
             }
+            "--snapshot-provider" => {
+                let value = value.context("missing value for --snapshot-provider")?;
+                config.snapshot_provider = match value.as_str() {
+                    "browser_cdp" => config::SnapshotProviderConfig::BrowserCdp,
+                    "websocket_seed" => config::SnapshotProviderConfig::WebsocketSeed,
+                    "file" => config::SnapshotProviderConfig::File,
+                    _ => anyhow::bail!("unsupported snapshot provider: {value}"),
+                };
+                index += 2;
+            }
             "--cdp-port" => {
                 let value = value.context("missing value for --cdp-port")?;
                 config.browser.cdp_port = value.parse().context("invalid --cdp-port")?;

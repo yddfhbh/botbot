@@ -677,6 +677,7 @@ pub struct BrowserCdpInputBackend {
     log_threads: Vec<JoinHandle<()>>,
     logger: Option<InputHelperLogger>,
     next_command_id: u64,
+    all_keys_released: bool,
 }
 
 impl BrowserCdpInputBackend {
@@ -740,6 +741,7 @@ impl BrowserCdpInputBackend {
             log_threads,
             logger,
             next_command_id: 1,
+            all_keys_released: false,
         })
     }
 
@@ -777,7 +779,7 @@ impl BrowserCdpInputBackend {
 
     fn wait_for_command_response(&mut self, id: u64, command_type: &'static str) -> Result<()> {
         loop {
-            match self.response_rx.recv_timeout(Duration::from_millis(1000)) {
+            match self.response_rx.recv_timeout(Duration::from_millis(2000)) {
                 Ok(line) => match parse_helper_response_line(&line, command_type, id)? {
                     ParsedHelperResponse::Ignore => continue,
                     ParsedHelperResponse::Ok => return Ok(()),
@@ -839,13 +841,21 @@ impl InputBackend for BrowserCdpInputBackend {
                 key,
                 duration.as_millis()
             )
-        })
+        })?;
+        self.all_keys_released = false;
+        Ok(())
     }
 
     fn release_all_keys(&mut self) -> Result<()> {
+        if self.all_keys_released {
+            emit_input_log(&self.logger, "[input] releaseAll skipped already_clear");
+            return Ok(());
+        }
         self.send_command("releaseAll", |id| {
             format!(r#"{{"id":{},"type":"releaseAll"}}"#, id)
-        })
+        })?;
+        self.all_keys_released = true;
+        Ok(())
     }
 }
 
