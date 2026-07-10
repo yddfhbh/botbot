@@ -38,7 +38,6 @@
     "28",
     "29",
     "30",
-    "31",
     "Object",
     "Function",
     "Array",
@@ -126,7 +125,8 @@
     "WheelEvent",
     "WebSocket",
     "WebGLVertexArrayObject",
-    "WebGLUniformLocation"
+    "WebGLUniformLocation",
+    "WebGLTransformFeedback"
   ],
   "directCandidatePaths": [],
   "gameSearchStats": {

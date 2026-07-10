@@ -52,13 +52,17 @@ async function main() {
     try {
       if (message.type === "releaseAll") {
         cdp = await ensureConnected(cdp, { port, url, targetHint });
+        const focus = await focusPage(cdp);
+        logInput(
+          `focus activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred}`
+        );
         await releaseAllKeys(cdp);
         logInput("releaseAll ok");
         writeResponse({
           ok: true,
           id: message.id ?? null,
           type: "releaseAll",
-          focus: null
+          focus
         });
         return;
       }
@@ -75,10 +79,14 @@ async function main() {
           return;
         }
         cdp = await ensureConnected(cdp, { port, url, targetHint });
-        const durationMs = numberArg(message.durationMs, 55);
-        const preKeyDownFocus = await preparePageForInput(cdp);
+        const focus = await focusPage(cdp);
         logInput(
-          `prepare activeBefore=${preKeyDownFocus.activeBefore} activeAfter=${preKeyDownFocus.activeAfter} blurred=${preKeyDownFocus.blurred} forcedFocus=${preKeyDownFocus.forcedFocus}`
+          `focus activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred}`
+        );
+        const durationMs = numberArg(message.durationMs, 55);
+        const preKeyDownFocus = await focusPage(cdp);
+        logInput(
+          `focus activeBefore=${preKeyDownFocus.activeBefore} activeAfter=${preKeyDownFocus.activeAfter} blurred=${preKeyDownFocus.blurred}`
         );
         await dispatchWithReconnect(cdp, spec, "keyDown", { port, url, targetHint }, (nextCdp) => {
           cdp = nextCdp;
@@ -142,7 +150,7 @@ async function releaseAllKeys(cdp) {
   }
 }
 
-async function preparePageForInput(cdp) {
+async function focusPage(cdp) {
   const result = await cdp.send("Runtime.evaluate", {
     expression: `(() => {
       const describe = (element) => {
@@ -165,22 +173,23 @@ async function preparePageForInput(cdp) {
         activeBefore.blur();
         blurred = true;
       }
+      window.focus();
+      const canvas = document.querySelector("canvas");
+      if (canvas && typeof canvas.focus === "function") {
+        canvas.focus();
+      } else if (document.body && typeof document.body.focus === "function") {
+        document.body.focus();
+      }
       return {
         activeBefore: describe(activeBefore),
         activeAfter: describe(document.activeElement),
-        blurred,
-        forcedFocus: false
+        blurred
       };
     })()`,
     returnByValue: true,
     awaitPromise: true
   });
-  return result?.result?.value ?? {
-    activeBefore: "UNKNOWN",
-    activeAfter: "UNKNOWN",
-    blurred: false,
-    forcedFocus: false
-  };
+  return result?.result?.value ?? { activeBefore: "UNKNOWN", activeAfter: "UNKNOWN", blurred: false };
 }
 
 async function dispatchKey(cdp, spec, type) {
@@ -220,15 +229,15 @@ async function connectToTarget({ port, url, targetHint }) {
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
   await cdp.send("Page.enable").catch(() => undefined);
   await cdp.send("Runtime.enable").catch(() => undefined);
+  await cdp.send("Page.bringToFront").catch(() => undefined);
   await installBackgroundInputKeepalive(cdp);
-  const focus = await preparePageForInput(cdp).catch(() => ({
+  const focus = await focusPage(cdp).catch(() => ({
     activeBefore: "UNKNOWN",
     activeAfter: "UNKNOWN",
-    blurred: false,
-    forcedFocus: false
+    blurred: false
   }));
   logInput(
-    `prepare activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred} forcedFocus=${focus.forcedFocus}`
+    `focus activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred}`
   );
   return cdp;
 }
