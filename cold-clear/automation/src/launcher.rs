@@ -174,6 +174,44 @@ impl LauncherState {
         {
             self.bot.movement_mode = MovementModeConfig::ZeroGSafe;
         }
+        if self.preset != ModePreset::Custom && self.matches_known_legacy_safe_preset() {
+            self.apply_tetrio_safe_preset();
+        }
+    }
+
+    fn matches_known_legacy_safe_preset(&self) -> bool {
+        self.target_pps == 0.0
+            && (self.matches_first_safe_preset_family() || self.matches_second_safe_preset_family())
+    }
+
+    fn matches_first_safe_preset_family(&self) -> bool {
+        self.poll_interval_ms == 16
+            && self.movement_tap_duration_ms == 55
+            && self.rotate_tap_duration_ms == 70
+            && self.hold_tap_duration_ms == 70
+            && self.hard_drop_tap_duration_ms == 80
+            && self.soft_drop_tap_duration_ms == 55
+            && self.movement_interval_ms == 60
+            && self.rotation_interval_ms == 120
+            && self.piece_interval_ms == 100
+            && self.hard_drop_interval_ms == 100
+            && self.min_snapshot_age_ms == 40
+            && self.handling.action_settle_ms == 25
+    }
+
+    fn matches_second_safe_preset_family(&self) -> bool {
+        self.poll_interval_ms == 16
+            && self.movement_tap_duration_ms == 40
+            && self.rotate_tap_duration_ms == 45
+            && self.hold_tap_duration_ms == 55
+            && self.hard_drop_tap_duration_ms == 55
+            && self.soft_drop_tap_duration_ms == 40
+            && self.movement_interval_ms == 18
+            && self.rotation_interval_ms == 45
+            && self.piece_interval_ms == 20
+            && self.hard_drop_interval_ms == 35
+            && self.min_snapshot_age_ms == 8
+            && self.handling.action_settle_ms == 8
     }
 
     fn to_automation_config(&self, paths: &AppPaths) -> AutomationConfig {
@@ -696,5 +734,44 @@ mod tests {
         assert!(readme.contains("Hard Drop Only"));
         assert!(readme.contains("ZeroG Complete"));
         assert!(readme.contains("Advanced/Experimental"));
+    }
+
+    #[test]
+    fn migrate_legacy_defaults_upgrades_previous_safe_profile() {
+        let mut state = LauncherState {
+            preset: ModePreset::Solo1080p,
+            dry_run: false,
+            poll_interval_ms: 16,
+            target_pps: 0.0,
+            movement_tap_duration_ms: 40,
+            rotate_tap_duration_ms: 45,
+            hold_tap_duration_ms: 55,
+            hard_drop_tap_duration_ms: 55,
+            soft_drop_tap_duration_ms: 40,
+            movement_interval_ms: 18,
+            rotation_interval_ms: 45,
+            piece_interval_ms: 20,
+            hard_drop_interval_ms: 35,
+            min_snapshot_age_ms: 8,
+            handling: HandlingConfig {
+                action_settle_ms: 8,
+                ..HandlingConfig::default()
+            },
+            ..LauncherState::default()
+        };
+
+        state.migrate_legacy_defaults();
+
+        assert_eq!(state.poll_interval_ms, 4);
+        assert_eq!(state.movement_tap_duration_ms, 25);
+        assert_eq!(state.rotate_tap_duration_ms, 28);
+        assert_eq!(state.hold_tap_duration_ms, 35);
+        assert_eq!(state.hard_drop_tap_duration_ms, 30);
+        assert_eq!(state.movement_interval_ms, 0);
+        assert_eq!(state.rotation_interval_ms, 8);
+        assert_eq!(state.piece_interval_ms, 0);
+        assert_eq!(state.hard_drop_interval_ms, 0);
+        assert_eq!(state.min_snapshot_age_ms, 0);
+        assert_eq!(state.handling.action_settle_ms, 0);
     }
 }
