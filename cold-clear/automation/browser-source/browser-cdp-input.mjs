@@ -24,11 +24,7 @@ async function main() {
   }
 
   await waitForCdp(port);
-  const target = await findOrCreateTarget({ port, url, targetHint });
-  const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
-  await cdp.send("Page.bringToFront");
-  await installBackgroundInputKeepalive(cdp);
-  await focusPage(cdp);
+  let cdp = await connectToTarget({ port, url, targetHint });
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -53,18 +49,53 @@ async function main() {
       return;
     }
 
-    if (message.type === "releaseAll") {
-      await releaseAllKeys(cdp);
-      return;
-    }
+    try {
+      if (message.type === "releaseAll") {
+        cdp = await ensureConnected(cdp, { port, url, targetHint });
+        await releaseAllKeys(cdp);
+        writeResponse({
+          ok: true,
+          id: message.id ?? null,
+          type: "releaseAll"
+        });
+        return;
+      }
 
-    if (message.type === "tap") {
-      const spec = KEY_MAP[message.key];
-      if (!spec) return;
-      await focusPage(cdp);
-      await dispatchKey(cdp, spec, "keyDown");
-      await sleep(numberArg(message.durationMs, 55));
-      await dispatchKey(cdp, spec, "keyUp");
+      if (message.type === "tap") {
+        const spec = KEY_MAP[message.key];
+        if (!spec) {
+          writeResponse({
+            ok: false,
+            id: message.id ?? null,
+            type: "tap",
+            error: `unknown key: ${message.key ?? ""}`
+          });
+          return;
+        }
+        cdp = await ensureConnected(cdp, { port, url, targetHint });
+        await focusPage(cdp);
+        await dispatchWithReconnect(cdp, spec, "keyDown", { port, url, targetHint }, (nextCdp) => {
+          cdp = nextCdp;
+        });
+        await sleep(numberArg(message.durationMs, 55));
+        await dispatchWithReconnect(cdp, spec, "keyUp", { port, url, targetHint }, (nextCdp) => {
+          cdp = nextCdp;
+        });
+        writeResponse({
+          ok: true,
+          id: message.id ?? null,
+          type: "tap",
+          key: message.key,
+          durationMs: numberArg(message.durationMs, 55)
+        });
+      }
+    } catch (error) {
+      writeResponse({
+        ok: false,
+        id: message.id ?? null,
+        type: message.type ?? "unknown",
+        error: error?.message ?? String(error)
+      });
     }
   });
 
@@ -125,6 +156,50 @@ async function dispatchKey(cdp, spec, type) {
     text: type === "keyDown" ? spec.text ?? "" : "",
     unmodifiedText: type === "keyDown" ? spec.text ?? "" : ""
   });
+}
+
+async function dispatchWithReconnect(cdp, spec, type, targetInfo, setClient) {
+  try {
+    await dispatchKey(cdp, spec, type);
+  } catch (error) {
+    if (!isSocketClosedError(error)) {
+      throw error;
+    }
+    const reconnected = await connectToTarget(targetInfo);
+    setClient(reconnected);
+    await dispatchKey(reconnected, spec, type);
+  }
+}
+
+async function ensureConnected(cdp, targetInfo) {
+  if (cdp?.isOpen()) {
+    return cdp;
+  }
+  return await connectToTarget(targetInfo);
+}
+
+async function connectToTarget({ port, url, targetHint }) {
+  const target = await findOrCreateTarget({ port, url, targetHint });
+  const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
+  await cdp.send("Page.enable").catch(() => undefined);
+  await cdp.send("Runtime.enable").catch(() => undefined);
+  await cdp.send("Page.bringToFront").catch(() => undefined);
+  await installBackgroundInputKeepalive(cdp);
+  await focusPage(cdp);
+  return cdp;
+}
+
+function isSocketClosedError(error) {
+  const message = String(error?.message ?? error ?? "").toLowerCase();
+  return (
+    message.includes("cdp socket is not open") ||
+    message.includes("inspected target navigated or closed") ||
+    message.includes("session closed")
+  );
+}
+
+function writeResponse(payload) {
+  process.stdout.write(`${JSON.stringify(payload)}\n`);
 }
 
 function parseArgs(argv) {
@@ -329,6 +404,10 @@ class CdpClient {
   close() {
     this.socket.close();
     return Promise.resolve();
+  }
+
+  isOpen() {
+    return this.socket.readyState === WebSocket.OPEN;
   }
 }
 

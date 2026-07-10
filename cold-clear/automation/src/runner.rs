@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use cold_clear::evaluation::Standard;
@@ -16,8 +16,13 @@ use libtetris::{
 use crate::config::{
     AutomationConfig, HandlingConfig, MovementModeConfig, SoftDropModeConfig, SpawnRuleConfig,
 };
-use crate::driver::{execute_plan, ExecutionPlan, ExecutionTimings, GameAction, InputBackend};
-use crate::scanner::{GameSnapshot, PieceToken, SnapshotScanner};
+use crate::driver::{
+    execute_hard_drop_action, execute_plan_until_hard_drop, execute_single_action, ExecutionPlan,
+    ExecutionTimings, GameAction, InputBackend,
+};
+use crate::scanner::{
+    read_snapshot_file, GameSnapshot, PieceToken, RotationToken, SnapshotScanner,
+};
 
 #[allow(dead_code)]
 pub fn run_loop<S: SnapshotScanner, D: InputBackend + ?Sized>(
@@ -45,7 +50,9 @@ where
 {
     let poll_delay = Duration::from_millis(config.poll_interval_ms);
     let piece_interval = Duration::from_millis(config.piece_interval_ms);
+    let target_piece_time = target_pps_interval(config.target_pps);
     let mut last_piece_counter = None;
+    let mut last_hard_drop_started_at = None;
     let execution_timings = ExecutionTimings {
         tap_duration: Duration::from_millis(config.tap_duration_ms),
         movement_tap_duration: Duration::from_millis(config.movement_tap_duration_ms),
@@ -89,7 +96,7 @@ where
                 match prepare_execution(config, &snapshot, &mut log)? {
                     Some(prepared) => {
                         emit_move_logs(&snapshot, &prepared, &mut log);
-                        execute_plan(
+                        execute_plan_until_hard_drop(
                             driver,
                             &prepared.execution_plan,
                             &config.handling,
@@ -97,10 +104,46 @@ where
                             |line| log(line),
                         )
                         .context("failed to execute bot move")?;
-                        if snapshot.piece_counter.is_some() {
-                            last_piece_counter = snapshot.piece_counter;
-                        }
                         if prepared.execution_plan.hard_drop {
+                            match maybe_finalize_hard_drop(
+                                config,
+                                &snapshot,
+                                &prepared,
+                                driver,
+                                execution_timings,
+                                &mut log,
+                            )? {
+                                HardDropDecision::Proceed => {
+                                    if !wait_for_target_pps(
+                                        target_piece_time,
+                                        last_hard_drop_started_at,
+                                        config.target_pps,
+                                        stop,
+                                        &mut log,
+                                    ) {
+                                        return Ok(());
+                                    }
+                                    let hard_drop_started_at = Instant::now();
+                                    execute_hard_drop_action(
+                                        driver,
+                                        &prepared.execution_plan.movement_actions,
+                                        &config.handling,
+                                        execution_timings,
+                                        |line| log(line),
+                                    )
+                                    .context("failed to execute hard drop input")?;
+                                    last_hard_drop_started_at = Some(hard_drop_started_at);
+                                    if snapshot.piece_counter.is_some() {
+                                        last_piece_counter = snapshot.piece_counter;
+                                    }
+                                }
+                                HardDropDecision::Retry(retry_snapshot) => {
+                                    buffered_snapshot = Some(retry_snapshot);
+                                    thread::sleep(poll_delay);
+                                    continue;
+                                }
+                            }
+
                             buffered_snapshot = wait_for_next_piece_snapshot(
                                 scanner,
                                 &snapshot,
@@ -191,6 +234,132 @@ where
     }
 }
 
+fn maybe_finalize_hard_drop<D, F>(
+    config: &AutomationConfig,
+    snapshot: &GameSnapshot,
+    prepared: &PreparedExecution,
+    driver: &mut D,
+    timings: ExecutionTimings,
+    log: &mut F,
+) -> Result<HardDropDecision>
+where
+    D: InputBackend + ?Sized,
+    F: FnMut(String),
+{
+    let Some(live_snapshot) = read_live_snapshot_for_correction(config, snapshot, log)? else {
+        return Ok(HardDropDecision::Proceed);
+    };
+    if snapshot.active.is_some()
+        && snapshot.active == live_snapshot.active
+        && !prepared.execution_plan.movement_actions.is_empty()
+    {
+        log(format!(
+            "[automation] pre_hard_drop_probe_stale token={} active_state_unchanged=true",
+            live_snapshot.token
+        ));
+        return Ok(HardDropDecision::Proceed);
+    }
+    let Some(active) = live_snapshot.active else {
+        return Ok(HardDropDecision::Proceed);
+    };
+
+    let target = prepared.planned_move.expected_location.canonical();
+    let target_rotation = rotation_token_from_state(target.kind.1);
+    if active.rotation != target_rotation {
+        log(format!(
+            "[automation] pre_hard_drop_mismatch token={} active_x={} active_rot={:?} target_x={} target_rot={:?} -> skip/replan",
+            live_snapshot.token,
+            active.x,
+            active.rotation,
+            target.x,
+            target_rotation
+        ));
+        return Ok(HardDropDecision::Retry(live_snapshot));
+    }
+
+    let x_diff = target.x - active.x;
+    if x_diff == 0 {
+        return Ok(HardDropDecision::Proceed);
+    }
+
+    if x_diff.abs() == 1 {
+        let correction = if x_diff < 0 {
+            GameAction::Left
+        } else {
+            GameAction::Right
+        };
+        log(format!(
+            "[automation] pre_hard_drop_correction token={} active_x={} target_x={} action={:?}",
+            live_snapshot.token, active.x, target.x, correction
+        ));
+        execute_single_action(driver, correction, &config.handling, timings, log)
+            .with_context(|| format!("failed to execute correction action {:?}", correction))?;
+
+        let corrected_snapshot =
+            read_live_snapshot_for_correction(config, snapshot, log)?.unwrap_or(live_snapshot);
+        if let Some(corrected_active) = corrected_snapshot.active {
+            if corrected_active.rotation == target_rotation && corrected_active.x == target.x {
+                log(format!(
+                    "[automation] pre_hard_drop_correction_applied token={} corrected_x={} corrected_rot={:?}",
+                    corrected_snapshot.token, corrected_active.x, corrected_active.rotation
+                ));
+                return Ok(HardDropDecision::Proceed);
+            }
+            log(format!(
+                "[automation] pre_hard_drop_correction_failed token={} active_x={} active_rot={:?} target_x={} target_rot={:?} -> skip/replan",
+                corrected_snapshot.token,
+                corrected_active.x,
+                corrected_active.rotation,
+                target.x,
+                target_rotation
+            ));
+            return Ok(HardDropDecision::Retry(corrected_snapshot));
+        }
+
+        log(format!(
+            "[automation] pre_hard_drop_correction_missing_active token={} -> skip/replan",
+            corrected_snapshot.token
+        ));
+        return Ok(HardDropDecision::Retry(corrected_snapshot));
+    }
+
+    log(format!(
+        "[automation] pre_hard_drop_x_out_of_range token={} active_x={} target_x={} delta={} -> skip/replan",
+        live_snapshot.token, active.x, target.x, x_diff
+    ));
+    Ok(HardDropDecision::Retry(live_snapshot))
+}
+
+fn read_live_snapshot_for_correction<F>(
+    config: &AutomationConfig,
+    snapshot: &GameSnapshot,
+    log: &mut F,
+) -> Result<Option<GameSnapshot>>
+where
+    F: FnMut(String),
+{
+    let live_snapshot = match read_snapshot_file(&config.snapshot_path) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            log(format!(
+                "[automation] pre_hard_drop_probe_unavailable token={} error={:#}",
+                snapshot.token, err
+            ));
+            return Ok(None);
+        }
+    };
+
+    if live_snapshot.token != snapshot.token {
+        log(format!(
+            "[automation] pre_hard_drop_probe_token_changed expected={} actual={}",
+            snapshot.token, live_snapshot.token
+        ));
+        return Ok(None);
+    }
+
+    Ok(Some(live_snapshot))
+}
+
 fn skip_snapshot_reason(
     snapshot: &GameSnapshot,
     last_piece_counter: Option<u32>,
@@ -209,6 +378,70 @@ fn skip_snapshot_reason(
     None
 }
 
+fn target_pps_interval(target_pps: f32) -> Option<Duration> {
+    if !target_pps.is_finite() || target_pps <= 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(1.0 / f64::from(target_pps)))
+}
+
+fn pps_wait_duration(target_piece_time: Option<Duration>, elapsed: Duration) -> Option<Duration> {
+    let target_piece_time = target_piece_time?;
+    let wait = target_piece_time.checked_sub(elapsed)?;
+    if wait.is_zero() {
+        None
+    } else {
+        Some(wait)
+    }
+}
+
+fn wait_for_target_pps<F>(
+    target_piece_time: Option<Duration>,
+    last_hard_drop_started_at: Option<Instant>,
+    target_pps: f32,
+    stop: &AtomicBool,
+    log: &mut F,
+) -> bool
+where
+    F: FnMut(String),
+{
+    let Some(target_piece_time) = target_piece_time else {
+        return true;
+    };
+    let Some(last_hard_drop_started_at) = last_hard_drop_started_at else {
+        return true;
+    };
+
+    let elapsed = last_hard_drop_started_at.elapsed();
+    let Some(wait) = pps_wait_duration(Some(target_piece_time), elapsed) else {
+        return true;
+    };
+
+    log(format!(
+        "[automation] pps_limit target_pps={:.2} cycle_ms={} elapsed_ms={} wait_ms={} before_hard_drop",
+        target_pps,
+        target_piece_time.as_millis(),
+        elapsed.as_millis(),
+        wait.as_millis()
+    ));
+    sleep_with_stop(stop, wait)
+}
+
+fn sleep_with_stop(stop: &AtomicBool, duration: Duration) -> bool {
+    let step = Duration::from_millis(5);
+    let deadline = Instant::now() + duration;
+    loop {
+        if stop.load(AtomicOrdering::Relaxed) {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        thread::sleep(step.min(deadline.saturating_duration_since(now)));
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PreparedExecution {
     planned_move: Move,
@@ -218,6 +451,12 @@ struct PreparedExecution {
     fallback_from: Option<MovementModeConfig>,
     execution_plan: ExecutionPlan,
     route_selection: RouteSelection,
+}
+
+#[derive(Clone, Debug)]
+enum HardDropDecision {
+    Proceed,
+    Retry(GameSnapshot),
 }
 
 #[derive(Clone, Debug)]
@@ -252,6 +491,8 @@ enum BuildExecutionError {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct RouteScore {
     has_soft_drop: bool,
+    post_softdrop_horizontal: bool,
+    post_softdrop_horizontal_count: usize,
     action_count: usize,
     direction_changes: usize,
     rotation_before_drop: usize,
@@ -474,6 +715,15 @@ fn spawn_rule_label(rule: SpawnRuleConfig) -> &'static str {
     }
 }
 
+fn rotation_token_from_state(rotation: RotationState) -> RotationToken {
+    match rotation {
+        RotationState::North => RotationToken::North,
+        RotationState::East => RotationToken::East,
+        RotationState::South => RotationToken::South,
+        RotationState::West => RotationToken::West,
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn plan_move(config: &AutomationConfig, snapshot: &GameSnapshot) -> Result<(Move, &'static str)> {
     let movement_mode = config.bot.movement_mode;
@@ -558,7 +808,9 @@ fn build_execution_plan(
     let board = board_from_snapshot(snapshot).map_err(BuildExecutionError::Fatal)?;
     let active_piece =
         execution_piece(snapshot, planned_move.hold).map_err(BuildExecutionError::Fatal)?;
-    let spawned = spawn_for_execution(&board, active_piece, config.bot.spawn_rule)
+    let spawned = active_piece_for_execution(snapshot, planned_move.hold, active_piece)
+        .map(Ok)
+        .unwrap_or_else(|| spawn_for_execution(&board, active_piece, config.bot.spawn_rule))
         .map_err(BuildExecutionError::Fatal)?;
     let route_selection = if movement_mode == MovementModeConfig::HardDropOnly {
         safe_spawn_tap_route(&board, spawned, planned_move.expected_location)
@@ -580,6 +832,23 @@ fn build_execution_plan(
             hard_drop: true,
         },
         route_selection,
+    })
+}
+
+fn active_piece_for_execution(
+    snapshot: &GameSnapshot,
+    used_hold: bool,
+    active_piece: Piece,
+) -> Option<FallingPiece> {
+    if used_hold {
+        return None;
+    }
+    let active = snapshot.active?;
+    Some(FallingPiece {
+        kind: libtetris::PieceState(active_piece, active.rotation.into()),
+        x: active.x,
+        y: active.y,
+        tspin: libtetris::TspinStatus::None,
     })
 }
 
@@ -850,6 +1119,7 @@ fn candidate_route_from_movements(
         .position(|movement| *movement == PieceMovement::SonicDrop)
         .map(|index| index + 1 < movements.len())
         .unwrap_or(false);
+    let post_softdrop_horizontal_count = count_post_softdrop_horizontal(movements);
     let soft_drop_count = movements
         .iter()
         .filter(|movement| **movement == PieceMovement::SonicDrop)
@@ -858,6 +1128,8 @@ fn candidate_route_from_movements(
     let rotation_before_drop = count_rotations_before_soft_drop(movements);
     let score = RouteScore {
         has_soft_drop,
+        post_softdrop_horizontal: post_softdrop_horizontal_count > 0,
+        post_softdrop_horizontal_count,
         action_count: movements.len(),
         direction_changes: if handling.cancel_das_on_direction_change {
             direction_changes
@@ -896,9 +1168,26 @@ fn validate_route(
     {
         let trailing_actions = &movements[first_soft_drop_index + 1..];
         let has_post_softdrop_actions = !trailing_actions.is_empty();
+        let has_post_softdrop_horizontal = trailing_actions
+            .iter()
+            .any(|movement| matches!(movement, PieceMovement::Left | PieceMovement::Right));
         let trailing_actions_are_spin_safe = trailing_actions
             .iter()
-            .all(|movement| is_allowed_post_softdrop_movement(*movement));
+            .all(|movement| is_allowed_post_softdrop_movement(*movement, handling));
+
+        if has_post_softdrop_horizontal && !handling.allow_post_softdrop_horizontal {
+            return Err(format!(
+                "post_softdrop_horizontal_blocked actions={}",
+                format_piece_movements(trailing_actions)
+            ));
+        }
+
+        if has_post_softdrop_actions && !handling.allow_post_softdrop_actions {
+            return Err(format!(
+                "post_softdrop_actions_disabled actions={}",
+                format_piece_movements(trailing_actions)
+            ));
+        }
 
         if handling.soft_drop_mode == SoftDropModeConfig::Infinite
             && !(handling.allow_post_softdrop_actions
@@ -919,15 +1208,26 @@ fn validate_route(
     Ok(())
 }
 
-fn is_allowed_post_softdrop_movement(movement: PieceMovement) -> bool {
+fn is_allowed_post_softdrop_movement(movement: PieceMovement, handling: &HandlingConfig) -> bool {
     matches!(
         movement,
-        PieceMovement::Left
-            | PieceMovement::Right
-            | PieceMovement::Cw
-            | PieceMovement::Ccw
-            | PieceMovement::SonicDrop
-    )
+        PieceMovement::Cw | PieceMovement::Ccw | PieceMovement::SonicDrop
+    ) || (handling.allow_post_softdrop_horizontal
+        && matches!(movement, PieceMovement::Left | PieceMovement::Right))
+}
+
+fn count_post_softdrop_horizontal(movements: &[PieceMovement]) -> usize {
+    let Some(first_soft_drop_index) = movements
+        .iter()
+        .position(|movement| *movement == PieceMovement::SonicDrop)
+    else {
+        return 0;
+    };
+
+    movements[first_soft_drop_index + 1..]
+        .iter()
+        .filter(|movement| matches!(movement, PieceMovement::Left | PieceMovement::Right))
+        .count()
 }
 
 fn format_piece_movements(movements: &[PieceMovement]) -> String {
@@ -1024,6 +1324,7 @@ mod tests {
             piece_counter: None,
             playing: true,
             countdown: false,
+            active: None,
         };
         let result = plan_move(&AutomationConfig::default(), &snapshot);
         assert!(result.is_err());
@@ -1043,6 +1344,7 @@ mod tests {
             piece_counter: None,
             playing: true,
             countdown: false,
+            active: None,
         };
         let (result, _mode) = plan_move(&AutomationConfig::default(), &snapshot).unwrap();
         assert!(!result.inputs.is_empty() || result.hold);
@@ -1062,6 +1364,7 @@ mod tests {
             piece_counter: None,
             playing: true,
             countdown: false,
+            active: None,
         };
         let config = AutomationConfig::default();
         let planned_move = Move {
@@ -1102,6 +1405,7 @@ mod tests {
             piece_counter: None,
             playing: true,
             countdown: false,
+            active: None,
         };
         let config = AutomationConfig::default();
         let board = board_from_snapshot(&snapshot).unwrap();
@@ -1156,7 +1460,6 @@ mod tests {
                 PieceMovement::Left,
                 PieceMovement::SonicDrop,
                 PieceMovement::Cw,
-                PieceMovement::Right,
             ],
             &handling,
         )
@@ -1164,12 +1467,7 @@ mod tests {
 
         assert_eq!(
             route.movement_actions,
-            vec![
-                GameAction::Left,
-                GameAction::SoftDrop,
-                GameAction::RotateCw,
-                GameAction::Right,
-            ]
+            vec![GameAction::Left, GameAction::SoftDrop, GameAction::RotateCw]
         );
         assert_eq!(route.route_kind, "SoftDropSpinRoute");
     }
@@ -1188,7 +1486,43 @@ mod tests {
 
         assert_eq!(
             result.unwrap_err(),
-            "soft_drop_post_actions_blocked actions=RotateCw".to_owned()
+            "post_softdrop_actions_disabled actions=RotateCw".to_owned()
+        );
+    }
+
+    #[test]
+    fn post_softdrop_horizontal_is_blocked_by_default() {
+        let handling = HandlingConfig {
+            soft_drop_mode: SoftDropModeConfig::Step,
+            ..HandlingConfig::default()
+        };
+        let result = candidate_route_from_movements(
+            &[PieceMovement::SonicDrop, PieceMovement::Right],
+            &handling,
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            "post_softdrop_horizontal_blocked actions=Right".to_owned()
+        );
+    }
+
+    #[test]
+    fn post_softdrop_horizontal_can_be_enabled_explicitly() {
+        let handling = HandlingConfig {
+            soft_drop_mode: SoftDropModeConfig::Step,
+            allow_post_softdrop_horizontal: true,
+            ..HandlingConfig::default()
+        };
+        let route = candidate_route_from_movements(
+            &[PieceMovement::SonicDrop, PieceMovement::Right],
+            &handling,
+        )
+        .unwrap();
+
+        assert_eq!(
+            route.movement_actions,
+            vec![GameAction::SoftDrop, GameAction::Right]
         );
     }
 
@@ -1216,6 +1550,30 @@ mod tests {
     }
 
     #[test]
+    fn route_scoring_penalizes_post_softdrop_horizontal() {
+        let handling = HandlingConfig {
+            soft_drop_mode: SoftDropModeConfig::Step,
+            allow_post_softdrop_horizontal: true,
+            ..HandlingConfig::default()
+        };
+        let rotate_only = candidate_route_from_movements(
+            &[PieceMovement::SonicDrop, PieceMovement::Cw],
+            &handling,
+        )
+        .unwrap();
+        let with_horizontal = candidate_route_from_movements(
+            &[PieceMovement::SonicDrop, PieceMovement::Right],
+            &handling,
+        )
+        .unwrap();
+
+        assert_eq!(
+            compare_route_candidates(&rotate_only, &with_horizontal),
+            Ordering::Less
+        );
+    }
+
+    #[test]
     fn skip_snapshot_reason_blocks_duplicate_piece_counter() {
         let snapshot = GameSnapshot {
             source: "browser_cdp".to_owned(),
@@ -1229,6 +1587,7 @@ mod tests {
             piece_counter: Some(12),
             playing: true,
             countdown: false,
+            active: None,
         };
 
         assert_eq!(
@@ -1251,6 +1610,7 @@ mod tests {
             piece_counter: Some(3),
             playing: false,
             countdown: false,
+            active: None,
         };
         assert_eq!(
             skip_snapshot_reason(&snapshot, None).as_deref(),
@@ -1262,6 +1622,29 @@ mod tests {
         assert_eq!(
             skip_snapshot_reason(&snapshot, None).as_deref(),
             Some("countdown=true")
+        );
+    }
+
+    #[test]
+    fn target_pps_interval_is_disabled_for_zero_or_invalid_values() {
+        assert_eq!(target_pps_interval(0.0), None);
+        assert_eq!(target_pps_interval(-1.0), None);
+        assert_eq!(target_pps_interval(f32::NAN), None);
+    }
+
+    #[test]
+    fn pps_wait_duration_only_waits_for_remaining_cycle_time() {
+        assert_eq!(
+            pps_wait_duration(Some(Duration::from_millis(500)), Duration::from_millis(120)),
+            Some(Duration::from_millis(380))
+        );
+        assert_eq!(
+            pps_wait_duration(Some(Duration::from_millis(500)), Duration::from_millis(500)),
+            None
+        );
+        assert_eq!(
+            pps_wait_duration(Some(Duration::from_millis(500)), Duration::from_millis(750)),
+            None
         );
     }
 }

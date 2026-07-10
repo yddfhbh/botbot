@@ -1,12 +1,13 @@
 use std::convert::TryInto;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use libtetris::Piece;
+use libtetris::{Piece, RotationState};
 use serde::{Deserialize, Serialize};
+use serde_json::error::Category as JsonErrorCategory;
 
 use crate::browser_source::BrowserSnapshotWire;
 
@@ -31,6 +32,8 @@ pub struct GameSnapshot {
     pub playing: bool,
     #[serde(default)]
     pub countdown: bool,
+    #[serde(default)]
+    pub active: Option<ActivePieceState>,
 }
 
 impl GameSnapshot {
@@ -50,6 +53,34 @@ impl GameSnapshot {
     pub fn hold_piece(&self) -> Option<Piece> {
         self.hold.map(Into::into)
     }
+}
+
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RotationToken {
+    North,
+    East,
+    South,
+    West,
+}
+
+impl From<RotationToken> for RotationState {
+    fn from(value: RotationToken) -> Self {
+        match value {
+            RotationToken::North => RotationState::North,
+            RotationToken::East => RotationState::East,
+            RotationToken::South => RotationState::South,
+            RotationToken::West => RotationState::West,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct ActivePieceState {
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    pub rotation: RotationToken,
 }
 
 pub trait SnapshotScanner {
@@ -102,7 +133,7 @@ impl SnapshotScanner for JsonFileScanner {
                 self.waiting_for_file_logged = false;
                 raw
             }
-            Err(err) if err.kind() == ErrorKind::NotFound => {
+            Err(err) if is_retryable_snapshot_io_error(&err) => {
                 if !self.waiting_for_file_logged {
                     println!(
                         "[automation] waiting for scanner output at {}",
@@ -118,16 +149,37 @@ impl SnapshotScanner for JsonFileScanner {
                 });
             }
         };
-        let metadata = fs::metadata(&self.path).with_context(|| {
-            format!(
-                "failed to read snapshot metadata from {}",
-                self.path.display()
-            )
-        })?;
-        let modified_at = metadata
-            .modified()
-            .context("failed to read snapshot modified timestamp")?;
-        let snapshot = parse_snapshot_json(&raw).context("failed to parse snapshot JSON")?;
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+        let modified_at = if self.min_snapshot_age.is_zero() {
+            None
+        } else {
+            match fs::metadata(&self.path) {
+                Ok(metadata) => match metadata.modified() {
+                    Ok(modified_at) => Some(modified_at),
+                    Err(_) => None,
+                },
+                Err(err) if is_retryable_snapshot_io_error(&err) => {
+                    return Ok(None);
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to read snapshot metadata from {}",
+                            self.path.display()
+                        )
+                    });
+                }
+            }
+        };
+        let snapshot = match parse_snapshot_json(&raw) {
+            Ok(snapshot) => snapshot,
+            Err(err) if is_retryable_snapshot_parse_error(&raw, &err) => {
+                return Ok(None);
+            }
+            Err(err) => return Err(err).context("failed to parse snapshot JSON"),
+        };
         if self.last_token.as_deref() == Some(snapshot.token.as_str()) {
             return Ok(None);
         }
@@ -140,7 +192,7 @@ impl SnapshotScanner for JsonFileScanner {
         }
 
         let age_ready = modified_at
-            .elapsed()
+            .and_then(|timestamp| timestamp.elapsed().ok())
             .map(|age| age >= self.min_snapshot_age)
             .unwrap_or(true);
         let stable_enough = self.pending_seen_count >= 2;
@@ -177,6 +229,31 @@ fn parse_snapshot_json(raw: &str) -> Result<GameSnapshot> {
             .context("browser snapshot was not ready"),
         SnapshotWire::Game(snapshot) => Ok(snapshot),
     }
+}
+
+pub fn read_snapshot_file(path: &Path) -> Result<GameSnapshot> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read snapshot JSON from {}", path.display()))?;
+    if raw.trim().is_empty() {
+        anyhow::bail!("snapshot JSON file was empty");
+    }
+    parse_snapshot_json(&raw).context("failed to parse snapshot JSON")
+}
+
+fn is_retryable_snapshot_parse_error(raw: &str, err: &anyhow::Error) -> bool {
+    if raw.trim().is_empty() {
+        return true;
+    }
+    err.downcast_ref::<serde_json::Error>()
+        .map(|json_err| matches!(json_err.classify(), JsonErrorCategory::Eof))
+        .unwrap_or(false)
+}
+
+fn is_retryable_snapshot_io_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::WouldBlock
+    )
 }
 
 fn queue_transitioned(
@@ -245,6 +322,7 @@ mod tests {
             piece_counter: Some(4),
             playing: true,
             countdown: false,
+            active: None,
         };
         assert!(!queue_transitioned(
             &[PieceToken::T, PieceToken::I, PieceToken::O],
@@ -278,6 +356,7 @@ mod tests {
             piece_counter: Some(0),
             playing: true,
             countdown: false,
+            active: None,
         };
         assert!(queue_transitioned(
             &[PieceToken::T, PieceToken::I, PieceToken::O],
@@ -304,5 +383,21 @@ mod tests {
         assert_eq!(snapshot.source, "browser_cdp");
         assert_eq!(snapshot.queue[0], PieceToken::T);
         assert_eq!(snapshot.piece_counter, Some(123));
+    }
+
+    #[test]
+    fn retryable_snapshot_io_errors_include_permission_denied() {
+        assert!(is_retryable_snapshot_io_error(&std::io::Error::from(
+            ErrorKind::NotFound
+        )));
+        assert!(is_retryable_snapshot_io_error(&std::io::Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(is_retryable_snapshot_io_error(&std::io::Error::from(
+            ErrorKind::WouldBlock
+        )));
+        assert!(!is_retryable_snapshot_io_error(&std::io::Error::from(
+            ErrorKind::InvalidData
+        )));
     }
 }

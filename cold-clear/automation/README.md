@@ -61,7 +61,7 @@ Running without arguments opens the launcher window. From there you can:
 - choose `2P Left 1080p`, `Solo 1080p`, or `Custom`
 - use the streamlined Browser CDP-only launcher
 - edit Browser CDP connection fields such as Chrome path, port, URL, target hint, and ribbon/seed fallbacks
-- edit dry-run, timings, movement mode, and spawn rule
+- edit dry-run, target PPS, timings, movement mode, and spawn rule
 - start or stop the bot session
 - save launcher settings for the next launch
 
@@ -79,19 +79,23 @@ The built-in live presets now apply a `TETR.IO Safe preset` aimed at personal so
 - `Planner threads`: auto-detect up to `4`
 - `Planner min nodes`: `4000`
 - `Legacy Tap`: `60ms`
-- `Move Tap`: `55ms`
-- `Rotate Tap`: `70ms`
-- `HardDrop Tap`: `80ms`
-- `Move Delay`: `60ms`
-- `Rotate Delay`: `120ms`
-- `HardDrop Delay`: `100ms`
-- `Piece Delay`: `100ms`
-- `Min Snapshot Age`: `40ms`
+- `Target PPS`: `0.0` (`0 = unlimited`)
+- `Move Tap`: `40ms`
+- `Rotate Tap`: `45ms`
+- `HardDrop Tap`: `55ms`
+- `Move Delay`: `18ms`
+- `Rotate Delay`: `45ms`
+- `HardDrop Delay`: `35ms`
+- `Piece Delay`: `20ms`
+- `Min Snapshot Age`: `8ms`
 - `IRS/IHS`: `Off`
 - `Prevent accidental hard drops`: `On`
 - `Speculate`: `Off`
 - `SoftDrop route`: disabled when `soft_drop_mode = infinite`
 - `Allow spin routes after soft drop`: `On`
+- `Allow post-softdrop horizontal`: `Off`
+- `Release after each action`: `On`
+- `Action settle`: `8ms`
 
 If you need to temporarily simplify execution for debugging, switch `Movement` to `Hard Drop Only`.
 
@@ -103,13 +107,14 @@ when the logged input route is something the real client can actually reproduce.
 These defaults are tuned to match longer real TETR.IO tap windows instead of the old `18ms` single-tap
 profile:
 
-- `Movement Tap`: `55ms`
-- `Rotate Tap`: `70ms`
-- `HardDrop Tap`: `80ms`
-- `Move Delay`: `60ms`
-- `Rotate Delay`: `120ms`
-- `HardDrop Delay`: `100ms`
-- `Piece Delay`: `100ms`
+- `Target PPS`: `0.0` by default (`0 = unlimited`)
+- `Movement Tap`: `40ms`
+- `Rotate Tap`: `45ms`
+- `HardDrop Tap`: `55ms`
+- `Move Delay`: `18ms`
+- `Rotate Delay`: `45ms`
+- `HardDrop Delay`: `35ms`
+- `Piece Delay`: `20ms`
 - `Snapshot provider`: `Browser CDP`
 - `Input backend`: `Browser CDP`
 - `Movement`: `ZeroG Safe`
@@ -119,7 +124,9 @@ profile:
 
 Movement taps are clamped below DAS with a safety margin, while rotate / hard drop keep their own
 dedicated press lengths. The launcher keeps `Legacy Tap` as a fallback, but the runtime now prefers
-the action-specific tap fields and the separate inter-action delay preset.
+the action-specific tap fields and the separate inter-action delay preset. `Target PPS` acts as a
+piece-rate limiter on top of those timings: when set above `0`, the runner waits before hard drop so
+the total placement rate does not exceed the requested PPS.
 
 ## If inputs still feel unstable
 
@@ -127,18 +134,22 @@ Try these first:
 
 - `Movement`: keep `ZeroG Safe` first and only drop to `Hard Drop Only` for debugging
 - `Spawn`: `Row 19 or 20`
-- `Move Tap`: start at `55ms`
-- `Rotate Tap`: start at `70ms`
-- `HardDrop Tap`: start at `80ms`
-- `Move Delay`: start at `60ms`
-- `Rotate Delay`: start at `120ms`
-- `HardDrop Delay`: start at `100ms`
-- `Piece Delay`: start at `100ms`
+- `Move Tap`: start at `40ms`
+- `Rotate Tap`: start at `45ms`
+- `HardDrop Tap`: start at `55ms`
+- `Target PPS`: start around `1.2` to `2.0` if you want a calmer pace, or leave it at `0` for no cap
+- `Move Delay`: start at `18ms`
+- `Rotate Delay`: start at `45ms`
+- `HardDrop Delay`: start at `35ms`
+- `Piece Delay`: start at `20ms`
 - `IRS/IHS`: `Off`
 - `Prevent accidental hard drops`: `On`
 - `Input backend`: keep `Browser CDP` first and only fall back to `Scan Code (SendInput)` or `Virtual Key (SendInput)` if needed
 - `SoftDrop route`: keep it disabled for Infinite SDF clients like TETR.IO
 - `Allow spin routes`: `On` by default so T-spin / kick routes can execute
+- `Allow post-softdrop horizontal`: keep it `Off` unless you specifically need floor-sideways corrections after soft drop
+- `Release after each action`: keep it `On` to reduce sticky left/right, DAS carry, and soft drop carry
+- `Action settle`: start at `8ms`
 
 The runner now also forces `release_all_keys()` before a plan, after hold, before hard drop, after hard
 drop, and again when the launcher stops. `ZeroG Safe` stays the recommended default because it can still

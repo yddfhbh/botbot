@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -33,9 +33,11 @@ async function main() {
   await waitForCdp(port);
   const target = await findOrCreateTarget({ port, url, targetHint });
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
+  await cdp.send("Page.enable").catch(() => undefined);
+  await cdp.send("Runtime.enable").catch(() => undefined);
   await cdp.send("Page.bringToFront");
   await installBackgroundInputKeepalive(cdp);
-  await cdp.send("Runtime.evaluate", {
+  await safeRuntimeEvaluate(cdp, {
     expression: "window.focus(); document.body && document.body.focus && document.body.focus(); true"
   }).catch(() => undefined);
 
@@ -50,7 +52,8 @@ async function main() {
   let lastReasonAt = 0;
   let stableSignature = "";
   let stableCount = 0;
-  let lastWrittenToken = "";
+  let lastWrittenSignature = "";
+  let lastLoggedToken = "";
   const probeState = {
     lastCaptureAt: 0
   };
@@ -87,7 +90,7 @@ async function main() {
     lastReasonAt = 0;
 
     const queueText = state.queue.join(",");
-    const signature = `${state.pieceCounter}|${state.current}|${state.hold ?? "-"}|${queueText}`;
+    const signature = `${state.pieceCounter}|${state.current}|${state.hold ?? "-"}|${queueText}|${state.activeX ?? "-"}|${state.activeY ?? "-"}|${state.activeRotation ?? "-"}`;
     if (signature === stableSignature) {
       stableCount += 1;
     } else {
@@ -113,15 +116,21 @@ async function main() {
       pieceCounter: state.pieceCounter,
       token: `browser-${state.pieceCounter}`,
       playing: state.playing,
-      countdown: state.countdown
+      countdown: state.countdown,
+      activeX: Number.isFinite(state.activeX) ? state.activeX : undefined,
+      activeY: Number.isFinite(state.activeY) ? state.activeY : undefined,
+      activeRotation: state.activeRotation ?? undefined
     };
 
-    if (snapshot.token !== lastWrittenToken) {
+    if (signature !== lastWrittenSignature) {
       writeSnapshot(snapshotPath, snapshot);
-      lastWrittenToken = snapshot.token;
-      console.log(
-        `[browser] page state ready pieceCounter=${state.pieceCounter} current=${snapshot.current} hold=${snapshot.hold ?? "-"} queue=${snapshot.queue.join(",")}`
-      );
+      lastWrittenSignature = signature;
+      if (snapshot.token !== lastLoggedToken) {
+        lastLoggedToken = snapshot.token;
+        console.log(
+          `[browser] page state ready pieceCounter=${state.pieceCounter} current=${snapshot.current} hold=${snapshot.hold ?? "-"} queue=${snapshot.queue.join(",")}`
+        );
+      }
     }
 
     await sleep(pollMs);
@@ -486,10 +495,18 @@ function finiteNumber(value) {
 
 async function readTetrioState(cdp, options) {
   const read = async () => {
-    const raw = await cdp.send("Runtime.evaluate", {
+    const raw = await safeRuntimeEvaluate(cdp, {
       expression: tetrioStateExpression(),
       returnByValue: true,
       awaitPromise: true
+    }, {
+      result: {
+        value: {
+          ok: false,
+          ready: false,
+          reason: "browser execution context not ready yet"
+        }
+      }
     });
     return raw.result?.value ?? { ok: false, ready: false, reason: "page probe returned empty" };
   };
@@ -537,11 +554,11 @@ async function captureTetrioGame(cdp) {
   try {
     await cdp.send("Debugger.enable");
     for (const expression of ["window.requestAnimationFrame", "window.setTimeout"]) {
-      const evaluated = await cdp.send("Runtime.evaluate", {
+      const evaluated = await safeRuntimeEvaluate(cdp, {
         expression,
         objectGroup: "fusion-tetrio-probe",
         silent: true
-      }).catch(() => null);
+      }, null).catch(() => null);
       const objectId = evaluated?.result?.objectId;
       if (!objectId) continue;
       const breakpoint = await cdp.send("Debugger.setBreakpointOnFunctionCall", {
@@ -589,6 +606,27 @@ async function captureTetrioGame(cdp) {
     }).catch(() => undefined);
     await cdp.send("Debugger.disable").catch(() => undefined);
   }
+}
+
+async function safeRuntimeEvaluate(cdp, params, fallbackResult = null) {
+  try {
+    return await cdp.send("Runtime.evaluate", params);
+  } catch (error) {
+    if (isMissingExecutionContextError(error)) {
+      return fallbackResult;
+    }
+    throw error;
+  }
+}
+
+function isMissingExecutionContextError(error) {
+  const message = String(error?.message ?? error ?? "").toLowerCase();
+  return (
+    message.includes("cannot find default execution context") ||
+    message.includes("execution context was destroyed") ||
+    message.includes("inspected target navigated or closed") ||
+    message.includes("no frame with given id")
+  );
 }
 
 async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent) {
@@ -752,6 +790,28 @@ function tetrioStateExpression() {
       }
       return null;
     };
+    const integerFrom = (...values) => {
+      const number = numberFrom(...values);
+      return number === null ? null : Math.floor(number);
+    };
+    const rotationFrom = (...values) => {
+      for (const value of values) {
+        if (value === null || value === undefined) continue;
+        if (typeof value === "number" && Number.isFinite(value)) {
+          const normalized = ((Math.floor(value) % 4) + 4) % 4;
+          return ["north", "east", "south", "west"][normalized] ?? null;
+        }
+        if (typeof value === "string") {
+          const text = value.trim().toLowerCase();
+          if (!text) continue;
+          if (["north", "n", "spawn", "0"].includes(text)) return "north";
+          if (["east", "e", "right", "r", "1"].includes(text)) return "east";
+          if (["south", "s", "2"].includes(text)) return "south";
+          if (["west", "w", "left", "l", "3"].includes(text)) return "west";
+        }
+      }
+      return null;
+    };
     const looksLikeGame = (value) =>
       value &&
       typeof value === "object" &&
@@ -806,7 +866,8 @@ function tetrioStateExpression() {
       return { ok: false, ready: false, reason: "TETR.IO board is not available" };
     }
 
-    const current = normalizePiece(state.falling ?? state.active ?? state.current ?? state.piece);
+    const activeState = state.falling ?? state.active ?? state.current ?? state.piece;
+    const current = normalizePiece(activeState);
     const hold = normalizePiece(state.hold ?? state.held);
     const queue = queueFrom(state.bag, state.queue, state.next, state.preview, state.previews, state.pieces);
     const stats = state.stats ?? {};
@@ -822,6 +883,25 @@ function tetrioStateExpression() {
     if (!current || pieceCounter < 0) {
       return { ok: false, ready: false, reason: "TETR.IO current piece or piece counter is not available" };
     }
+
+    const activeX = integerFrom(
+      activeState?.x,
+      activeState?.col,
+      activeState?.column,
+      activeState?.cx
+    );
+    const activeY = integerFrom(
+      activeState?.y,
+      activeState?.row,
+      activeState?.cy
+    );
+    const activeRotation = rotationFrom(
+      activeState?.rotation,
+      activeState?.rot,
+      activeState?.orientation,
+      activeState?.dir,
+      activeState?.state
+    );
 
     const playing =
       typeof game.isPlaying === "function" ? Boolean(game.isPlaying()) :
@@ -852,7 +932,10 @@ function tetrioStateExpression() {
       incoming: Math.max(0, numberFrom(stats.impendingdamage, state.incoming, 0) ?? 0),
       pieceCounter,
       playing,
-      countdown
+      countdown,
+      activeX,
+      activeY,
+      activeRotation
     };
   })()`;
 }
@@ -860,7 +943,10 @@ function tetrioStateExpression() {
 function writeSnapshot(snapshotPath, payload) {
   const directory = path.dirname(snapshotPath);
   mkdirSync(directory, { recursive: true });
-  writeFileSync(snapshotPath, JSON.stringify(payload, null, 2));
+  const temporaryPath = `${snapshotPath}.tmp`;
+  writeFileSync(temporaryPath, JSON.stringify(payload, null, 2));
+  rmSync(snapshotPath, { force: true });
+  renameSync(temporaryPath, snapshotPath);
 }
 
 function sleep(ms) {

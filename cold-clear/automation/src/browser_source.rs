@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{AutomationConfig, SnapshotProviderConfig};
 use crate::paths::AppPaths;
-use crate::scanner::{GameSnapshot, PieceToken};
+use crate::scanner::{ActivePieceState, GameSnapshot, PieceToken, RotationToken};
 
 pub type SharedLogger = Arc<Mutex<Box<dyn FnMut(String) + Send>>>;
 
@@ -95,6 +95,15 @@ pub struct BrowserSnapshotWire {
     pub playing: bool,
     #[serde(default)]
     pub countdown: bool,
+    #[serde(default)]
+    #[serde(alias = "activeX")]
+    pub active_x: Option<i32>,
+    #[serde(default)]
+    #[serde(alias = "activeY")]
+    pub active_y: Option<i32>,
+    #[serde(default)]
+    #[serde(alias = "activeRotation")]
+    pub active_rotation: Option<RotationToken>,
 }
 
 impl BrowserSnapshotWire {
@@ -117,6 +126,14 @@ impl BrowserSnapshotWire {
             piece_counter: Some(self.piece_counter),
             playing: self.playing,
             countdown: self.countdown,
+            active: match (self.active_x, self.active_rotation) {
+                (Some(x), Some(rotation)) => Some(ActivePieceState {
+                    x,
+                    y: self.active_y.unwrap_or_default(),
+                    rotation,
+                }),
+                _ => None,
+            },
         }))
     }
 }
@@ -323,6 +340,9 @@ mod tests {
             token: "browser-27".to_owned(),
             playing: true,
             countdown: false,
+            active_x: Some(4),
+            active_y: Some(19),
+            active_rotation: Some(RotationToken::North),
         };
 
         let snapshot = wire.into_game_snapshot().unwrap().unwrap();
@@ -334,6 +354,14 @@ mod tests {
         );
         assert_eq!(snapshot.hold, Some(PieceToken::I));
         assert_eq!(snapshot.piece_counter, Some(27));
+        assert_eq!(
+            snapshot.active,
+            Some(ActivePieceState {
+                x: 4,
+                y: 19,
+                rotation: RotationToken::North
+            })
+        );
     }
 
     #[test]

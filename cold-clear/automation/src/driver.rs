@@ -1,9 +1,10 @@
-use std::io::Write;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 
 use crate::config::{
     AutomationConfig, BufferModeConfig, HandlingConfig, InputBackendConfig, KeyBindings,
@@ -89,6 +90,26 @@ where
     B: InputBackend + ?Sized,
     F: FnMut(String),
 {
+    execute_plan_until_hard_drop(backend, plan, handling, timings, |line| log(line))?;
+    if plan.hard_drop {
+        execute_hard_drop_action(backend, &plan.movement_actions, handling, timings, |line| {
+            log(line)
+        })?;
+    }
+    Ok(())
+}
+
+pub fn execute_plan_until_hard_drop<B, F>(
+    backend: &mut B,
+    plan: &ExecutionPlan,
+    handling: &HandlingConfig,
+    timings: ExecutionTimings,
+    mut log: F,
+) -> Result<()>
+where
+    B: InputBackend + ?Sized,
+    F: FnMut(String),
+{
     log_release(&mut log, "before_plan");
     backend
         .release_all_keys()
@@ -117,26 +138,92 @@ where
     }
 
     for action in &plan.movement_actions {
-        tap_action_with_logging(backend, *action, handling, timings, &mut log)
+        execute_single_action(backend, *action, handling, timings, &mut log)
             .with_context(|| format!("failed to send action {:?}", action))?;
-        sleep_action_delay(&mut log, *action, timings);
     }
 
-    if plan.hard_drop {
-        log_release(&mut log, "before_hard_drop");
+    Ok(())
+}
+
+pub fn execute_single_action<B, F>(
+    backend: &mut B,
+    action: GameAction,
+    handling: &HandlingConfig,
+    timings: ExecutionTimings,
+    log: &mut F,
+) -> Result<()>
+where
+    B: InputBackend + ?Sized,
+    F: FnMut(String),
+{
+    tap_action_with_logging(backend, action, handling, timings, log)?;
+    apply_post_action_safety(backend, action, handling, log)?;
+    sleep_action_delay(log, action, timings);
+    Ok(())
+}
+
+pub fn execute_hard_drop_action<B, F>(
+    backend: &mut B,
+    actions_before_hard_drop: &[GameAction],
+    handling: &HandlingConfig,
+    timings: ExecutionTimings,
+    mut log: F,
+) -> Result<()>
+where
+    B: InputBackend + ?Sized,
+    F: FnMut(String),
+{
+    log(format!(
+        "[automation] pre_hard_drop_actions={:?}",
+        actions_before_hard_drop
+    ));
+    log_release(&mut log, "before_hard_drop");
+    backend
+        .release_all_keys()
+        .context("failed to release all keys before hard drop")?;
+    if handling.prevent_accidental_hard_drops {
+        log("[automation] prevent_accidental_hard_drops=On".to_owned());
+    }
+    tap_action_with_logging(backend, GameAction::HardDrop, handling, timings, &mut log)
+        .context("failed to send hard drop input")?;
+    log_release(&mut log, "after_hard_drop");
+    backend
+        .release_all_keys()
+        .context("failed to release all keys after hard drop")?;
+    sleep_action_delay(&mut log, GameAction::HardDrop, timings);
+
+    Ok(())
+}
+
+fn apply_post_action_safety<B, F>(
+    backend: &mut B,
+    action: GameAction,
+    handling: &HandlingConfig,
+    log: &mut F,
+) -> Result<()>
+where
+    B: InputBackend + ?Sized,
+    F: FnMut(String),
+{
+    if handling.release_after_each_action {
+        log(format!(
+            "[automation] release_after_each_action=On action={:?}",
+            action
+        ));
+        log_release(log, "after_action");
         backend
             .release_all_keys()
-            .context("failed to release all keys before hard drop")?;
-        if handling.prevent_accidental_hard_drops {
-            log("[automation] prevent_accidental_hard_drops=On".to_owned());
-        }
-        tap_action_with_logging(backend, GameAction::HardDrop, handling, timings, &mut log)
-            .context("failed to send hard drop input")?;
-        log_release(&mut log, "after_hard_drop");
-        backend
-            .release_all_keys()
-            .context("failed to release all keys after hard drop")?;
-        sleep_action_delay(&mut log, GameAction::HardDrop, timings);
+            .with_context(|| format!("failed to release all keys after {:?}", action))?;
+        sleep_action_settle(
+            log,
+            action,
+            Duration::from_millis(handling.action_settle_ms),
+        );
+    } else {
+        log(format!(
+            "[automation] release_after_each_action=Off action={:?}",
+            action
+        ));
     }
 
     Ok(())
@@ -199,6 +286,21 @@ where
         profile.source
     ));
     thread::sleep(profile.duration);
+}
+
+fn sleep_action_settle<F>(log: &mut F, action: GameAction, duration: Duration)
+where
+    F: FnMut(String),
+{
+    if duration.is_zero() {
+        return;
+    }
+    log(format!(
+        "[automation] action_settle {:?} {}ms",
+        action,
+        duration.as_millis()
+    ));
+    thread::sleep(duration);
 }
 
 fn action_tap_profile(
@@ -564,6 +666,8 @@ impl InputBackend for DebugLogBackend {
 pub struct BrowserCdpInputBackend {
     child: Child,
     stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_command_id: u64,
 }
 
 impl BrowserCdpInputBackend {
@@ -582,7 +686,7 @@ impl BrowserCdpInputBackend {
             .arg("1")
             .current_dir(&paths.workspace_root)
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
 
         if !config.browser.chrome_path.trim().is_empty() {
@@ -600,7 +704,16 @@ impl BrowserCdpInputBackend {
             .stdin
             .take()
             .context("browser input helper stdin was not available")?;
-        Ok(Self { child, stdin })
+        let stdout = child
+            .stdout
+            .take()
+            .context("browser input helper stdout was not available")?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_command_id: 1,
+        })
     }
 
     fn command_name_for(action: GameAction) -> &'static str {
@@ -615,7 +728,14 @@ impl BrowserCdpInputBackend {
         }
     }
 
-    fn send_line(&mut self, line: &str) -> Result<()> {
+    fn send_command(
+        &mut self,
+        command_type: &'static str,
+        payload: impl FnOnce(u64) -> String,
+    ) -> Result<()> {
+        let id = self.next_command_id;
+        self.next_command_id += 1;
+        let line = payload(id);
         self.stdin
             .write_all(line.as_bytes())
             .context("failed to write to browser input helper")?;
@@ -624,13 +744,59 @@ impl BrowserCdpInputBackend {
             .context("failed to write newline to browser input helper")?;
         self.stdin
             .flush()
-            .context("failed to flush browser input helper")
+            .context("failed to flush browser input helper")?;
+        self.wait_for_command_response(id, command_type)
+    }
+
+    fn wait_for_command_response(&mut self, id: u64, command_type: &'static str) -> Result<()> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = self
+                .stdout
+                .read_line(&mut line)
+                .context("failed to read from browser input helper")?;
+            if read == 0 {
+                bail!(
+                    "browser input helper closed before acknowledging {} command id={}",
+                    command_type,
+                    id
+                );
+            }
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let response: BrowserInputHelperResponse =
+                serde_json::from_str(trimmed).with_context(|| {
+                    format!(
+                        "failed to parse browser input helper response for {} command id={}: {}",
+                        command_type, id, trimmed
+                    )
+                })?;
+            if response.id != Some(id) {
+                continue;
+            }
+            if response.ok {
+                return Ok(());
+            }
+            bail!(
+                "browser input helper rejected {} command id={}: {}",
+                command_type,
+                id,
+                response.error.unwrap_or_else(|| "unknown error".to_owned())
+            );
+        }
     }
 }
 
 impl Drop for BrowserCdpInputBackend {
     fn drop(&mut self) {
-        let _ = self.send_line(r#"{"type":"quit"}"#);
+        let _ = self.stdin.write_all(br#"{"type":"quit"}"#);
+        let _ = self.stdin.write_all(b"\n");
+        let _ = self.stdin.flush();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -639,15 +805,40 @@ impl Drop for BrowserCdpInputBackend {
 impl InputBackend for BrowserCdpInputBackend {
     fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()> {
         let key = Self::command_name_for(action);
-        self.send_line(&format!(
-            r#"{{"type":"tap","key":"{key}","durationMs":{}}}"#,
-            duration.as_millis()
-        ))
+        self.send_command("tap", |id| {
+            format!(
+                r#"{{"id":{},"type":"tap","key":"{}","durationMs":{}}}"#,
+                id,
+                key,
+                duration.as_millis()
+            )
+        })
     }
 
     fn release_all_keys(&mut self) -> Result<()> {
-        self.send_line(r#"{"type":"releaseAll"}"#)
+        self.send_command("releaseAll", |id| {
+            format!(r#"{{"id":{},"type":"releaseAll"}}"#, id)
+        })
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserInputHelperResponse {
+    ok: bool,
+    #[allow(dead_code)]
+    #[serde(default)]
+    r#type: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    key: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    #[serde(alias = "durationMs")]
+    duration_ms: Option<u64>,
+    #[serde(default)]
+    id: Option<u64>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -710,15 +901,22 @@ mod tests {
     fn timings() -> ExecutionTimings {
         ExecutionTimings {
             tap_duration: Duration::from_millis(60),
-            movement_tap_duration: Duration::from_millis(55),
-            rotate_tap_duration: Duration::from_millis(70),
-            hold_tap_duration: Duration::from_millis(70),
-            hard_drop_tap_duration: Duration::from_millis(80),
-            soft_drop_tap_duration: Duration::from_millis(55),
-            movement_interval: Duration::from_millis(60),
-            rotation_interval: Duration::from_millis(120),
-            piece_interval: Duration::from_millis(100),
-            hard_drop_interval: Duration::from_millis(100),
+            movement_tap_duration: Duration::from_millis(25),
+            rotate_tap_duration: Duration::from_millis(28),
+            hold_tap_duration: Duration::from_millis(35),
+            hard_drop_tap_duration: Duration::from_millis(30),
+            soft_drop_tap_duration: Duration::from_millis(25),
+            movement_interval: Duration::ZERO,
+            rotation_interval: Duration::from_millis(8),
+            piece_interval: Duration::ZERO,
+            hard_drop_interval: Duration::ZERO,
+        }
+    }
+
+    fn handling_for_tests() -> HandlingConfig {
+        HandlingConfig {
+            action_settle_ms: 0,
+            ..HandlingConfig::default()
         }
     }
 
@@ -735,7 +933,7 @@ mod tests {
         execute_plan(
             &mut backend,
             &plan,
-            &HandlingConfig::default(),
+            &handling_for_tests(),
             timings(),
             |line| logs.push(line),
         )
@@ -745,13 +943,16 @@ mod tests {
             &*backend.events.borrow(),
             &[
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::Hold, Duration::from_millis(70)),
+                RecordedEvent::Tap(GameAction::Hold, Duration::from_millis(35)),
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::RotateCw, Duration::from_millis(70)),
-                RecordedEvent::Tap(GameAction::Left, Duration::from_millis(55)),
-                RecordedEvent::Tap(GameAction::SoftDrop, Duration::from_millis(55)),
+                RecordedEvent::Tap(GameAction::RotateCw, Duration::from_millis(28)),
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::HardDrop, Duration::from_millis(80)),
+                RecordedEvent::Tap(GameAction::Left, Duration::from_millis(25)),
+                RecordedEvent::ReleaseAll,
+                RecordedEvent::Tap(GameAction::SoftDrop, Duration::from_millis(25)),
+                RecordedEvent::ReleaseAll,
+                RecordedEvent::ReleaseAll,
+                RecordedEvent::Tap(GameAction::HardDrop, Duration::from_millis(30)),
                 RecordedEvent::ReleaseAll,
             ]
         );
@@ -760,10 +961,10 @@ mod tests {
             .any(|line| line.contains("release_all before_plan")));
         assert!(logs
             .iter()
-            .any(|line| line.contains("after_rotate_delay 120ms")));
+            .any(|line| line.contains("release_after_each_action=On action=RotateCw")));
         assert!(logs
             .iter()
-            .any(|line| line.contains("after_hard_drop_delay 100ms")));
+            .any(|line| line.contains("after_rotate_delay 8ms")));
     }
 
     #[test]
@@ -778,7 +979,7 @@ mod tests {
         execute_plan(
             &mut backend,
             &plan,
-            &HandlingConfig::default(),
+            &handling_for_tests(),
             timings(),
             |_| {},
         )
@@ -790,7 +991,7 @@ mod tests {
         );
         assert_eq!(
             backend.events.borrow()[backend.events.borrow().len() - 2],
-            RecordedEvent::Tap(GameAction::HardDrop, Duration::from_millis(80))
+            RecordedEvent::Tap(GameAction::HardDrop, Duration::from_millis(30))
         );
     }
 
@@ -839,23 +1040,23 @@ mod tests {
 
         assert_eq!(
             duration_for_action(GameAction::RotateCw, &handling, timings),
-            Duration::from_millis(70)
+            Duration::from_millis(28)
         );
         assert_eq!(
             duration_for_action(GameAction::RotateCcw, &handling, timings),
-            Duration::from_millis(70)
+            Duration::from_millis(28)
         );
         assert_eq!(
             duration_for_action(GameAction::Hold, &handling, timings),
-            Duration::from_millis(70)
+            Duration::from_millis(35)
         );
         assert_eq!(
             duration_for_action(GameAction::SoftDrop, &handling, timings),
-            Duration::from_millis(55)
+            Duration::from_millis(25)
         );
         assert_eq!(
             duration_for_action(GameAction::HardDrop, &handling, timings),
-            Duration::from_millis(80)
+            Duration::from_millis(30)
         );
     }
 }

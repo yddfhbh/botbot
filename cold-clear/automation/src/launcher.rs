@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -46,6 +47,7 @@ struct LauncherState {
     always_on_top: bool,
     dry_run: bool,
     poll_interval_ms: u64,
+    target_pps: f32,
     tap_duration_ms: u64,
     movement_tap_duration_ms: u64,
     rotate_tap_duration_ms: u64,
@@ -74,18 +76,19 @@ impl Default for LauncherState {
             browser: BrowserCdpConfig::default(),
             always_on_top: false,
             dry_run: true,
-            poll_interval_ms: 16,
+            poll_interval_ms: 4,
+            target_pps: 0.0,
             tap_duration_ms: 60,
-            movement_tap_duration_ms: 55,
-            rotate_tap_duration_ms: 70,
-            hold_tap_duration_ms: 70,
-            hard_drop_tap_duration_ms: 80,
-            soft_drop_tap_duration_ms: 55,
-            movement_interval_ms: 60,
-            rotation_interval_ms: 120,
-            piece_interval_ms: 100,
-            hard_drop_interval_ms: 100,
-            min_snapshot_age_ms: 40,
+            movement_tap_duration_ms: 25,
+            rotate_tap_duration_ms: 28,
+            hold_tap_duration_ms: 35,
+            hard_drop_tap_duration_ms: 30,
+            soft_drop_tap_duration_ms: 25,
+            movement_interval_ms: 0,
+            rotation_interval_ms: 8,
+            piece_interval_ms: 0,
+            hard_drop_interval_ms: 0,
+            min_snapshot_age_ms: 0,
             input_backend: InputBackendConfig::BrowserCdp,
             bot: BotConfig::default(),
             handling: HandlingConfig::default(),
@@ -111,17 +114,19 @@ pub fn launcher_viewport(paths: &AppPaths) -> egui::ViewportBuilder {
 
 impl LauncherState {
     fn apply_tetrio_safe_preset(&mut self) {
+        self.target_pps = 0.0;
         self.tap_duration_ms = 60;
-        self.movement_tap_duration_ms = 55;
-        self.rotate_tap_duration_ms = 70;
-        self.hold_tap_duration_ms = 70;
-        self.hard_drop_tap_duration_ms = 80;
-        self.soft_drop_tap_duration_ms = 55;
-        self.movement_interval_ms = 60;
-        self.rotation_interval_ms = 120;
-        self.piece_interval_ms = 100;
-        self.hard_drop_interval_ms = 100;
-        self.min_snapshot_age_ms = 40;
+        self.poll_interval_ms = 4;
+        self.movement_tap_duration_ms = 25;
+        self.rotate_tap_duration_ms = 28;
+        self.hold_tap_duration_ms = 35;
+        self.hard_drop_tap_duration_ms = 30;
+        self.soft_drop_tap_duration_ms = 25;
+        self.movement_interval_ms = 0;
+        self.rotation_interval_ms = 8;
+        self.piece_interval_ms = 0;
+        self.hard_drop_interval_ms = 0;
+        self.min_snapshot_age_ms = 0;
         self.snapshot_provider = SnapshotProviderConfig::BrowserCdp;
         self.input_backend = InputBackendConfig::BrowserCdp;
         self.browser = BrowserCdpConfig::default();
@@ -133,6 +138,9 @@ impl LauncherState {
         self.bot.spawn_rule = SpawnRuleConfig::Row19Or20;
         self.handling.soft_drop_mode = SoftDropModeConfig::Infinite;
         self.handling.allow_post_softdrop_actions = true;
+        self.handling.allow_post_softdrop_horizontal = false;
+        self.handling.release_after_each_action = true;
+        self.handling.action_settle_ms = 0;
         self.handling.prevent_accidental_hard_drops = true;
         self.handling.cancel_das_on_direction_change = true;
         self.handling.prefer_soft_drop_over_movement = false;
@@ -174,6 +182,7 @@ impl LauncherState {
             snapshot_path: paths.resolve_workspace_path(&self.snapshot_path),
             dry_run: self.dry_run,
             poll_interval_ms: self.poll_interval_ms,
+            target_pps: self.target_pps,
             tap_duration_ms: self.tap_duration_ms,
             movement_tap_duration_ms: self.movement_tap_duration_ms,
             rotate_tap_duration_ms: self.rotate_tap_duration_ms,
@@ -252,10 +261,35 @@ impl LauncherApp {
         {
             self.status = "Running".to_owned();
         }
+        self.append_log_file(&line);
         self.logs.push(line);
         if self.logs.len() > 400 {
             let drain = self.logs.len() - 400;
             self.logs.drain(0..drain);
+        }
+    }
+
+    fn append_log_file(&self, line: &str) {
+        let log_path = self
+            .paths
+            .launcher_state_path
+            .parent()
+            .map(|parent| parent.join("launcher-latest.log"))
+            .unwrap_or_else(|| {
+                self.paths
+                    .workspace_root
+                    .join("automation")
+                    .join("launcher-latest.log")
+            });
+        if let Some(parent) = log_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let _ = writeln!(file, "{line}");
         }
     }
 
@@ -454,12 +488,31 @@ impl eframe::App for LauncherApp {
                     &mut self.state.handling.allow_post_softdrop_actions,
                     "Allow spin routes",
                 );
+                ui.checkbox(
+                    &mut self.state.handling.allow_post_softdrop_horizontal,
+                    "Allow post-softdrop horizontal",
+                );
                 ui.label("Input");
                 ui.monospace("Browser CDP");
             });
             ui.horizontal(|ui| {
+                ui.checkbox(
+                    &mut self.state.handling.release_after_each_action,
+                    "Release after each action",
+                );
+                ui.label("Settle");
+                ui.add(egui::DragValue::new(&mut self.state.handling.action_settle_ms).speed(1));
+            });
+            ui.horizontal(|ui| {
                 ui.label("Poll");
                 ui.add(egui::DragValue::new(&mut self.state.poll_interval_ms).speed(1));
+                ui.label("Target PPS");
+                ui.add(
+                    egui::DragValue::new(&mut self.state.target_pps)
+                        .speed(0.05)
+                        .range(0.0..=20.0),
+                );
+                ui.small("0 = unlimited");
             });
             ui.horizontal(|ui| {
                 ui.label("Move Tap");
@@ -612,19 +665,25 @@ mod tests {
 
         assert_eq!(state.bot.movement_mode, MovementModeConfig::ZeroGSafe);
         assert_eq!(state.bot.spawn_rule, SpawnRuleConfig::Row19Or20);
+        assert_eq!(state.target_pps, 0.0);
         assert_eq!(state.tap_duration_ms, 60);
-        assert_eq!(state.movement_tap_duration_ms, 55);
-        assert_eq!(state.rotate_tap_duration_ms, 70);
-        assert_eq!(state.hold_tap_duration_ms, 70);
-        assert_eq!(state.hard_drop_tap_duration_ms, 80);
-        assert_eq!(state.soft_drop_tap_duration_ms, 55);
-        assert_eq!(state.movement_interval_ms, 60);
-        assert_eq!(state.rotation_interval_ms, 120);
-        assert_eq!(state.piece_interval_ms, 100);
-        assert_eq!(state.hard_drop_interval_ms, 100);
+        assert_eq!(state.poll_interval_ms, 4);
+        assert_eq!(state.movement_tap_duration_ms, 25);
+        assert_eq!(state.rotate_tap_duration_ms, 28);
+        assert_eq!(state.hold_tap_duration_ms, 35);
+        assert_eq!(state.hard_drop_tap_duration_ms, 30);
+        assert_eq!(state.soft_drop_tap_duration_ms, 25);
+        assert_eq!(state.movement_interval_ms, 0);
+        assert_eq!(state.rotation_interval_ms, 8);
+        assert_eq!(state.piece_interval_ms, 0);
+        assert_eq!(state.hard_drop_interval_ms, 0);
+        assert_eq!(state.min_snapshot_age_ms, 0);
         assert_eq!(state.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
         assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
         assert!(state.handling.allow_post_softdrop_actions);
+        assert!(!state.handling.allow_post_softdrop_horizontal);
+        assert!(state.handling.release_after_each_action);
+        assert_eq!(state.handling.action_settle_ms, 0);
         assert_eq!(state.handling.irs_mode, BufferModeConfig::Off);
         assert_eq!(state.handling.ihs_mode, BufferModeConfig::Off);
     }

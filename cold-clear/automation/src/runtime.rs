@@ -24,9 +24,10 @@ where
     emit_log(
         &logger,
         format!(
-            "[automation] watching {} dry_run={}",
+            "[automation] watching {} dry_run={} target_pps={:.2}",
             config.snapshot_path.display(),
-            config.dry_run
+            config.dry_run,
+            config.target_pps
         ),
     );
     let mut provider = ProviderProcess::start(&paths, &config, logger.clone())?;
