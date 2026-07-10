@@ -77,10 +77,11 @@ async function main() {
     const pieceIndex = 0;
     const currentAndNext = getCurrentAndNext(capture.seed, pieceIndex, 6);
     const token = `seed-${pieceIndex}-${currentAndNext.current}${currentAndNext.queue.join("")}`;
+    const field = createEmptyField();
     const snapshot = {
       ok: true,
       source: "websocket_seed",
-      field: createEmptyField(),
+      field,
       current: currentAndNext.current,
       hold: null,
       queue: currentAndNext.queue,
@@ -98,6 +99,8 @@ async function main() {
       boardwidth: capture.boardwidth,
       boardheight: capture.boardheight,
       pieceIndex,
+      localBoardHash: hashField(field),
+      garbageSupport: "unsupported",
       options: capture.options
     };
 
@@ -307,6 +310,16 @@ class CdpClient {
 
 function createEmptyField() {
   return Array.from({ length: 40 }, () => Array(10).fill(false));
+}
+
+function hashField(field) {
+  const bits = field.map((row) => row.map((cell) => (cell ? "1" : "0")).join("")).join("|");
+  let hash = 2166136261;
+  for (let index = 0; index < bits.length; index += 1) {
+    hash ^= bits.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `fnv1a-${(hash >>> 0).toString(16)}`;
 }
 
 function writeSnapshot(snapshotPath, snapshot) {

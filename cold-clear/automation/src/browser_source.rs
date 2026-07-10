@@ -124,22 +124,11 @@ fn spawn_browser_provider(
     config: &AutomationConfig,
     logger: SharedLogger,
 ) -> Result<ProviderProcess> {
-    match config.snapshot_provider {
-        crate::config::SnapshotProviderConfig::BrowserCdp => spawn_node_provider(
-            &paths.browser_snapshot_script_path,
-            paths,
-            config,
-            logger,
-            "browser_cdp",
-        ),
-        crate::config::SnapshotProviderConfig::WebsocketSeed => spawn_node_provider(
-            &paths.browser_websocket_seed_script_path,
-            paths,
-            config,
-            logger,
-            "websocket_seed",
-        ),
-        crate::config::SnapshotProviderConfig::File => {
+    match provider_script_and_name(paths, config.snapshot_provider) {
+        Some((script, provider_name)) => {
+            spawn_node_provider(script, paths, config, logger, provider_name)
+        }
+        None => {
             emit_log(
                 &logger,
                 format!(
@@ -152,6 +141,21 @@ fn spawn_browser_provider(
                 log_threads: Vec::new(),
             })
         }
+    }
+}
+
+fn provider_script_and_name(
+    paths: &AppPaths,
+    snapshot_provider: crate::config::SnapshotProviderConfig,
+) -> Option<(&PathBuf, &'static str)> {
+    match snapshot_provider {
+        crate::config::SnapshotProviderConfig::BrowserCdp => {
+            Some((&paths.browser_snapshot_script_path, "browser_cdp"))
+        }
+        crate::config::SnapshotProviderConfig::WebsocketSeed => {
+            Some((&paths.browser_websocket_seed_script_path, "websocket_seed"))
+        }
+        crate::config::SnapshotProviderConfig::File => None,
     }
 }
 
@@ -426,6 +430,20 @@ mod tests {
         assert!(joined.contains("--player-user-id user-123"));
         assert!(joined.contains("--dump-state-on-fail 1"));
         assert!(joined.contains("--dump-state-path automation/debug/tetrio-state-dump.json"));
+    }
+
+    #[test]
+    fn websocket_seed_provider_uses_websocket_seed_script() {
+        let paths = AppPaths::discover();
+        let (script, provider_name) =
+            provider_script_and_name(&paths, crate::config::SnapshotProviderConfig::WebsocketSeed)
+                .expect("websocket seed provider should map to a node helper");
+
+        assert_eq!(provider_name, "websocket_seed");
+        assert_eq!(
+            script.file_name().and_then(|name| name.to_str()),
+            Some("tetrio-websocket-seed-source.mjs")
+        );
     }
 
     #[test]

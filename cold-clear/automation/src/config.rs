@@ -33,7 +33,7 @@ impl Default for AutomationConfig {
     fn default() -> Self {
         Self {
             snapshot_path: PathBuf::from("automation/live-snapshot.json"),
-            snapshot_provider: SnapshotProviderConfig::BrowserCdp,
+            snapshot_provider: SnapshotProviderConfig::WebsocketSeed,
             dry_run: true,
             poll_interval_ms: 20,
             perf_log_enabled: true,
@@ -49,8 +49,13 @@ impl Default for AutomationConfig {
             piece_interval_ms: 60,
             hard_drop_interval_ms: 40,
             min_snapshot_age_ms: 30,
-            input_backend: InputBackendConfig::ScanCode,
-            browser: BrowserCdpConfig::default(),
+            input_backend: InputBackendConfig::BrowserCdp,
+            browser: BrowserCdpConfig {
+                probe_page_state: false,
+                debugger_probe_mode: DebuggerProbeMode::Disabled,
+                use_ribbon_websocket: true,
+                ..BrowserCdpConfig::default()
+            },
             bot: BotConfig::default(),
             handling: HandlingConfig::default(),
             keys: KeyBindings::default(),
@@ -289,11 +294,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn automation_config_defaults_to_browser_cdp_snapshot_provider() {
+    fn automation_config_defaults_to_websocket_seed_snapshot_provider() {
         let config = AutomationConfig::default();
 
-        assert_eq!(config.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
-        assert_eq!(config.input_backend, InputBackendConfig::ScanCode);
+        assert_eq!(
+            config.snapshot_provider,
+            SnapshotProviderConfig::WebsocketSeed
+        );
+        assert_eq!(config.input_backend, InputBackendConfig::BrowserCdp);
+        assert!(config.browser.use_ribbon_websocket);
     }
 
     #[test]

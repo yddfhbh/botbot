@@ -22,16 +22,20 @@ use crate::runtime::run_automation;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ModePreset {
-    VsLeft1080p,
-    Solo1080p,
+    #[serde(alias = "VsLeft1080p")]
+    VsWebsocketSeed,
+    #[serde(alias = "Solo1080p")]
+    SoloBrowserCdp,
+    FileDebug,
     Custom,
 }
 
 impl ModePreset {
     fn label(self) -> &'static str {
         match self {
-            ModePreset::VsLeft1080p => "2P Left 1080p",
-            ModePreset::Solo1080p => "Solo 1080p",
+            ModePreset::SoloBrowserCdp => "Solo Browser CDP",
+            ModePreset::VsWebsocketSeed => "VS WebSocket Seed",
+            ModePreset::FileDebug => "File Debug",
             ModePreset::Custom => "Custom",
         }
     }
@@ -69,15 +73,20 @@ struct LauncherState {
 impl Default for LauncherState {
     fn default() -> Self {
         Self {
-            preset: ModePreset::VsLeft1080p,
+            preset: ModePreset::VsWebsocketSeed,
             snapshot_path: "automation/live-snapshot.json".to_owned(),
-            snapshot_provider: SnapshotProviderConfig::BrowserCdp,
-            browser: BrowserCdpConfig::default(),
+            snapshot_provider: SnapshotProviderConfig::WebsocketSeed,
+            browser: BrowserCdpConfig {
+                probe_page_state: false,
+                debugger_probe_mode: DebuggerProbeMode::Disabled,
+                use_ribbon_websocket: true,
+                ..BrowserCdpConfig::default()
+            },
             always_on_top: false,
             dry_run: true,
             poll_interval_ms: 20,
             perf_log_enabled: true,
-            input_backend: InputBackendConfig::ScanCode,
+            input_backend: InputBackendConfig::BrowserCdp,
             target_pps: 1.2,
             tap_duration_ms: 60,
             movement_tap_duration_ms: 20,
@@ -113,10 +122,9 @@ pub fn launcher_viewport(paths: &AppPaths) -> egui::ViewportBuilder {
 }
 
 impl LauncherState {
-    fn apply_tetrio_safe_preset(&mut self) {
-        self.snapshot_provider = SnapshotProviderConfig::BrowserCdp;
-        self.input_backend = InputBackendConfig::ScanCode;
+    fn apply_shared_runtime_defaults(&mut self) {
         self.target_pps = 1.2;
+        self.dry_run = true;
         self.tap_duration_ms = 60;
         self.poll_interval_ms = 20;
         self.perf_log_enabled = true;
@@ -130,8 +138,6 @@ impl LauncherState {
         self.piece_interval_ms = 60;
         self.hard_drop_interval_ms = 40;
         self.min_snapshot_age_ms = 30;
-        self.browser = BrowserCdpConfig::default();
-        self.browser.debugger_probe_mode = DebuggerProbeMode::Manual;
         self.bot.threads = BotConfig::default().threads;
         self.bot.min_nodes = BotConfig::default().min_nodes;
         self.bot.max_nodes = BotConfig::default().max_nodes;
@@ -150,8 +156,52 @@ impl LauncherState {
         self.handling.ihs_mode = BufferModeConfig::Off;
     }
 
+    fn apply_solo_browser_cdp_preset(&mut self) {
+        self.snapshot_provider = SnapshotProviderConfig::BrowserCdp;
+        self.input_backend = InputBackendConfig::BrowserCdp;
+        self.browser = BrowserCdpConfig::default();
+        self.browser.debugger_probe_mode = DebuggerProbeMode::Manual;
+        self.browser.use_ribbon_websocket = false;
+        self.browser.use_seed_simulation_fallback = false;
+        self.apply_shared_runtime_defaults();
+    }
+
+    fn apply_vs_websocket_seed_preset(&mut self) {
+        self.snapshot_provider = SnapshotProviderConfig::WebsocketSeed;
+        self.input_backend = InputBackendConfig::BrowserCdp;
+        self.browser = BrowserCdpConfig::default();
+        self.browser.probe_page_state = false;
+        self.browser.debugger_probe_mode = DebuggerProbeMode::Disabled;
+        self.browser.use_ribbon_websocket = true;
+        self.browser.ribbon_decode_mode = RibbonDecodeMode::UntilSeed;
+        self.browser.use_seed_simulation_fallback = false;
+        self.apply_shared_runtime_defaults();
+        self.bot.speculate = false;
+    }
+
+    fn apply_file_debug_preset(&mut self) {
+        self.snapshot_provider = SnapshotProviderConfig::File;
+        self.input_backend = InputBackendConfig::BrowserCdp;
+        self.browser = BrowserCdpConfig::default();
+        self.browser.probe_page_state = false;
+        self.browser.debugger_probe_mode = DebuggerProbeMode::Disabled;
+        self.browser.use_ribbon_websocket = false;
+        self.browser.use_seed_simulation_fallback = false;
+        self.apply_shared_runtime_defaults();
+        self.dry_run = true;
+    }
+
+    fn apply_active_preset(&mut self) {
+        match self.preset {
+            ModePreset::SoloBrowserCdp => self.apply_solo_browser_cdp_preset(),
+            ModePreset::VsWebsocketSeed => self.apply_vs_websocket_seed_preset(),
+            ModePreset::FileDebug => self.apply_file_debug_preset(),
+            ModePreset::Custom => {}
+        }
+    }
+
     fn apply_fast_perf_preset(&mut self) {
-        self.apply_tetrio_safe_preset();
+        self.apply_active_preset();
         self.target_pps = 1.5;
         self.poll_interval_ms = 16;
         self.browser.state_poll_ms = 16;
@@ -173,7 +223,7 @@ impl LauncherState {
             return;
         }
         self.snapshot_path = "automation/live-snapshot.json".to_owned();
-        self.apply_tetrio_safe_preset();
+        self.apply_active_preset();
     }
 
     fn migrate_legacy_defaults(&mut self) {
@@ -184,7 +234,7 @@ impl LauncherState {
             )
             && self.tap_duration_ms <= 8
         {
-            self.apply_tetrio_safe_preset();
+            self.apply_active_preset();
         }
         if self.preset != ModePreset::Custom
             && self.bot.movement_mode == MovementModeConfig::HardDropOnly
@@ -197,7 +247,7 @@ impl LauncherState {
             self.browser.debugger_probe_mode = DebuggerProbeMode::Manual;
         }
         if self.preset != ModePreset::Custom && self.matches_known_legacy_safe_preset() {
-            self.apply_tetrio_safe_preset();
+            self.apply_active_preset();
         }
     }
 
@@ -638,13 +688,18 @@ impl eframe::App for LauncherApp {
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
                             &mut self.state.preset,
-                            ModePreset::VsLeft1080p,
-                            ModePreset::VsLeft1080p.label(),
+                            ModePreset::VsWebsocketSeed,
+                            ModePreset::VsWebsocketSeed.label(),
                         );
                         ui.selectable_value(
                             &mut self.state.preset,
-                            ModePreset::Solo1080p,
-                            ModePreset::Solo1080p.label(),
+                            ModePreset::SoloBrowserCdp,
+                            ModePreset::SoloBrowserCdp.label(),
+                        );
+                        ui.selectable_value(
+                            &mut self.state.preset,
+                            ModePreset::FileDebug,
+                            ModePreset::FileDebug.label(),
                         );
                         ui.selectable_value(
                             &mut self.state.preset,
@@ -681,7 +736,7 @@ impl eframe::App for LauncherApp {
             });
             match self.state.snapshot_provider {
                 SnapshotProviderConfig::BrowserCdp => {
-                    ui.label("Browser CDP direct mode. The snapshot file is only internal transport between helper and runner.");
+                    ui.label("Browser CDP Direct is for solo/custom solo and direct-state debugging. The snapshot file is only internal transport between helper and runner.");
                     ui.horizontal(|ui| {
                         ui.label("Chrome Path");
                         ui.text_edit_singleline(&mut self.state.browser.chrome_path);
@@ -838,7 +893,7 @@ impl eframe::App for LauncherApp {
                     let snapshot_status = load_websocket_seed_status(
                         &self.paths.resolve_workspace_path(&self.state.snapshot_path),
                     );
-                    ui.label("WebSocket seed provider for VS room experiments. It captures seed/options and reconstructs only current/queue.");
+                    ui.label("WebSocket Seed is the default VS/private room path. It currently reconstructs current/queue from seed/options and does not support garbage feedback.");
                     ui.horizontal(|ui| {
                         ui.label("Chrome Path");
                         ui.text_edit_singleline(&mut self.state.browser.chrome_path);
@@ -878,6 +933,14 @@ impl eframe::App for LauncherApp {
                                 })
                                 .unwrap_or_else(|| "-".to_owned()),
                         );
+                        ui.label("Nextcount");
+                        ui.monospace(
+                            snapshot_status
+                                .as_ref()
+                                .and_then(|status| status.nextcount)
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "-".to_owned()),
+                        );
                         ui.label("PieceIndex");
                         ui.monospace(
                             snapshot_status
@@ -887,9 +950,70 @@ impl eframe::App for LauncherApp {
                                 .unwrap_or_else(|| "-".to_owned()),
                         );
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("Current");
+                        ui.monospace(
+                            snapshot_status
+                                .as_ref()
+                                .map(|status| {
+                                    if status.current.is_empty() {
+                                        "-".to_owned()
+                                    } else {
+                                        status.current.to_uppercase()
+                                    }
+                                })
+                                .unwrap_or_else(|| "-".to_owned()),
+                        );
+                        ui.label("Queue");
+                        ui.monospace(
+                            snapshot_status
+                                .as_ref()
+                                .map(|status| {
+                                    if status.queue.is_empty() {
+                                        "-".to_owned()
+                                    } else {
+                                        status
+                                            .queue
+                                            .iter()
+                                            .map(|piece| piece.to_uppercase())
+                                            .collect::<Vec<_>>()
+                                            .join(",")
+                                    }
+                                })
+                                .unwrap_or_else(|| "-".to_owned()),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Local board hash");
+                        ui.monospace(
+                            snapshot_status
+                                .as_ref()
+                                .map(|status| {
+                                    if status.local_board_hash.is_empty() {
+                                        "-".to_owned()
+                                    } else {
+                                        status.local_board_hash.clone()
+                                    }
+                                })
+                                .unwrap_or_else(|| "-".to_owned()),
+                        );
+                        ui.label("Garbage support");
+                        ui.monospace(
+                            snapshot_status
+                                .as_ref()
+                                .map(|status| {
+                                    if status.garbage_support.is_empty() {
+                                        "unsupported".to_owned()
+                                    } else {
+                                        status.garbage_support.clone()
+                                    }
+                                })
+                                .unwrap_or_else(|| "unsupported".to_owned()),
+                        );
+                    });
                 }
                 SnapshotProviderConfig::File => {
-                    ui.label("File provider reads the snapshot path as-is and does not launch a browser helper.");
+                    ui.label("File Debug reads the snapshot path as-is for fixture/replay/debug work and does not launch a browser helper.");
                 }
             }
             ui.horizontal(|ui| {
@@ -916,9 +1040,9 @@ impl eframe::App for LauncherApp {
                     .selected_text(input_backend_label(self.state.input_backend))
                     .show_ui(ui, |ui| {
                         for backend in [
+                            InputBackendConfig::BrowserCdp,
                             InputBackendConfig::ScanCode,
                             InputBackendConfig::VirtualKey,
-                            InputBackendConfig::BrowserCdp,
                         ] {
                             ui.selectable_value(
                                 &mut self.state.input_backend,
@@ -929,8 +1053,8 @@ impl eframe::App for LauncherApp {
                     });
             });
             ui.horizontal(|ui| {
-                if ui.button("Stable").clicked() {
-                    self.state.apply_tetrio_safe_preset();
+                if ui.button("Reset Preset").clicked() {
+                    self.state.apply_preset();
                 }
                 if ui.button("Fast but risky").clicked() {
                     self.state.apply_fast_perf_preset();
@@ -1089,8 +1213,18 @@ struct WebsocketSeedSnapshotStatus {
     seed_captured: bool,
     #[serde(default)]
     bagtype: String,
+    #[serde(default)]
+    nextcount: Option<u32>,
     #[serde(default, rename = "pieceIndex")]
     piece_index: Option<u32>,
+    #[serde(default)]
+    current: String,
+    #[serde(default)]
+    queue: Vec<String>,
+    #[serde(default, rename = "localBoardHash")]
+    local_board_hash: String,
+    #[serde(default, rename = "garbageSupport")]
+    garbage_support: String,
 }
 
 fn load_websocket_seed_status(
@@ -1186,8 +1320,8 @@ fn input_focus_mode_label(mode: InputFocusMode) -> &'static str {
 
 fn input_backend_label(backend: InputBackendConfig) -> &'static str {
     match backend {
-        InputBackendConfig::ScanCode => "Scan Code",
-        InputBackendConfig::VirtualKey => "Virtual Key",
+        InputBackendConfig::ScanCode => "Scan Code Fallback",
+        InputBackendConfig::VirtualKey => "Virtual Key Fallback",
         InputBackendConfig::BrowserCdp => "Browser CDP",
     }
 }
@@ -1197,13 +1331,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn built_in_preset_uses_safe_defaults() {
+    fn default_launcher_state_prefers_vs_websocket_seed() {
+        let state = LauncherState::default();
+
+        assert_eq!(state.preset, ModePreset::VsWebsocketSeed);
+        assert_eq!(
+            state.snapshot_provider,
+            SnapshotProviderConfig::WebsocketSeed
+        );
+        assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
+        assert!(state.browser.use_ribbon_websocket);
+    }
+
+    #[test]
+    fn solo_browser_cdp_preset_uses_browser_cdp_input() {
         let mut state = LauncherState::default();
-        state.preset = ModePreset::Solo1080p;
+        state.preset = ModePreset::SoloBrowserCdp;
         state.apply_preset();
 
         assert_eq!(state.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
-        assert_eq!(state.input_backend, InputBackendConfig::ScanCode);
+        assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
+        assert!(state.browser.probe_page_state);
+        assert_eq!(state.browser.debugger_probe_mode, DebuggerProbeMode::Manual);
+        assert!(!state.browser.use_ribbon_websocket);
+        assert!(!state.browser.use_seed_simulation_fallback);
+    }
+
+    #[test]
+    fn vs_websocket_seed_preset_uses_browser_cdp_input() {
+        let mut state = LauncherState::default();
+        state.preset = ModePreset::VsWebsocketSeed;
+        state.apply_preset();
+
+        assert_eq!(
+            state.snapshot_provider,
+            SnapshotProviderConfig::WebsocketSeed
+        );
+        assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
+        assert!(!state.browser.probe_page_state);
+        assert_eq!(
+            state.browser.debugger_probe_mode,
+            DebuggerProbeMode::Disabled
+        );
+        assert!(state.browser.use_ribbon_websocket);
+        assert_eq!(
+            state.browser.ribbon_decode_mode,
+            RibbonDecodeMode::UntilSeed
+        );
+        assert!(!state.browser.use_seed_simulation_fallback);
+        assert!(!state.bot.speculate);
+    }
+
+    #[test]
+    fn file_debug_preset_uses_file_provider() {
+        let mut state = LauncherState::default();
+        state.preset = ModePreset::FileDebug;
+        state.apply_preset();
+
+        assert_eq!(state.snapshot_provider, SnapshotProviderConfig::File);
+        assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
+        assert!(state.dry_run);
+    }
+
+    #[test]
+    fn legacy_mode_names_deserialize_into_new_presets() {
+        let solo: LauncherState = serde_json::from_str(r#"{"preset":"Solo1080p"}"#).unwrap();
+        let vs: LauncherState = serde_json::from_str(r#"{"preset":"VsLeft1080p"}"#).unwrap();
+
+        assert_eq!(solo.preset, ModePreset::SoloBrowserCdp);
+        assert_eq!(vs.preset, ModePreset::VsWebsocketSeed);
+    }
+
+    #[test]
+    fn runtime_defaults_stay_synced_across_presets() {
+        let mut state = LauncherState::default();
+        state.preset = ModePreset::SoloBrowserCdp;
+        state.apply_preset();
+
         assert_eq!(state.bot.movement_mode, MovementModeConfig::ZeroGSafe);
         assert_eq!(state.bot.spawn_rule, SpawnRuleConfig::Row19Or20);
         assert_eq!(state.target_pps, 1.2);
@@ -1222,22 +1426,8 @@ mod tests {
         assert_eq!(state.bot.threads, 1);
         assert_eq!(state.bot.min_nodes, 0);
         assert_eq!(state.bot.max_nodes, 100_000);
-        assert_eq!(state.browser.debugger_probe_mode, DebuggerProbeMode::Manual);
         assert_eq!(state.browser.state_poll_ms, 40);
-        assert_eq!(
-            state.browser.ribbon_decode_mode,
-            RibbonDecodeMode::UntilSeed
-        );
-        assert_eq!(state.browser.input_focus_mode, InputFocusMode::PerPlan);
         assert!(state.perf_log_enabled);
-        assert_eq!(state.browser.player_selector, PlayerSelectorConfig::Auto);
-        assert!(state.browser.player_nickname.is_empty());
-        assert!(state.browser.player_user_id.is_empty());
-        assert!(state.browser.dump_state_on_fail);
-        assert_eq!(
-            state.browser.dump_state_path,
-            "automation/debug/tetrio-state-dump.json"
-        );
         assert!(state.handling.allow_post_softdrop_actions);
         assert!(!state.handling.allow_post_softdrop_horizontal);
         assert!(!state.handling.release_after_each_action);
@@ -1249,22 +1439,19 @@ mod tests {
     #[test]
     fn readme_matches_safe_preset_defaults() {
         let readme = include_str!("../README.md");
-        assert!(readme.contains("Stable Preset"));
-        assert!(readme.contains("ZeroG Safe"));
-        assert!(readme.contains("Hard Drop Only"));
-        assert!(readme.contains("ZeroG Complete"));
-        assert!(readme.contains("Fast but risky"));
-        assert!(readme.contains("Debugger probe mode"));
-        assert!(readme.contains("Advanced/Experimental"));
-        assert!(readme.contains("VS Room"));
-        assert!(readme.contains("\"player_selector\": \"auto\""));
+        assert!(readme.contains("VS WebSocket Seed"));
+        assert!(readme.contains("Legacy Screen Scanner"));
         assert!(readme.contains("WebSocket Seed"));
+        assert!(readme.contains("Do not work on scanner unless explicitly requested."));
+        assert!(!readme.contains("2P Left 1080p"));
+        assert!(!readme.contains("falling all the way back to the screen scanner"));
+        assert_eq!(readme.matches("screen scanner").count(), 1);
     }
 
     #[test]
     fn migrate_legacy_defaults_upgrades_previous_safe_profile() {
         let mut state = LauncherState {
-            preset: ModePreset::Solo1080p,
+            preset: ModePreset::SoloBrowserCdp,
             dry_run: false,
             poll_interval_ms: 4,
             target_pps: 0.0,
@@ -1301,7 +1488,7 @@ mod tests {
         assert_eq!(state.bot.threads, 1);
         assert_eq!(state.bot.min_nodes, 0);
         assert_eq!(state.bot.max_nodes, 100_000);
-        assert_eq!(state.input_backend, InputBackendConfig::ScanCode);
+        assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
         assert_eq!(state.handling.action_settle_ms, 0);
         assert!(!state.handling.release_after_each_action);
     }

@@ -1,21 +1,41 @@
 # Automation Bridge
 
-This crate turns the Cold Clear planner into a Browser CDP snapshot driven TETR.IO automation runner.
+This crate runs Cold Clear against TETR.IO snapshots inside `automation/live-snapshot.json`.
 
-- Browser CDP snapshot mode is the recommended way to read TETR.IO state.
-- `WebSocket Seed` is an experimental VS room snapshot provider that only reconstructs `current` / `queue`.
-- Screen scanner support has been removed from the launcher and runtime flow.
-- `Scan Code` is the default input backend on Windows because it avoids Browser CDP input stalls while keeping CDP state reads.
-- `Browser CDP` input remains available when foreground `SendInput` is unreliable.
+- `WebSocket Seed` is the default VS/private room direction.
+- `Browser CDP Direct` is for solo/custom solo and direct-state debugging.
+- `File` is for fixture/replay/debug workflows.
+- There is no automatic fallback from `Browser CDP Direct` or `WebSocket Seed` into any image-based legacy path.
 - Use only in private/solo/custom practice, not public matchmaking.
 
-## What It Does
+## Provider Policy
 
-- reads TETR.IO state from a Chromium tab through CDP
-- writes the live state into `automation/live-snapshot.json` as internal transport
-- rebuilds a `libtetris::Board` from that snapshot
-- asks Cold Clear for a move
-- uses a stability-first preset by default
+### VS WebSocket Seed
+
+Use this for private/custom `1v1` rooms.
+
+- reads game options from the TETR.IO websocket
+- reconstructs current and queue from the captured `7-bag` seed
+- keeps `incoming = 0`
+- `garbage support = unsupported`
+- does not depend on screen scanning
+
+This is the recommended default for VS work in this repo.
+
+### Solo Browser CDP
+
+Use this for solo/custom solo and Browser CDP debugging.
+
+- reads direct page state through CDP
+- can use manual debugger capture when the game object is not exposed yet
+- stays separate from the VS seed path
+
+### File Debug
+
+Use this for fixture/replay/debug work.
+
+- reads the snapshot file as-is
+- does not launch a browser helper
 
 ## Runner
 
@@ -23,15 +43,25 @@ This crate turns the Cold Clear planner into a Browser CDP snapshot driven TETR.
 cargo run -p automation -- automation/config.example.json
 ```
 
-```powershell
-cargo run -p automation -- --input-backend scan_code --cdp-port 9222 --url https://tetr.io/ --target TETR.IO
-```
+VS/private room example:
 
 ```powershell
-cargo run -p automation -- --snapshot-provider websocket_seed --input-backend scan_code --cdp-port 9222 --url https://tetr.io/ --target TETR.IO
+cargo run -p automation -- --snapshot-provider websocket_seed --input-backend browser_cdp --cdp-port 9222 --url https://tetr.io/ --target TETR.IO
 ```
 
-`dry_run: true` leaves the keyboard untouched and only prints planned actions.
+Solo/debug example:
+
+```powershell
+cargo run -p automation -- --snapshot-provider browser_cdp --input-backend browser_cdp --cdp-port 9222 --url https://tetr.io/ --target TETR.IO
+```
+
+File debug example:
+
+```powershell
+cargo run -p automation -- --snapshot-provider file
+```
+
+`dry_run: true` leaves input untouched and only logs planned actions.
 
 ## Launcher
 
@@ -39,94 +69,47 @@ cargo run -p automation -- --snapshot-provider websocket_seed --input-backend sc
 cargo run -p automation
 ```
 
-Running without arguments opens the launcher.
+The launcher exposes four modes:
 
-- choose `2P Left 1080p`, `Solo 1080p`, or `Custom`
-- choose `Browser CDP Direct`, `WebSocket Seed`, or `File`
-- choose `Scan Code`, `Virtual Key`, or `Browser CDP` for input
-- set snapshot path, Chrome path, CDP port, URL, and target hint
-- choose `Player` selector plus optional nickname / user id when using VS rooms
-- tune `Browser state poll ms`, `Debugger probe mode`, `Ribbon decode mode`, `Input focus mode`, planner limits, and `Perf log`
-- use `Stable`, `Fast but risky`, or `Benchmark`
-- `Capture game object` manually triggers the debugger probe once
+- `VS WebSocket Seed`
+- `Solo Browser CDP`
+- `File Debug`
+- `Custom`
 
-## Stable Preset
+Recommended usage:
 
-The default preset now favors stability over raw throughput.
+1. Pick `VS WebSocket Seed` for private/custom `1v1` rooms.
+2. Pick `Solo Browser CDP` for solo/custom solo.
+3. Leave `Scan Code` and `Virtual Key` as fallback input backends only when `Browser CDP` input is not usable.
 
-- `Snapshot provider`: `Browser CDP Direct`
-- `Input backend`: `Scan Code`
-- `Movement`: `ZeroG Safe`
-- `Spawn`: `Row 19 or 20`
-- `Target PPS`: `1.2`
-- `Runner poll`: `20ms`
-- `Browser state poll`: `40ms`
-- `Browser min state poll`: `16ms`
-- `Min Snapshot Age`: `30ms`
-- `Planner threads`: `1`
-- `Planner min nodes`: `0`
-- `Planner max nodes`: `100000`
-- `Debugger probe mode`: `manual`
-- `Ribbon decode mode`: `until_seed`
-- `Use ribbon websocket`: `Off`
-- `Use seed simulation fallback`: `Off`
-- `Input focus mode`: `per_plan`
-- `Move Delay`: `20ms`
-- `Rotate Delay`: `30ms`
-- `HardDrop Delay`: `40ms`
-- `Piece Delay`: `60ms`
-- `ZeroG Complete` remains available as `Advanced/Experimental`
-- `Hard Drop Only` remains available as an emergency fallback
+When `WebSocket Seed` is selected, the launcher shows:
 
-## Fast But Risky
+- `Seed captured`
+- `bagtype`
+- `nextcount`
+- `pieceIndex`
+- `current`
+- `queue`
+- `local board hash`
+- `garbage support`
 
-- `Runner poll`: `16ms`
-- `Browser state poll`: `16ms`
-- `Planner threads`: `2`
-- `Planner max nodes`: `200000`
+These values come from `automation/live-snapshot.json`.
 
-## Benchmark
+## Failure Policy
 
-- `Runner poll`: `2ms`
-- `Planner threads`: `4`
-- `Planner max nodes`: `400000`
+- `Browser CDP Direct` failure returns `ok:false` with a reason and optional dump.
+- `WebSocket Seed` failure returns `ok:false` with a reason and websocket helper logs.
+- Neither provider automatically starts any legacy image-based fallback.
+- `File` mode is the only path that consumes an externally written snapshot directly.
 
-`Poll 2ms` is for debug / benchmark use only and should not be your default.
+## Browser CDP Notes
 
-## Speed Notes
+- `Debugger probe mode=manual` or `disabled` is preferred.
+- `Browser CDP Direct` is a solo/debug path, not the default VS path.
+- If direct-state capture fails in VS, switch to `WebSocket Seed`; do not work around it by reviving scanner fallbacks.
 
-- If the TETR.IO screen freezes every 2 seconds, check whether the debugger probe is repeating.
-- Do not leave debugger breakpoint probing enabled during live play.
-- Browser CDP `Runtime.evaluate` usually only needs to run every `30-60ms`.
-- `Poll 2ms` is for debug / benchmark use only, not a recommended default.
-- When performance is bad, start testing from `threads=1` and `max_nodes=100000`.
-- If `cdp_eval_ms` spikes and `input_ms` jumps together, keep the snapshot provider on `Browser CDP Direct` and switch only the input backend to `Scan Code` first.
+## Legacy Screen Scanner
 
-## Browser CDP Mode
+The screen scanner is legacy/debug only. It is not a recommended preset, not a VS default path, and not an automatic fallback.
 
-- `Probe page state`: reads the live board/current/hold/queue directly from the page when possible
-- `Debugger probe mode=manual`: recommended default; only the launcher button or one-off CLI probe can run the heavy `Debugger` capture
-- `Debugger probe mode=disabled`: never uses the debugger probe
-- `Ribbon decode mode=until_seed`: decode only received ribbon frames until the seed is found
-
-The runtime will not input while `playing=false` or `countdown=true`, and it skips duplicate tokens.
-
-## VS Room
-
-Browser CDP VS room settings:
-
-```json
-{
-  "browser": {
-    "player_selector": "auto",
-    "player_nickname": "hebi_",
-    "player_user_id": "",
-    "dump_state_on_fail": true,
-    "dump_state_path": "automation/debug/tetrio-state-dump.json"
-  }
-}
-```
-
-- `player_selector=auto` first prefers `isLocal`/`local` style flags, then user id, then nickname, then the first alive candidate with a current piece
-- `player_selector=left` or `right` forces index `0` or `1` among valid player candidates
-- `player_selector=nickname` and `user_id` only select exact matches
+Do not work on scanner unless explicitly requested.
