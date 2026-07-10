@@ -91,7 +91,7 @@ The built-in live presets now apply a `TETR.IO Safe preset` aimed at personal so
 - `Prevent accidental hard drops`: `On`
 - `Speculate`: `Off`
 - `SoftDrop route`: disabled when `soft_drop_mode = infinite`
-- `Allow spin routes after soft drop`: `Off`
+- `Allow spin routes after soft drop`: `On`
 
 If you need to temporarily simplify execution for debugging, switch `Movement` to `Hard Drop Only`.
 
@@ -138,7 +138,7 @@ Try these first:
 - `Prevent accidental hard drops`: `On`
 - `Input backend`: keep `Browser CDP` first and only fall back to `Scan Code (SendInput)` or `Virtual Key (SendInput)` if needed
 - `SoftDrop route`: keep it disabled for Infinite SDF clients like TETR.IO
-- `Allow spin routes`: keep it `Off` for the default safe mode; turn it `On` only when you want T-spin / kick testing
+- `Allow spin routes`: `On` by default so T-spin / kick routes can execute
 
 The runner now also forces `release_all_keys()` before a plan, after hold, before hard drop, after hard
 drop, and again when the launcher stops. `ZeroG Safe` stays the recommended default because it can still

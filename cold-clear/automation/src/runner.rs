@@ -1175,8 +1175,9 @@ mod tests {
     }
 
     #[test]
-    fn post_softdrop_actions_stay_blocked_in_safe_mode() {
+    fn post_softdrop_actions_can_still_be_disabled_explicitly() {
         let handling = HandlingConfig {
+            allow_post_softdrop_actions: false,
             soft_drop_mode: SoftDropModeConfig::Step,
             ..HandlingConfig::default()
         };

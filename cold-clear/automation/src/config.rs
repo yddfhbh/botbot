@@ -162,7 +162,7 @@ impl Default for HandlingConfig {
             das_ms: 97,
             dcd_ms: 0,
             soft_drop_mode: SoftDropModeConfig::Infinite,
-            allow_post_softdrop_actions: false,
+            allow_post_softdrop_actions: true,
             soft_drop_factor: 1,
             prevent_accidental_hard_drops: true,
             cancel_das_on_direction_change: true,
