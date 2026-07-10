@@ -258,6 +258,10 @@ function writeJsonAtomic(outputPath, payload) {
   }
 }
 
+export function writeDebugDump(outputPath, payload) {
+  writeJsonAtomic(outputPath, payload);
+}
+
 function getPlayerNickname(player) {
   return (
     getFirstValue(

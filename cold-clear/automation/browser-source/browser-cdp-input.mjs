@@ -266,7 +266,7 @@ function parseArgs(argv) {
     if (!arg.startsWith("--")) continue;
     const key = arg.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
     const next = argv[i + 1];
-    if (!next || next.startsWith("--")) {
+    if (next === undefined || next.startsWith("--")) {
       parsed[key] = "1";
       continue;
     }
