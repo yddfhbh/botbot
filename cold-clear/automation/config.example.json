@@ -25,7 +25,7 @@
     "target_hint": "TETR.IO",
     "connect_only": false,
     "probe_page_state": true,
-    "debugger_probe_mode": "startup_only",
+    "debugger_probe_mode": "manual",
     "state_poll_ms": 40,
     "min_state_poll_ms": 16,
     "use_ribbon_websocket": false,

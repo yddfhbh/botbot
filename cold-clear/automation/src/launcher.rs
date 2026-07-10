@@ -131,6 +131,7 @@ impl LauncherState {
         self.hard_drop_interval_ms = 40;
         self.min_snapshot_age_ms = 30;
         self.browser = BrowserCdpConfig::default();
+        self.browser.debugger_probe_mode = DebuggerProbeMode::Manual;
         self.bot.threads = BotConfig::default().threads;
         self.bot.min_nodes = BotConfig::default().min_nodes;
         self.bot.max_nodes = BotConfig::default().max_nodes;
@@ -189,6 +190,11 @@ impl LauncherState {
             && self.bot.movement_mode == MovementModeConfig::HardDropOnly
         {
             self.bot.movement_mode = MovementModeConfig::ZeroGSafe;
+        }
+        if self.preset != ModePreset::Custom
+            && self.browser.debugger_probe_mode == DebuggerProbeMode::StartupOnly
+        {
+            self.browser.debugger_probe_mode = DebuggerProbeMode::Manual;
         }
         if self.preset != ModePreset::Custom && self.matches_known_legacy_safe_preset() {
             self.apply_tetrio_safe_preset();
@@ -1171,10 +1177,7 @@ mod tests {
         assert_eq!(state.bot.threads, 1);
         assert_eq!(state.bot.min_nodes, 0);
         assert_eq!(state.bot.max_nodes, 100_000);
-        assert_eq!(
-            state.browser.debugger_probe_mode,
-            DebuggerProbeMode::StartupOnly
-        );
+        assert_eq!(state.browser.debugger_probe_mode, DebuggerProbeMode::Manual);
         assert_eq!(state.browser.state_poll_ms, 40);
         assert_eq!(
             state.browser.ribbon_decode_mode,

@@ -101,7 +101,7 @@ impl Default for BrowserCdpConfig {
             target_hint: "TETR.IO".to_owned(),
             connect_only: false,
             probe_page_state: true,
-            debugger_probe_mode: DebuggerProbeMode::StartupOnly,
+            debugger_probe_mode: DebuggerProbeMode::Manual,
             state_poll_ms: 40,
             min_state_poll_ms: 16,
             use_ribbon_websocket: false,
@@ -315,7 +315,7 @@ mod tests {
     fn browser_cdp_config_defaults_include_vs_selector_and_dump_settings() {
         let config = BrowserCdpConfig::default();
 
-        assert_eq!(config.debugger_probe_mode, DebuggerProbeMode::StartupOnly);
+        assert_eq!(config.debugger_probe_mode, DebuggerProbeMode::Manual);
         assert_eq!(config.state_poll_ms, 40);
         assert_eq!(config.min_state_poll_ms, 16);
         assert_eq!(config.ribbon_decode_mode, RibbonDecodeMode::UntilSeed);

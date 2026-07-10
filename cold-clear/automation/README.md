@@ -66,7 +66,7 @@ The default preset now favors stability over raw throughput.
 - `Planner threads`: `1`
 - `Planner min nodes`: `0`
 - `Planner max nodes`: `100000`
-- `Debugger probe mode`: `startup_only`
+- `Debugger probe mode`: `manual`
 - `Ribbon decode mode`: `until_seed`
 - `Use ribbon websocket`: `Off`
 - `Use seed simulation fallback`: `Off`
@@ -105,8 +105,7 @@ The default preset now favors stability over raw throughput.
 ## Browser CDP Mode
 
 - `Probe page state`: reads the live board/current/hold/queue directly from the page when possible
-- `Debugger probe mode=startup_only`: allows the heavy `Debugger` probe only until the game object is first captured
-- `Debugger probe mode=manual`: only the launcher button or one-off CLI probe can run it
+- `Debugger probe mode=manual`: recommended default; only the launcher button or one-off CLI probe can run the heavy `Debugger` capture
 - `Debugger probe mode=disabled`: never uses the debugger probe
 - `Ribbon decode mode=until_seed`: decode only received ribbon frames until the seed is found
 
