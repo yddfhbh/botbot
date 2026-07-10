@@ -40,6 +40,7 @@ Running without arguments opens the launcher. The launcher is now Browser CDP on
 
 - choose `2P Left 1080p`, `Solo 1080p`, or `Custom`
 - set Chrome path, CDP port, URL, and target hint
+- choose `Player` selector plus optional nickname / user id when using VS rooms
 - toggle page probing, ribbon websocket capture, and seed simulation fallback
 - tune dry-run, target PPS, tap timings, and planner limits
 - `Target PPS` changes apply immediately while a session is running
@@ -98,3 +99,30 @@ Browser CDP mode attaches to Chromium launched with `--remote-debugging-port=922
 - `Use seed simulation fallback`: reconstructs queue state when direct page data is incomplete
 
 The runtime will not input while `playing=false` or `countdown=true`, and it skips duplicate `pieceCounter` values.
+
+## VS Room
+
+Browser CDP VS room settings:
+
+```json
+{
+  "browser": {
+    "player_selector": "auto",
+    "player_nickname": "hebi_",
+    "player_user_id": "",
+    "dump_state_on_fail": true,
+    "dump_state_path": "automation/debug/tetrio-state-dump.json"
+  }
+}
+```
+
+- `player_selector=auto` first prefers `isLocal`/`local` style flags, then user id, then nickname, then the first alive candidate with a current piece
+- `player_selector=left` or `right` forces index `0` or `1` among valid player candidates
+- `player_selector=nickname` and `user_id` only select exact matches
+
+If VS room state detection fails, check these in order:
+
+1. `automation/live-snapshot.json` for `ok`, `current`, `queue`, and `token`
+2. `automation/debug/tetrio-state-dump.json` for the saved state shape summary
+3. launcher or terminal logs for `[browser] candidates`, `selectedPath`, and `reject reason`
+4. input helper logs for `[input:cdp] focus ...` and dispatch lines

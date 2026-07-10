@@ -3,6 +3,8 @@ import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync 
 import os from "node:os";
 import path from "node:path";
 
+import { resolveGameStateSnapshot } from "./tetrio-state.mjs";
+
 const DEFAULT_URL = "https://tetr.io/";
 const DEFAULT_PORT = 9222;
 const DEFAULT_NEXT_COUNT = 6;
@@ -16,11 +18,15 @@ async function main() {
   const targetHint = args.target ?? "TETR.IO";
   const pollMs = numberArg(args.pollMs, 40);
   const connectOnly = args.connectOnly === "1";
-  const probePageState = args.probePageState !== "0";
-  const useRibbonWebsocket = args.useRibbonWebsocket !== "0";
-  const useSeedSimulationFallback = args.useSeedSimulationFallback !== "0";
   const chromePath = process.env.CHROME_PATH || "";
   const msgpack = await loadOptionalMsgpack();
+  const selector = {
+    playerSelector: args.playerSelector ?? "auto",
+    playerNickname: args.playerNickname ?? "",
+    playerUserId: args.playerUserId ?? "",
+    dumpStateOnFail: args.dumpStateOnFail !== "0",
+    dumpStatePath: args.dumpStatePath ?? "automation/debug/tetrio-state-dump.json"
+  };
 
   let browserProcess = null;
   if (!connectOnly) {
@@ -35,16 +41,23 @@ async function main() {
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
   await cdp.send("Page.enable").catch(() => undefined);
   await cdp.send("Runtime.enable").catch(() => undefined);
-  await cdp.send("Page.bringToFront");
+  await cdp.send("Page.bringToFront").catch(() => undefined);
   await installBackgroundInputKeepalive(cdp);
-  await safeRuntimeEvaluate(cdp, {
-    expression: "window.focus(); document.body && document.body.focus && document.body.focus(); true"
-  }).catch(() => undefined);
+  await safeRuntimeEvaluate(
+    cdp,
+    {
+      expression: "window.focus(); document.body && document.body.focus && document.body.focus(); true"
+    },
+    null
+  ).catch(() => undefined);
 
   console.log(`[browser] connected to ${target.title || target.url} on port ${port}`);
+  console.log(
+    `[browser] selector=${selector.playerSelector} nickname=${selector.playerNickname || "-"} userId=${selector.playerUserId || "-"}`
+  );
 
   const network = createTetrioNetworkState();
-  if (useRibbonWebsocket) {
+  if (msgpack && args.useRibbonWebsocket !== "0") {
     await installRibbonMonitor(cdp, network, msgpack);
   }
 
@@ -54,6 +67,8 @@ async function main() {
   let stableCount = 0;
   let lastWrittenSignature = "";
   let lastLoggedToken = "";
+  let lastSelectedPath = "";
+  let lastSelectionReason = "";
   const probeState = {
     lastCaptureAt: 0
   };
@@ -67,8 +82,11 @@ async function main() {
 
   while (true) {
     const state = await readTetrioState(cdp, {
-      probePageState,
-      useSeedSimulationFallback,
+      selector,
+      targetTitle: target.title ?? "",
+      targetUrl: target.url ?? "",
+      probePageState: args.probePageState !== "0",
+      useSeedSimulationFallback: args.useSeedSimulationFallback !== "0",
       network,
       probeState
     });
@@ -78,7 +96,9 @@ async function main() {
         state.reason ??
         (!state.playing ? "page is not playing" : state.countdown ? "countdown active" : "state not ready");
       if (reason !== lastReason || Date.now() - lastReasonAt >= DEFAULT_STATUS_MS) {
-        console.log(`[browser] ${reason}`);
+        for (const line of state.logs ?? []) {
+          console.log(line);
+        }
         lastReason = reason;
         lastReasonAt = Date.now();
       }
@@ -89,15 +109,13 @@ async function main() {
     lastReason = "";
     lastReasonAt = 0;
 
-    const queueText = state.queue.join(",");
-    const signature = `${state.pieceCounter}|${state.current}|${state.hold ?? "-"}|${queueText}|${state.activeX ?? "-"}|${state.activeY ?? "-"}|${state.activeRotation ?? "-"}`;
+    const signature = `${state.token}|${state.playing}|${state.countdown}`;
     if (signature === stableSignature) {
       stableCount += 1;
     } else {
       stableSignature = signature;
       stableCount = 1;
     }
-
     if (stableCount < 2) {
       await sleep(pollMs);
       continue;
@@ -113,8 +131,8 @@ async function main() {
       b2b: Boolean(state.b2b),
       combo: state.combo,
       incoming: state.incoming,
-      pieceCounter: state.pieceCounter,
-      token: `browser-${state.pieceCounter}`,
+      pieceCounter: Number.isFinite(state.pieceCounter) ? state.pieceCounter : undefined,
+      token: state.token,
       playing: state.playing,
       countdown: state.countdown,
       activeX: Number.isFinite(state.activeX) ? state.activeX : undefined,
@@ -125,11 +143,15 @@ async function main() {
     if (signature !== lastWrittenSignature) {
       writeSnapshot(snapshotPath, snapshot);
       lastWrittenSignature = signature;
-      if (snapshot.token !== lastLoggedToken) {
+      const selectionChanged =
+        state.selectedPath !== lastSelectedPath || state.selectionReason !== lastSelectionReason;
+      if (snapshot.token !== lastLoggedToken || selectionChanged) {
         lastLoggedToken = snapshot.token;
-        console.log(
-          `[browser] page state ready pieceCounter=${state.pieceCounter} current=${snapshot.current} hold=${snapshot.hold ?? "-"} queue=${snapshot.queue.join(",")}`
-        );
+        lastSelectedPath = state.selectedPath;
+        lastSelectionReason = state.selectionReason;
+        for (const line of state.logs ?? []) {
+          console.log(line);
+        }
       }
     }
 
@@ -139,7 +161,7 @@ async function main() {
 
 function parseArgs(argv) {
   const parsed = {};
-  for (let i = 0; i < argv.length; i++) {
+  for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (!arg.startsWith("--")) continue;
     const key = arg.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
@@ -149,7 +171,7 @@ function parseArgs(argv) {
       continue;
     }
     parsed[key] = next;
-    i++;
+    i += 1;
   }
   return parsed;
 }
@@ -425,7 +447,7 @@ async function installRibbonMonitor(cdp, network, msgpack) {
 
 function inspectRibbonPayload(payload, network, unpack) {
   const candidates = [];
-  for (let offset = 0; offset <= Math.min(24, payload.length - 1); offset++) {
+  for (let offset = 0; offset <= Math.min(24, payload.length - 1); offset += 1) {
     try {
       candidates.push(unpack(payload.subarray(offset)));
     } catch {}
@@ -494,29 +516,41 @@ function finiteNumber(value) {
 }
 
 async function readTetrioState(cdp, options) {
-  const read = async () => {
-    const raw = await safeRuntimeEvaluate(cdp, {
-      expression: tetrioStateExpression(),
-      returnByValue: true,
-      awaitPromise: true
-    }, {
-      result: {
-        value: {
-          ok: false,
-          ready: false,
-          reason: "browser execution context not ready yet"
+  const readRawState = async () => {
+    const raw = await safeRuntimeEvaluate(
+      cdp,
+      {
+        expression: captureTetrioExportExpression(),
+        returnByValue: true,
+        awaitPromise: true
+      },
+      {
+        result: {
+          value: {
+            ok: false,
+            reason: "browser execution context not ready yet"
+          }
         }
       }
-    });
-    return raw.result?.value ?? { ok: false, ready: false, reason: "page probe returned empty" };
+    );
+    return raw?.result?.value ?? { ok: false, reason: "page probe returned empty" };
   };
 
-  let state = await read();
+  let rawState = await readRawState();
+  const snapshotFromRaw = (value) =>
+    resolveGameStateSnapshot({
+      exported: value?.exported ?? null,
+      boardState: value?.boardState ?? null,
+      pageHints: value?.pageHints ?? {},
+      selector: options.selector,
+      href: value?.href ?? "",
+      targetTitle: options.targetTitle,
+      targetUrl: options.targetUrl
+    });
+
+  let state = rawState.ok ? snapshotFromRaw(rawState) : { ok: false, ready: false, reason: rawState.reason, logs: [`[browser] reject reason=${rawState.reason}`] };
   const shouldRecaptureGame =
-    !state.ok ||
-    !state.ready ||
-    !state.playing ||
-    state.countdown;
+    !state.ok || !state.ready || !state.playing || state.countdown;
   const shouldCapture =
     options.probePageState &&
     shouldRecaptureGame &&
@@ -534,11 +568,15 @@ async function readTetrioState(cdp, options) {
     }));
     if (capture.ok) {
       console.log(`[browser] page probe exposed game object via ${capture.source}`);
-      state = await read();
+      rawState = await readRawState();
+      state = rawState.ok
+        ? snapshotFromRaw(rawState)
+        : { ok: false, ready: false, reason: rawState.reason, logs: [`[browser] reject reason=${rawState.reason}`] };
     } else if (state.reason) {
       state = {
         ...state,
-        reason: `${state.reason}; page probe: ${capture.reason}`
+        reason: `${state.reason}; page probe: ${capture.reason}`,
+        logs: [...(state.logs ?? []), `[browser] reject reason=${capture.reason}`]
       };
     }
   }
@@ -552,6 +590,62 @@ async function readTetrioState(cdp, options) {
   return buildSeedFallbackState(options.network);
 }
 
+function captureTetrioExportExpression() {
+  return `(() => {
+    const looksLikeGame = (value) =>
+      value &&
+      typeof value === "object" &&
+      typeof value.ejectState === "function" &&
+      typeof value.ejectBoardState === "function";
+    const scanObject = (root, limit = 200) => {
+      if (!root || typeof root !== "object") return null;
+      let names = [];
+      try { names = Object.getOwnPropertyNames(root).slice(0, limit); } catch {}
+      for (const name of names) {
+        try {
+          const value = root[name];
+          if (looksLikeGame(value)) return value;
+        } catch {}
+      }
+      return null;
+    };
+    const findGame = () => {
+      const direct = [window.__fusionTetrioGame, window.tetrioGame, window.TETRIO_GAME, window.game, window.app, window.tetrio];
+      for (const candidate of direct) {
+        if (looksLikeGame(candidate)) return candidate;
+        const nested = scanObject(candidate);
+        if (nested) return nested;
+      }
+      const names = Object.getOwnPropertyNames(window).slice(0, 1500);
+      for (const name of names) {
+        try {
+          const value = window[name];
+          if (looksLikeGame(value)) return value;
+        } catch {}
+      }
+      return null;
+    };
+
+    const game = findGame();
+    if (!game) {
+      return { ok: false, reason: "TETR.IO game instance not captured yet" };
+    }
+    window.__fusionTetrioGame = game;
+    const exported = typeof game.ejectState === "function" ? game.ejectState() : null;
+    const boardState = typeof game.ejectBoardState === "function" ? game.ejectBoardState() : null;
+    return {
+      ok: true,
+      href: location.href,
+      exported,
+      boardState,
+      pageHints: {
+        gameIsPlaying: typeof game.isPlaying === "function" ? Boolean(game.isPlaying()) : null,
+        gameIsStarted: typeof game.isStarted === "function" ? Boolean(game.isStarted()) : null
+      }
+    };
+  })()`;
+}
+
 async function captureTetrioGame(cdp) {
   const breakpointIds = [];
   let paused = false;
@@ -559,11 +653,15 @@ async function captureTetrioGame(cdp) {
   try {
     await cdp.send("Debugger.enable");
     for (const expression of ["window.requestAnimationFrame", "window.setTimeout"]) {
-      const evaluated = await safeRuntimeEvaluate(cdp, {
-        expression,
-        objectGroup: "fusion-tetrio-probe",
-        silent: true
-      }, null).catch(() => null);
+      const evaluated = await safeRuntimeEvaluate(
+        cdp,
+        {
+          expression,
+          objectGroup: "fusion-tetrio-probe",
+          silent: true
+        },
+        null
+      ).catch(() => null);
       const objectId = evaluated?.result?.objectId;
       if (!objectId) continue;
       const breakpoint = await cdp.send("Debugger.setBreakpointOnFunctionCall", {
@@ -684,8 +782,13 @@ function buildSeedFallbackState(network) {
     combo: 0,
     incoming: 0,
     pieceCounter: 0,
+    token: "browser-0",
     playing: ready,
-    countdown: !ready
+    countdown: !ready,
+    logs: [
+      `[browser] mode=unknown candidates=0 selector=auto`,
+      `[browser] reject reason=${ready ? "seed fallback ready" : "seed fallback waiting"}`
+    ]
   };
 }
 
@@ -710,7 +813,7 @@ function generate7BagQueue(seed, count) {
   const queue = [];
   while (queue.length < count) {
     const nextBag = [...pieces];
-    for (let index = nextBag.length - 1; index > 0; index--) {
+    for (let index = nextBag.length - 1; index > 0; index -= 1) {
       const swapIndex = Math.floor(rng.nextFloat() * (index + 1));
       [nextBag[index], nextBag[swapIndex]] = [nextBag[swapIndex], nextBag[index]];
     }
@@ -728,221 +831,6 @@ function getCurrentAndNext(seed, pieceIndex, nextCount = DEFAULT_NEXT_COUNT) {
     current: queue[pieceIndex] ?? null,
     queue: queue.slice(pieceIndex + 1, pieceIndex + 1 + nextCount)
   };
-}
-
-function tetrioStateExpression() {
-  return `(() => {
-    const pieceNames = ["i", "o", "t", "s", "z", "j", "l"];
-    const normalizePiece = (value) => {
-      if (value === null || value === undefined || value === false) return null;
-      if (typeof value === "number") return pieceNames[value] ?? null;
-      if (typeof value === "string") {
-        const text = value.trim().toLowerCase();
-        if (!text) return null;
-        for (const token of text.split(/[^a-z0-9]+/)) {
-          if (pieceNames.includes(token)) return token;
-        }
-        return pieceNames.includes(text) ? text : null;
-      }
-      if (Array.isArray(value)) {
-        for (const item of value) {
-          const piece = normalizePiece(item);
-          if (piece) return piece;
-        }
-        return null;
-      }
-      if (typeof value === "object") {
-        for (const key of ["type", "symbol", "id", "piece", "name", "mino", "value"]) {
-          const piece = normalizePiece(value[key]);
-          if (piece) return piece;
-        }
-      }
-      return null;
-    };
-    const filled = (cell) => {
-      if (cell === null || cell === undefined || cell === false || cell === 0 || cell === "") return false;
-      if (typeof cell === "string") {
-        const text = cell.trim().toLowerCase();
-        return text !== "" && text !== "." && text !== "0" && text !== "empty";
-      }
-      if (typeof cell === "object") {
-        if ("empty" in cell) return !cell.empty;
-        if ("type" in cell) return filled(cell.type);
-        if ("mino" in cell) return filled(cell.mino);
-      }
-      return true;
-    };
-    const rowCells = (row) =>
-      Array.isArray(row)
-        ? row
-        : Array.isArray(row?.cells)
-          ? row.cells
-          : Array.isArray(row?.row)
-            ? row.row
-            : null;
-    const queueFrom = (...values) => {
-      for (const value of values) {
-        if (!Array.isArray(value)) continue;
-        const queue = value.map(normalizePiece).filter(Boolean);
-        if (queue.length > 0) return queue.slice(0, 12);
-      }
-      return [];
-    };
-    const numberFrom = (...values) => {
-      for (const value of values) {
-        const number = Number(value);
-        if (Number.isFinite(number)) return number;
-      }
-      return null;
-    };
-    const integerFrom = (...values) => {
-      const number = numberFrom(...values);
-      return number === null ? null : Math.floor(number);
-    };
-    const rotationFrom = (...values) => {
-      for (const value of values) {
-        if (value === null || value === undefined) continue;
-        if (typeof value === "number" && Number.isFinite(value)) {
-          const normalized = ((Math.floor(value) % 4) + 4) % 4;
-          return ["north", "east", "south", "west"][normalized] ?? null;
-        }
-        if (typeof value === "string") {
-          const text = value.trim().toLowerCase();
-          if (!text) continue;
-          if (["north", "n", "spawn", "0"].includes(text)) return "north";
-          if (["east", "e", "right", "r", "1"].includes(text)) return "east";
-          if (["south", "s", "2"].includes(text)) return "south";
-          if (["west", "w", "left", "l", "3"].includes(text)) return "west";
-        }
-      }
-      return null;
-    };
-    const looksLikeGame = (value) =>
-      value &&
-      typeof value === "object" &&
-      typeof value.ejectState === "function" &&
-      typeof value.ejectBoardState === "function";
-    const scanObject = (root, limit = 200) => {
-      if (!root || typeof root !== "object") return null;
-      let names = [];
-      try { names = Object.getOwnPropertyNames(root).slice(0, limit); } catch {}
-      for (const name of names) {
-        try {
-          const value = root[name];
-          if (looksLikeGame(value)) return value;
-        } catch {}
-      }
-      return null;
-    };
-    const findGame = () => {
-      const direct = [window.__fusionTetrioGame, window.tetrioGame, window.TETRIO_GAME, window.game, window.app, window.tetrio];
-      for (const candidate of direct) {
-        if (looksLikeGame(candidate)) return candidate;
-        const nested = scanObject(candidate);
-        if (nested) return nested;
-      }
-      const names = Object.getOwnPropertyNames(window).slice(0, 1500);
-      for (const name of names) {
-        try {
-          const value = window[name];
-          if (looksLikeGame(value)) return value;
-        } catch {}
-      }
-      return null;
-    };
-
-    const game = findGame();
-    if (!game) {
-      return { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" };
-    }
-    window.__fusionTetrioGame = game;
-    const exported = typeof game.ejectState === "function" ? game.ejectState() : null;
-    const boardState = typeof game.ejectBoardState === "function" ? game.ejectBoardState() : null;
-    const state = exported && typeof exported === "object" && exported.game ? exported.game : exported;
-    if (!state || typeof state !== "object") {
-      return { ok: false, ready: false, reason: "TETR.IO game state is not available" };
-    }
-
-    const board =
-      Array.isArray(state.board) ? state.board :
-      Array.isArray(boardState?.b) ? boardState.b :
-      null;
-    if (!Array.isArray(board) || board.length === 0) {
-      return { ok: false, ready: false, reason: "TETR.IO board is not available" };
-    }
-
-    const activeState = state.falling ?? state.active ?? state.current ?? state.piece;
-    const current = normalizePiece(activeState);
-    const hold = normalizePiece(state.hold ?? state.held);
-    const queue = queueFrom(state.bag, state.queue, state.next, state.preview, state.previews, state.pieces);
-    const stats = state.stats ?? {};
-    const pieceCounter = Math.max(0, Math.floor(numberFrom(
-      stats.piecesplaced,
-      stats.piecesPlaced,
-      stats.pieces,
-      state.piecesplaced,
-      state.piecesPlaced,
-      state.pieceCounter,
-      state.piececount
-    ) ?? -1));
-    if (!current || pieceCounter < 0) {
-      return { ok: false, ready: false, reason: "TETR.IO current piece or piece counter is not available" };
-    }
-
-    const activeX = integerFrom(
-      activeState?.x,
-      activeState?.col,
-      activeState?.column,
-      activeState?.cx
-    );
-    const activeY = integerFrom(
-      activeState?.y,
-      activeState?.row,
-      activeState?.cy
-    );
-    const activeRotation = rotationFrom(
-      activeState?.rotation,
-      activeState?.rot,
-      activeState?.orientation,
-      activeState?.dir,
-      activeState?.state
-    );
-
-    const playing =
-      typeof game.isPlaying === "function" ? Boolean(game.isPlaying()) :
-      typeof state.playing === "boolean" ? state.playing :
-      typeof state.paused === "boolean" ? !state.paused :
-      true;
-    const started =
-      typeof game.isStarted === "function" ? Boolean(game.isStarted()) :
-      Boolean(state.started ?? true);
-    const destroyed = Boolean(state.destroyed || state.dead || state.gameover);
-    const countdown = started && !destroyed && !playing;
-    const ready = started && !destroyed;
-    const field = Array.from({ length: 40 }, (_, rowIndex) => {
-      const sourceRow = board[board.length - 1 - rowIndex];
-      const cells = rowCells(sourceRow);
-      return Array.from({ length: 10 }, (_, x) => filled(cells ? cells[x] : null));
-    });
-    return {
-      ok: true,
-      ready,
-      reason: ready ? null : !started ? "TETR.IO game is not started" : "TETR.IO game ended",
-      field,
-      current,
-      hold,
-      queue,
-      b2b: Math.max(0, numberFrom(stats.b2b, state.b2b, 0) ?? 0) > 0,
-      combo: Math.max(0, numberFrom(stats.combo, state.combo, 0) ?? 0),
-      incoming: Math.max(0, numberFrom(stats.impendingdamage, state.incoming, 0) ?? 0),
-      pieceCounter,
-      playing,
-      countdown,
-      activeX,
-      activeY,
-      activeRotation
-    };
-  })()`;
 }
 
 function writeSnapshot(snapshotPath, payload) {

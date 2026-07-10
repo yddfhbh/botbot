@@ -66,6 +66,11 @@ pub struct BrowserCdpConfig {
     pub probe_page_state: bool,
     pub use_ribbon_websocket: bool,
     pub use_seed_simulation_fallback: bool,
+    pub player_selector: PlayerSelectorConfig,
+    pub player_nickname: String,
+    pub player_user_id: String,
+    pub dump_state_on_fail: bool,
+    pub dump_state_path: String,
     pub bootstrap_timeout_ms: u64,
 }
 
@@ -81,9 +86,24 @@ impl Default for BrowserCdpConfig {
             probe_page_state: true,
             use_ribbon_websocket: true,
             use_seed_simulation_fallback: true,
+            player_selector: PlayerSelectorConfig::Auto,
+            player_nickname: String::new(),
+            player_user_id: String::new(),
+            dump_state_on_fail: true,
+            dump_state_path: "automation/debug/tetrio-state-dump.json".to_owned(),
             bootstrap_timeout_ms: 2500,
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayerSelectorConfig {
+    Auto,
+    Left,
+    Right,
+    Nickname,
+    UserId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -215,5 +235,44 @@ impl Default for KeyBindings {
             soft_drop: "DOWN".to_owned(),
             hard_drop: "SPACE".to_owned(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_cdp_config_defaults_include_vs_selector_and_dump_settings() {
+        let config = BrowserCdpConfig::default();
+
+        assert_eq!(config.player_selector, PlayerSelectorConfig::Auto);
+        assert!(config.player_nickname.is_empty());
+        assert!(config.player_user_id.is_empty());
+        assert!(config.dump_state_on_fail);
+        assert_eq!(
+            config.dump_state_path,
+            "automation/debug/tetrio-state-dump.json"
+        );
+    }
+
+    #[test]
+    fn browser_cdp_config_deserializes_player_selector_variants() {
+        let parsed: BrowserCdpConfig = serde_json::from_str(
+            r#"{
+                "player_selector": "user_id",
+                "player_nickname": "hebi_",
+                "player_user_id": "user-123",
+                "dump_state_on_fail": false,
+                "dump_state_path": "automation/debug/custom-dump.json"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.player_selector, PlayerSelectorConfig::UserId);
+        assert_eq!(parsed.player_nickname, "hebi_");
+        assert_eq!(parsed.player_user_id, "user-123");
+        assert!(!parsed.dump_state_on_fail);
+        assert_eq!(parsed.dump_state_path, "automation/debug/custom-dump.json");
     }
 }

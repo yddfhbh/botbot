@@ -52,11 +52,17 @@ async function main() {
     try {
       if (message.type === "releaseAll") {
         cdp = await ensureConnected(cdp, { port, url, targetHint });
+        const focus = await focusPage(cdp);
+        logInput(
+          `focus activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred}`
+        );
         await releaseAllKeys(cdp);
+        logInput("releaseAll ok");
         writeResponse({
           ok: true,
           id: message.id ?? null,
-          type: "releaseAll"
+          type: "releaseAll",
+          focus
         });
         return;
       }
@@ -73,19 +79,32 @@ async function main() {
           return;
         }
         cdp = await ensureConnected(cdp, { port, url, targetHint });
+        const focus = await focusPage(cdp);
+        logInput(
+          `focus activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred}`
+        );
+        const durationMs = numberArg(message.durationMs, 55);
+        const preKeyDownFocus = await focusPage(cdp);
+        logInput(
+          `focus activeBefore=${preKeyDownFocus.activeBefore} activeAfter=${preKeyDownFocus.activeAfter} blurred=${preKeyDownFocus.blurred}`
+        );
         await dispatchWithReconnect(cdp, spec, "keyDown", { port, url, targetHint }, (nextCdp) => {
           cdp = nextCdp;
         });
-        await sleep(numberArg(message.durationMs, 55));
+        logInput(`dispatch keyDown key=${message.key}`);
+        await sleep(durationMs);
         await dispatchWithReconnect(cdp, spec, "keyUp", { port, url, targetHint }, (nextCdp) => {
           cdp = nextCdp;
         });
+        logInput(`dispatch keyUp key=${message.key}`);
+        logInput(`tap key=${message.key} durationMs=${durationMs}`);
         writeResponse({
           ok: true,
           id: message.id ?? null,
           type: "tap",
           key: message.key,
-          durationMs: numberArg(message.durationMs, 55)
+          durationMs,
+          focus: preKeyDownFocus
         });
       }
     } catch (error) {
@@ -132,17 +151,45 @@ async function releaseAllKeys(cdp) {
 }
 
 async function focusPage(cdp) {
-  await cdp.send("Runtime.evaluate", {
+  const result = await cdp.send("Runtime.evaluate", {
     expression: `(() => {
+      const describe = (element) => {
+        if (!element) return "NONE";
+        const tag = element.tagName || "UNKNOWN";
+        if (element.isContentEditable) return tag + "[contenteditable]";
+        return tag;
+      };
+      const activeBefore = document.activeElement;
+      let blurred = false;
+      if (
+        activeBefore &&
+        (
+          activeBefore.tagName === "INPUT" ||
+          activeBefore.tagName === "TEXTAREA" ||
+          activeBefore.isContentEditable
+        ) &&
+        typeof activeBefore.blur === "function"
+      ) {
+        activeBefore.blur();
+        blurred = true;
+      }
       window.focus();
-      const active = document.activeElement;
-      if (active && typeof active.blur === "function") active.blur();
-      if (document.body && typeof document.body.focus === "function") document.body.focus();
-      return true;
+      const canvas = document.querySelector("canvas");
+      if (canvas && typeof canvas.focus === "function") {
+        canvas.focus();
+      } else if (document.body && typeof document.body.focus === "function") {
+        document.body.focus();
+      }
+      return {
+        activeBefore: describe(activeBefore),
+        activeAfter: describe(document.activeElement),
+        blurred
+      };
     })()`,
     returnByValue: true,
     awaitPromise: true
-  }).catch(() => undefined);
+  });
+  return result?.result?.value ?? { activeBefore: "UNKNOWN", activeAfter: "UNKNOWN", blurred: false };
 }
 
 async function dispatchKey(cdp, spec, type) {
@@ -184,7 +231,14 @@ async function connectToTarget({ port, url, targetHint }) {
   await cdp.send("Runtime.enable").catch(() => undefined);
   await cdp.send("Page.bringToFront").catch(() => undefined);
   await installBackgroundInputKeepalive(cdp);
-  await focusPage(cdp);
+  const focus = await focusPage(cdp).catch(() => ({
+    activeBefore: "UNKNOWN",
+    activeAfter: "UNKNOWN",
+    blurred: false
+  }));
+  logInput(
+    `focus activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred}`
+  );
   return cdp;
 }
 
@@ -201,9 +255,13 @@ function writeResponse(payload) {
   process.stdout.write(`${JSON.stringify(payload)}\n`);
 }
 
+function logInput(message) {
+  process.stderr.write(`[input:cdp] ${message}\n`);
+}
+
 function parseArgs(argv) {
   const parsed = {};
-  for (let i = 0; i < argv.length; i++) {
+  for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (!arg.startsWith("--")) continue;
     const key = arg.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
@@ -213,7 +271,7 @@ function parseArgs(argv) {
       continue;
     }
     parsed[key] = next;
-    i++;
+    i += 1;
   }
   return parsed;
 }

@@ -25,6 +25,11 @@
     "probe_page_state": true,
     "use_ribbon_websocket": true,
     "use_seed_simulation_fallback": true,
+    "player_selector": "auto",
+    "player_nickname": "",
+    "player_user_id": "",
+    "dump_state_on_fail": true,
+    "dump_state_path": "automation/debug/tetrio-state-dump.json",
     "bootstrap_timeout_ms": 2500
   },
   "bot": {

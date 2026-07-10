@@ -1,6 +1,8 @@
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::thread;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -62,9 +64,12 @@ pub trait InputBackend {
     fn release_all_keys(&mut self) -> Result<()>;
 }
 
+pub type InputHelperLogger = Arc<dyn Fn(String) + Send + Sync>;
+
 pub fn create_input_backend(
     paths: &AppPaths,
     config: &AutomationConfig,
+    logger: Option<InputHelperLogger>,
 ) -> Result<Box<dyn InputBackend>> {
     if config.dry_run {
         return Ok(Box::new(DebugLogBackend::new()));
@@ -75,7 +80,9 @@ pub fn create_input_backend(
         InputBackendConfig::VirtualKey => {
             Ok(Box::new(SendInputVirtualKeyBackend::new(&config.keys)?))
         }
-        InputBackendConfig::BrowserCdp => Ok(Box::new(BrowserCdpInputBackend::new(paths, config)?)),
+        InputBackendConfig::BrowserCdp => Ok(Box::new(BrowserCdpInputBackend::new(
+            paths, config, logger,
+        )?)),
     }
 }
 
@@ -666,12 +673,18 @@ impl InputBackend for DebugLogBackend {
 pub struct BrowserCdpInputBackend {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    response_rx: Receiver<String>,
+    log_threads: Vec<JoinHandle<()>>,
+    logger: Option<InputHelperLogger>,
     next_command_id: u64,
 }
 
 impl BrowserCdpInputBackend {
-    pub fn new(paths: &AppPaths, config: &AutomationConfig) -> Result<Self> {
+    pub fn new(
+        paths: &AppPaths,
+        config: &AutomationConfig,
+        logger: Option<InputHelperLogger>,
+    ) -> Result<Self> {
         let script = &paths.browser_input_script_path;
         let mut command = Command::new(&config.browser.node_command);
         command
@@ -687,7 +700,7 @@ impl BrowserCdpInputBackend {
             .current_dir(&paths.workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         if !config.browser.chrome_path.trim().is_empty() {
             command.env("CHROME_PATH", &config.browser.chrome_path);
@@ -708,10 +721,24 @@ impl BrowserCdpInputBackend {
             .stdout
             .take()
             .context("browser input helper stdout was not available")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("browser input helper stderr was not available")?;
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut log_threads = Vec::new();
+        log_threads.push(spawn_helper_stdout_thread(
+            stdout,
+            response_tx,
+            logger.clone(),
+        ));
+        log_threads.push(spawn_helper_stderr_thread(stderr, logger.clone()));
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            response_rx,
+            log_threads,
+            logger,
             next_command_id: 1,
         })
     }
@@ -749,45 +776,42 @@ impl BrowserCdpInputBackend {
     }
 
     fn wait_for_command_response(&mut self, id: u64, command_type: &'static str) -> Result<()> {
-        let mut line = String::new();
         loop {
-            line.clear();
-            let read = self
-                .stdout
-                .read_line(&mut line)
-                .context("failed to read from browser input helper")?;
-            if read == 0 {
-                bail!(
-                    "browser input helper closed before acknowledging {} command id={}",
-                    command_type,
-                    id
-                );
+            match self.response_rx.recv_timeout(Duration::from_millis(1000)) {
+                Ok(line) => match parse_helper_response_line(&line, command_type, id)? {
+                    ParsedHelperResponse::Ignore => continue,
+                    ParsedHelperResponse::Ok => return Ok(()),
+                    ParsedHelperResponse::Err(message) => {
+                        emit_input_log(
+                            &self.logger,
+                            format!(
+                                "[input] command={} id={} ok=false error={}",
+                                command_type, id, message
+                            ),
+                        );
+                        bail!(
+                            "browser input helper rejected {} command id={}: {}",
+                            command_type,
+                            id,
+                            message
+                        );
+                    }
+                },
+                Err(RecvTimeoutError::Timeout) => {
+                    bail!(
+                        "browser input helper timed out waiting for {} command id={}",
+                        command_type,
+                        id
+                    );
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!(
+                        "browser input helper closed before acknowledging {} command id={}",
+                        command_type,
+                        id
+                    );
+                }
             }
-
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let response: BrowserInputHelperResponse =
-                serde_json::from_str(trimmed).with_context(|| {
-                    format!(
-                        "failed to parse browser input helper response for {} command id={}: {}",
-                        command_type, id, trimmed
-                    )
-                })?;
-            if response.id != Some(id) {
-                continue;
-            }
-            if response.ok {
-                return Ok(());
-            }
-            bail!(
-                "browser input helper rejected {} command id={}: {}",
-                command_type,
-                id,
-                response.error.unwrap_or_else(|| "unknown error".to_owned())
-            );
         }
     }
 }
@@ -799,6 +823,9 @@ impl Drop for BrowserCdpInputBackend {
         let _ = self.stdin.flush();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        for handle in self.log_threads.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -839,6 +866,109 @@ struct BrowserInputHelperResponse {
     id: Option<u64>,
     #[serde(default)]
     error: Option<String>,
+}
+
+enum ParsedHelperResponse {
+    Ignore,
+    Ok,
+    Err(String),
+}
+
+fn parse_helper_response_line(
+    line: &str,
+    command_type: &'static str,
+    expected_id: u64,
+) -> Result<ParsedHelperResponse> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(ParsedHelperResponse::Ignore);
+    }
+    let response: BrowserInputHelperResponse =
+        serde_json::from_str(trimmed).with_context(|| {
+            format!(
+                "failed to parse browser input helper response for {} command id={}: {}",
+                command_type, expected_id, trimmed
+            )
+        })?;
+    if response.id != Some(expected_id) {
+        return Ok(ParsedHelperResponse::Ignore);
+    }
+    if response.ok {
+        return Ok(ParsedHelperResponse::Ok);
+    }
+    Ok(ParsedHelperResponse::Err(
+        response.error.unwrap_or_else(|| "unknown error".to_owned()),
+    ))
+}
+
+fn emit_input_log(logger: &Option<InputHelperLogger>, line: impl Into<String>) {
+    let line = line.into();
+    if let Some(logger) = logger {
+        logger(line);
+    } else {
+        println!("{line}");
+    }
+}
+
+fn spawn_helper_stdout_thread<R>(
+    reader: R,
+    response_tx: mpsc::Sender<String>,
+    logger: Option<InputHelperLogger>,
+) -> JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim().to_owned();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    emit_input_log(&logger, format!("[input] {trimmed}"));
+                    if response_tx.send(trimmed).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    emit_input_log(&logger, format!("[input][err] stdout read error: {err}"));
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn spawn_helper_stderr_thread<R>(reader: R, logger: Option<InputHelperLogger>) -> JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    emit_input_log(&logger, format!("[input][err] {trimmed}"));
+                }
+                Err(err) => {
+                    emit_input_log(&logger, format!("[input][err] stderr read error: {err}"));
+                    break;
+                }
+            }
+        }
+    })
 }
 
 #[allow(dead_code)]
@@ -1059,6 +1189,29 @@ mod tests {
             duration_for_action(GameAction::HardDrop, &handling, timings),
             Duration::from_millis(20)
         );
+    }
+
+    #[test]
+    fn parse_helper_response_line_returns_error_for_matching_failed_response() {
+        let parsed = parse_helper_response_line(
+            r#"{"ok":false,"id":7,"type":"tap","error":"focus failed"}"#,
+            "tap",
+            7,
+        )
+        .unwrap();
+
+        match parsed {
+            ParsedHelperResponse::Err(message) => assert_eq!(message, "focus failed"),
+            _ => panic!("expected error response"),
+        }
+    }
+
+    #[test]
+    fn parse_helper_response_line_ignores_other_command_ids() {
+        let parsed =
+            parse_helper_response_line(r#"{"ok":true,"id":9,"type":"tap"}"#, "tap", 7).unwrap();
+
+        assert!(matches!(parsed, ParsedHelperResponse::Ignore));
     }
 }
 

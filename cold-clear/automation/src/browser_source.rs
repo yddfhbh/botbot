@@ -68,7 +68,7 @@ pub struct BrowserSnapshotWire {
     pub incoming: u32,
     #[serde(default)]
     #[serde(alias = "pieceCounter")]
-    pub piece_counter: u32,
+    pub piece_counter: Option<u32>,
     pub token: String,
     #[serde(default = "default_true")]
     pub playing: bool,
@@ -102,7 +102,7 @@ impl BrowserSnapshotWire {
             combo: self.combo,
             b2b: self.b2b,
             incoming: self.incoming,
-            piece_counter: Some(self.piece_counter),
+            piece_counter: self.piece_counter,
             playing: self.playing,
             countdown: self.countdown,
             active: match (self.active_x, self.active_rotation) {
@@ -125,26 +125,9 @@ fn spawn_browser_provider(
     let script = &paths.browser_snapshot_script_path;
     let snapshot_path = config.snapshot_path.clone();
     let mut command = Command::new(&config.browser.node_command);
+    command.arg(script);
+    command.args(build_browser_provider_args(config, &snapshot_path));
     command
-        .arg(script)
-        .arg("--snapshot-path")
-        .arg(&snapshot_path)
-        .arg("--port")
-        .arg(config.browser.cdp_port.to_string())
-        .arg("--url")
-        .arg(&config.browser.url)
-        .arg("--target")
-        .arg(&config.browser.target_hint)
-        .arg("--poll-ms")
-        .arg(config.poll_interval_ms.to_string())
-        .arg("--probe-page-state")
-        .arg(bool_flag(config.browser.probe_page_state))
-        .arg("--use-ribbon-websocket")
-        .arg(bool_flag(config.browser.use_ribbon_websocket))
-        .arg("--use-seed-simulation-fallback")
-        .arg(bool_flag(config.browser.use_seed_simulation_fallback))
-        .arg("--connect-only")
-        .arg(bool_flag(config.browser.connect_only))
         .current_dir(&paths.workspace_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -176,6 +159,39 @@ fn spawn_browser_provider(
         ),
     );
     Ok(ProviderProcess { child, log_threads })
+}
+
+fn build_browser_provider_args(config: &AutomationConfig, snapshot_path: &PathBuf) -> Vec<String> {
+    vec![
+        "--snapshot-path".to_owned(),
+        snapshot_path.display().to_string(),
+        "--port".to_owned(),
+        config.browser.cdp_port.to_string(),
+        "--url".to_owned(),
+        config.browser.url.clone(),
+        "--target".to_owned(),
+        config.browser.target_hint.clone(),
+        "--poll-ms".to_owned(),
+        config.poll_interval_ms.to_string(),
+        "--probe-page-state".to_owned(),
+        bool_flag(config.browser.probe_page_state).to_owned(),
+        "--use-ribbon-websocket".to_owned(),
+        bool_flag(config.browser.use_ribbon_websocket).to_owned(),
+        "--use-seed-simulation-fallback".to_owned(),
+        bool_flag(config.browser.use_seed_simulation_fallback).to_owned(),
+        "--connect-only".to_owned(),
+        bool_flag(config.browser.connect_only).to_owned(),
+        "--player-selector".to_owned(),
+        selector_arg_name(config.browser.player_selector).to_owned(),
+        "--player-nickname".to_owned(),
+        config.browser.player_nickname.clone(),
+        "--player-user-id".to_owned(),
+        config.browser.player_user_id.clone(),
+        "--dump-state-on-fail".to_owned(),
+        bool_flag(config.browser.dump_state_on_fail).to_owned(),
+        "--dump-state-path".to_owned(),
+        config.browser.dump_state_path.clone(),
+    ]
 }
 
 fn wait_for_launch_health(
@@ -252,6 +268,16 @@ fn bool_flag(value: bool) -> &'static str {
     }
 }
 
+fn selector_arg_name(value: crate::config::PlayerSelectorConfig) -> &'static str {
+    match value {
+        crate::config::PlayerSelectorConfig::Auto => "auto",
+        crate::config::PlayerSelectorConfig::Left => "left",
+        crate::config::PlayerSelectorConfig::Right => "right",
+        crate::config::PlayerSelectorConfig::Nickname => "nickname",
+        crate::config::PlayerSelectorConfig::UserId => "user_id",
+    }
+}
+
 fn default_browser_source() -> String {
     "browser_cdp".to_owned()
 }
@@ -263,6 +289,7 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn browser_wire_converts_to_game_snapshot() {
@@ -276,7 +303,7 @@ mod tests {
             b2b: true,
             combo: 3,
             incoming: 2,
-            piece_counter: 27,
+            piece_counter: Some(27),
             token: "browser-27".to_owned(),
             playing: true,
             countdown: false,
@@ -301,6 +328,42 @@ mod tests {
                 y: 19,
                 rotation: RotationToken::North
             })
+        );
+    }
+
+    #[test]
+    fn browser_provider_args_include_vs_selector_and_dump_options() {
+        let mut config = AutomationConfig::default();
+        config.snapshot_path = PathBuf::from("automation/live-snapshot.json");
+        config.browser.player_selector = crate::config::PlayerSelectorConfig::Nickname;
+        config.browser.player_nickname = "hebi_".to_owned();
+        config.browser.player_user_id = "user-123".to_owned();
+        config.browser.dump_state_path = "automation/debug/tetrio-state-dump.json".to_owned();
+
+        let args = build_browser_provider_args(&config, &config.snapshot_path);
+        let joined = args.join(" ");
+
+        assert!(joined.contains("--player-selector nickname"));
+        assert!(joined.contains("--player-nickname hebi_"));
+        assert!(joined.contains("--player-user-id user-123"));
+        assert!(joined.contains("--dump-state-on-fail 1"));
+        assert!(joined.contains("--dump-state-path automation/debug/tetrio-state-dump.json"));
+    }
+
+    #[test]
+    fn node_tetrio_state_tests_pass() {
+        let output = Command::new("node")
+            .arg("--test")
+            .arg("browser-source/tetrio-state.test.mjs")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("failed to run node tests");
+
+        assert!(
+            output.status.success(),
+            "node tests failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

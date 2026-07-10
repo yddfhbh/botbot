@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     AutomationConfig, BotConfig, BrowserCdpConfig, BufferModeConfig, HandlingConfig, KeyBindings,
-    MovementModeConfig, SoftDropModeConfig, SpawnRuleConfig,
+    MovementModeConfig, PlayerSelectorConfig, SoftDropModeConfig, SpawnRuleConfig,
 };
 use crate::driver::create_input_backend;
 use crate::paths::AppPaths;
@@ -466,7 +466,7 @@ impl LauncherApp {
             return Ok(());
         }
         let config = self.state.to_automation_config(&self.paths);
-        let mut backend = create_input_backend(&self.paths, &config)?;
+        let mut backend = create_input_backend(&self.paths, &config, None)?;
         backend.release_all_keys()
     }
 
@@ -555,6 +555,40 @@ impl eframe::App for LauncherApp {
                 ui.label("Target");
                 ui.text_edit_singleline(&mut self.state.browser.target_hint);
                 ui.checkbox(&mut self.state.browser.connect_only, "Connect only");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Player");
+                egui::ComboBox::from_id_salt("player_selector")
+                    .selected_text(player_selector_label(self.state.browser.player_selector))
+                    .show_ui(ui, |ui| {
+                        for selector in [
+                            PlayerSelectorConfig::Auto,
+                            PlayerSelectorConfig::Left,
+                            PlayerSelectorConfig::Right,
+                            PlayerSelectorConfig::Nickname,
+                            PlayerSelectorConfig::UserId,
+                        ] {
+                            ui.selectable_value(
+                                &mut self.state.browser.player_selector,
+                                selector,
+                                player_selector_label(selector),
+                            );
+                        }
+                    });
+                ui.label("Nickname");
+                ui.text_edit_singleline(&mut self.state.browser.player_nickname);
+            });
+            ui.horizontal(|ui| {
+                ui.label("User ID");
+                ui.text_edit_singleline(&mut self.state.browser.player_user_id);
+                ui.checkbox(
+                    &mut self.state.browser.dump_state_on_fail,
+                    "Dump state on fail",
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Dump Path");
+                ui.text_edit_singleline(&mut self.state.browser.dump_state_path);
             });
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.state.browser.probe_page_state, "Probe page state");
@@ -768,6 +802,16 @@ fn spawn_rule_label(rule: SpawnRuleConfig) -> &'static str {
     }
 }
 
+fn player_selector_label(selector: PlayerSelectorConfig) -> &'static str {
+    match selector {
+        PlayerSelectorConfig::Auto => "Auto",
+        PlayerSelectorConfig::Left => "Left",
+        PlayerSelectorConfig::Right => "Right",
+        PlayerSelectorConfig::Nickname => "Nickname",
+        PlayerSelectorConfig::UserId => "User ID",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,6 +840,14 @@ mod tests {
         assert_eq!(state.bot.threads, 4);
         assert_eq!(state.bot.min_nodes, 4_000);
         assert_eq!(state.bot.max_nodes, 400_000);
+        assert_eq!(state.browser.player_selector, PlayerSelectorConfig::Auto);
+        assert!(state.browser.player_nickname.is_empty());
+        assert!(state.browser.player_user_id.is_empty());
+        assert!(state.browser.dump_state_on_fail);
+        assert_eq!(
+            state.browser.dump_state_path,
+            "automation/debug/tetrio-state-dump.json"
+        );
         assert!(state.handling.allow_post_softdrop_actions);
         assert!(!state.handling.allow_post_softdrop_horizontal);
         assert!(!state.handling.release_after_each_action);
@@ -812,6 +864,8 @@ mod tests {
         assert!(readme.contains("Hard Drop Only"));
         assert!(readme.contains("ZeroG Complete"));
         assert!(readme.contains("Advanced/Experimental"));
+        assert!(readme.contains("VS room"));
+        assert!(readme.contains("\"player_selector\": \"auto\""));
     }
 
     #[test]

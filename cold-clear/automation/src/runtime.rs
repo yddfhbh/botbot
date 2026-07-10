@@ -6,7 +6,7 @@ use anyhow::Result;
 
 use crate::browser_source::{emit_log, ProviderProcess, SharedLogger};
 use crate::config::AutomationConfig;
-use crate::driver::create_input_backend;
+use crate::driver::{create_input_backend, InputHelperLogger};
 use crate::paths::AppPaths;
 use crate::runner::run_loop_until;
 use crate::scanner::JsonFileScanner;
@@ -36,7 +36,11 @@ where
         config.snapshot_path.clone(),
         Duration::from_millis(config.min_snapshot_age_ms),
     );
-    let mut backend = create_input_backend(&paths, &config)?;
+    let input_logger: InputHelperLogger = {
+        let logger = logger.clone();
+        Arc::new(move |line| emit_log(&logger, line))
+    };
+    let mut backend = create_input_backend(&paths, &config, Some(input_logger))?;
     let logger_for_loop = logger.clone();
     let result = run_loop_until(
         &config,
