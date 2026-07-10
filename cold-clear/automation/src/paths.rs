@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 pub struct AppPaths {
     pub workspace_root: PathBuf,
     pub launcher_state_path: PathBuf,
-    pub scanner_script_path: PathBuf,
     pub browser_snapshot_script_path: PathBuf,
     pub browser_input_script_path: PathBuf,
 }
@@ -17,7 +16,6 @@ impl AppPaths {
         let automation_dir = workspace_root.join("automation");
         Self {
             launcher_state_path: automation_dir.join("launcher-state.json"),
-            scanner_script_path: automation_dir.join("scripts").join("screen_scanner.py"),
             browser_snapshot_script_path: automation_dir
                 .join("browser-source")
                 .join("tetrio-cdp-source.mjs"),
@@ -60,8 +58,8 @@ fn discover_workspace_root() -> Option<PathBuf> {
         for ancestor in candidate.ancestors() {
             let automation_dir = ancestor.join("automation");
             if automation_dir
-                .join("scripts")
-                .join("screen_scanner.py")
+                .join("browser-source")
+                .join("tetrio-cdp-source.mjs")
                 .exists()
             {
                 return Some(ancestor.to_path_buf());

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AutomationConfig, SnapshotProviderConfig};
+use crate::config::AutomationConfig;
 use crate::paths::AppPaths;
 use crate::scanner::{ActivePieceState, GameSnapshot, PieceToken, RotationToken};
 
@@ -30,29 +30,8 @@ impl ProviderProcess {
         paths: &AppPaths,
         config: &AutomationConfig,
         logger: SharedLogger,
-    ) -> Result<Option<Self>> {
-        match config.snapshot_provider {
-            SnapshotProviderConfig::File => Ok(None),
-            SnapshotProviderConfig::Scanner => {
-                let process = spawn_scanner_provider(paths, config, logger)?;
-                Ok(Some(process))
-            }
-            SnapshotProviderConfig::BrowserCdp => {
-                match spawn_browser_provider(paths, config, logger.clone()) {
-                    Ok(process) => Ok(Some(process)),
-                    Err(err) => {
-                        emit_log(
-                        &logger,
-                        format!(
-                            "[browser] provider launch failed: {err:#}; falling back to screen scanner"
-                        ),
-                    );
-                        let process = spawn_scanner_provider(paths, config, logger)?;
-                        Ok(Some(process))
-                    }
-                }
-            }
-        }
+    ) -> Result<Self> {
+        spawn_browser_provider(paths, config, logger)
     }
 
     pub fn stop(&mut self) {
@@ -138,14 +117,6 @@ impl BrowserSnapshotWire {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn provider_should_fallback(
-    provider: SnapshotProviderConfig,
-    browser_launch_failed: bool,
-) -> bool {
-    provider == SnapshotProviderConfig::BrowserCdp && browser_launch_failed
-}
-
 fn spawn_browser_provider(
     paths: &AppPaths,
     config: &AutomationConfig,
@@ -203,37 +174,6 @@ fn spawn_browser_provider(
             "[browser] helper running on port {} target={}",
             config.browser.cdp_port, config.browser.target_hint
         ),
-    );
-    Ok(ProviderProcess { child, log_threads })
-}
-
-fn spawn_scanner_provider(
-    paths: &AppPaths,
-    config: &AutomationConfig,
-    logger: SharedLogger,
-) -> Result<ProviderProcess> {
-    let script = &paths.scanner_script_path;
-    let scanner_config = paths.resolve_workspace_path(&config.scanner.config_path);
-    let mut child = Command::new(&config.scanner.python_command)
-        .arg(script)
-        .arg(&scanner_config)
-        .current_dir(&paths.workspace_root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to launch screen scanner with {} {}",
-                config.scanner.python_command,
-                script.display()
-            )
-        })?;
-
-    let log_threads =
-        take_process_logs(&mut child, "[scanner] ", "[scanner][err] ", logger.clone());
-    emit_log(
-        &logger,
-        format!("[scanner] launched with {}", scanner_config.display()),
     );
     Ok(ProviderProcess { child, log_threads })
 }
@@ -362,17 +302,5 @@ mod tests {
                 rotation: RotationToken::North
             })
         );
-    }
-
-    #[test]
-    fn browser_provider_failure_falls_back_to_scanner() {
-        assert!(provider_should_fallback(
-            SnapshotProviderConfig::BrowserCdp,
-            true
-        ));
-        assert!(!provider_should_fallback(
-            SnapshotProviderConfig::Scanner,
-            true
-        ));
     }
 }

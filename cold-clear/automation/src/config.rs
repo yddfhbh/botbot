@@ -1,12 +1,10 @@
 use std::path::PathBuf;
-use std::thread;
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutomationConfig {
-    pub snapshot_provider: SnapshotProviderConfig,
     pub snapshot_path: PathBuf,
     pub dry_run: bool,
     pub poll_interval_ms: u64,
@@ -23,7 +21,6 @@ pub struct AutomationConfig {
     pub hard_drop_interval_ms: u64,
     pub min_snapshot_age_ms: u64,
     pub input_backend: InputBackendConfig,
-    pub scanner: ScannerSourceConfig,
     pub browser: BrowserCdpConfig,
     pub bot: BotConfig,
     pub handling: HandlingConfig,
@@ -33,52 +30,26 @@ pub struct AutomationConfig {
 impl Default for AutomationConfig {
     fn default() -> Self {
         Self {
-            snapshot_provider: SnapshotProviderConfig::BrowserCdp,
             snapshot_path: PathBuf::from("automation/live-snapshot.json"),
             dry_run: true,
-            poll_interval_ms: 4,
+            poll_interval_ms: 2,
             target_pps: 0.0,
             tap_duration_ms: 60,
-            movement_tap_duration_ms: 16,
-            rotate_tap_duration_ms: 18,
-            hold_tap_duration_ms: 20,
-            hard_drop_tap_duration_ms: 20,
-            soft_drop_tap_duration_ms: 16,
+            movement_tap_duration_ms: 12,
+            rotate_tap_duration_ms: 14,
+            hold_tap_duration_ms: 16,
+            hard_drop_tap_duration_ms: 16,
+            soft_drop_tap_duration_ms: 12,
             movement_interval_ms: 0,
             rotation_interval_ms: 0,
             piece_interval_ms: 0,
             hard_drop_interval_ms: 0,
             min_snapshot_age_ms: 0,
             input_backend: InputBackendConfig::BrowserCdp,
-            scanner: ScannerSourceConfig::default(),
             browser: BrowserCdpConfig::default(),
             bot: BotConfig::default(),
             handling: HandlingConfig::default(),
             keys: KeyBindings::default(),
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SnapshotProviderConfig {
-    Scanner,
-    BrowserCdp,
-    File,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ScannerSourceConfig {
-    pub config_path: String,
-    pub python_command: String,
-}
-
-impl Default for ScannerSourceConfig {
-    fn default() -> Self {
-        Self {
-            config_path: "automation/scan-config.vs-left-1080p.json".to_owned(),
-            python_command: "python".to_owned(),
         }
     }
 }
@@ -131,8 +102,8 @@ impl Default for BotConfig {
     fn default() -> Self {
         Self {
             threads: 1,
-            min_nodes: 500,
-            max_nodes: 5_000,
+            min_nodes: 50,
+            max_nodes: 800,
             use_hold: true,
             speculate: false,
             movement_mode: MovementModeConfig::ZeroGSafe,
@@ -245,11 +216,4 @@ impl Default for KeyBindings {
             hard_drop: "SPACE".to_owned(),
         }
     }
-}
-
-fn default_bot_threads() -> u32 {
-    let detected = thread::available_parallelism()
-        .map(|parallelism| parallelism.get())
-        .unwrap_or(1);
-    detected.min(4) as u32
 }

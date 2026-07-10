@@ -10,9 +10,8 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    AutomationConfig, BotConfig, BrowserCdpConfig, BufferModeConfig, HandlingConfig,
-    InputBackendConfig, KeyBindings, MovementModeConfig, ScannerSourceConfig,
-    SnapshotProviderConfig, SoftDropModeConfig, SpawnRuleConfig,
+    AutomationConfig, BotConfig, BrowserCdpConfig, BufferModeConfig, HandlingConfig, KeyBindings,
+    MovementModeConfig, SoftDropModeConfig, SpawnRuleConfig,
 };
 use crate::driver::create_input_backend;
 use crate::paths::AppPaths;
@@ -39,10 +38,7 @@ impl ModePreset {
 #[serde(default)]
 struct LauncherState {
     preset: ModePreset,
-    snapshot_provider: SnapshotProviderConfig,
-    scanner_config_path: String,
     snapshot_path: String,
-    python_command: String,
     browser: BrowserCdpConfig,
     always_on_top: bool,
     dry_run: bool,
@@ -59,7 +55,6 @@ struct LauncherState {
     piece_interval_ms: u64,
     hard_drop_interval_ms: u64,
     min_snapshot_age_ms: u64,
-    input_backend: InputBackendConfig,
     bot: BotConfig,
     handling: HandlingConfig,
     keys: KeyBindings,
@@ -69,27 +64,23 @@ impl Default for LauncherState {
     fn default() -> Self {
         Self {
             preset: ModePreset::VsLeft1080p,
-            snapshot_provider: SnapshotProviderConfig::BrowserCdp,
-            scanner_config_path: "automation/scan-config.vs-left-1080p.json".to_owned(),
             snapshot_path: "automation/live-snapshot.json".to_owned(),
-            python_command: "python".to_owned(),
             browser: BrowserCdpConfig::default(),
             always_on_top: false,
             dry_run: true,
-            poll_interval_ms: 4,
+            poll_interval_ms: 2,
             target_pps: 0.0,
             tap_duration_ms: 60,
-            movement_tap_duration_ms: 16,
-            rotate_tap_duration_ms: 18,
-            hold_tap_duration_ms: 20,
-            hard_drop_tap_duration_ms: 20,
-            soft_drop_tap_duration_ms: 16,
+            movement_tap_duration_ms: 12,
+            rotate_tap_duration_ms: 14,
+            hold_tap_duration_ms: 16,
+            hard_drop_tap_duration_ms: 16,
+            soft_drop_tap_duration_ms: 12,
             movement_interval_ms: 0,
             rotation_interval_ms: 0,
             piece_interval_ms: 0,
             hard_drop_interval_ms: 0,
             min_snapshot_age_ms: 0,
-            input_backend: InputBackendConfig::BrowserCdp,
             bot: BotConfig::default(),
             handling: HandlingConfig::default(),
             keys: KeyBindings::default(),
@@ -116,19 +107,17 @@ impl LauncherState {
     fn apply_tetrio_safe_preset(&mut self) {
         self.target_pps = 0.0;
         self.tap_duration_ms = 60;
-        self.poll_interval_ms = 4;
-        self.movement_tap_duration_ms = 16;
-        self.rotate_tap_duration_ms = 18;
-        self.hold_tap_duration_ms = 20;
-        self.hard_drop_tap_duration_ms = 20;
-        self.soft_drop_tap_duration_ms = 16;
+        self.poll_interval_ms = 2;
+        self.movement_tap_duration_ms = 12;
+        self.rotate_tap_duration_ms = 14;
+        self.hold_tap_duration_ms = 16;
+        self.hard_drop_tap_duration_ms = 16;
+        self.soft_drop_tap_duration_ms = 12;
         self.movement_interval_ms = 0;
         self.rotation_interval_ms = 0;
         self.piece_interval_ms = 0;
         self.hard_drop_interval_ms = 0;
         self.min_snapshot_age_ms = 0;
-        self.snapshot_provider = SnapshotProviderConfig::BrowserCdp;
-        self.input_backend = InputBackendConfig::BrowserCdp;
         self.browser = BrowserCdpConfig::default();
         self.bot.threads = BotConfig::default().threads;
         self.bot.min_nodes = BotConfig::default().min_nodes;
@@ -149,12 +138,9 @@ impl LauncherState {
     }
 
     fn apply_preset(&mut self) {
-        self.scanner_config_path = match self.preset {
-            ModePreset::VsLeft1080p => "automation/scan-config.vs-left-1080p.json",
-            ModePreset::Solo1080p => "automation/scan-config.solo-1080p.json",
-            ModePreset::Custom => return,
+        if self.preset == ModePreset::Custom {
+            return;
         }
-        .to_owned();
         self.snapshot_path = "automation/live-snapshot.json".to_owned();
         self.apply_tetrio_safe_preset();
     }
@@ -183,7 +169,8 @@ impl LauncherState {
         self.target_pps == 0.0
             && (self.matches_first_safe_preset_family()
                 || self.matches_second_safe_preset_family()
-                || self.matches_third_safe_preset_family())
+                || self.matches_third_safe_preset_family()
+                || self.matches_fourth_safe_preset_family())
     }
 
     fn matches_first_safe_preset_family(&self) -> bool {
@@ -232,9 +219,24 @@ impl LauncherState {
             && self.handling.release_after_each_action
     }
 
+    fn matches_fourth_safe_preset_family(&self) -> bool {
+        self.poll_interval_ms == 4
+            && self.movement_tap_duration_ms == 16
+            && self.rotate_tap_duration_ms == 18
+            && self.hold_tap_duration_ms == 20
+            && self.hard_drop_tap_duration_ms == 20
+            && self.soft_drop_tap_duration_ms == 16
+            && self.movement_interval_ms == 0
+            && self.rotation_interval_ms == 0
+            && self.piece_interval_ms == 0
+            && self.hard_drop_interval_ms == 0
+            && self.min_snapshot_age_ms == 0
+            && self.handling.action_settle_ms == 0
+            && !self.handling.release_after_each_action
+    }
+
     fn to_automation_config(&self, paths: &AppPaths) -> AutomationConfig {
         AutomationConfig {
-            snapshot_provider: SnapshotProviderConfig::BrowserCdp,
             snapshot_path: paths.resolve_workspace_path(&self.snapshot_path),
             dry_run: self.dry_run,
             poll_interval_ms: self.poll_interval_ms,
@@ -250,11 +252,7 @@ impl LauncherState {
             piece_interval_ms: self.piece_interval_ms,
             hard_drop_interval_ms: self.hard_drop_interval_ms,
             min_snapshot_age_ms: self.min_snapshot_age_ms,
-            input_backend: InputBackendConfig::BrowserCdp,
-            scanner: ScannerSourceConfig {
-                config_path: self.scanner_config_path.clone(),
-                python_command: self.python_command.clone(),
-            },
+            input_backend: crate::config::InputBackendConfig::BrowserCdp,
             browser: self.browser.clone(),
             bot: self.bot.clone(),
             handling: self.handling.clone(),
@@ -294,9 +292,6 @@ pub struct LauncherApp {
 impl LauncherApp {
     pub fn new(paths: AppPaths) -> Self {
         let mut state = load_launcher_state(&paths).unwrap_or_default();
-        if state.scanner_config_path.is_empty() {
-            state.apply_preset();
-        }
         state.migrate_legacy_defaults();
         Self {
             paths,
@@ -504,7 +499,7 @@ impl eframe::App for LauncherApp {
                 }
             });
 
-            ui.label("Browser CDP mode only. Screen scanner and file mode stay as internal fallback/debug paths.");
+            ui.label("Browser CDP mode only. The snapshot file is only internal transport between helper and runner.");
             ui.horizontal(|ui| {
                 ui.label("Chrome Path");
                 ui.text_edit_singleline(&mut self.state.browser.chrome_path);
@@ -740,19 +735,17 @@ mod tests {
         assert_eq!(state.bot.spawn_rule, SpawnRuleConfig::Row19Or20);
         assert_eq!(state.target_pps, 0.0);
         assert_eq!(state.tap_duration_ms, 60);
-        assert_eq!(state.poll_interval_ms, 4);
-        assert_eq!(state.movement_tap_duration_ms, 16);
-        assert_eq!(state.rotate_tap_duration_ms, 18);
-        assert_eq!(state.hold_tap_duration_ms, 20);
-        assert_eq!(state.hard_drop_tap_duration_ms, 20);
-        assert_eq!(state.soft_drop_tap_duration_ms, 16);
+        assert_eq!(state.poll_interval_ms, 2);
+        assert_eq!(state.movement_tap_duration_ms, 12);
+        assert_eq!(state.rotate_tap_duration_ms, 14);
+        assert_eq!(state.hold_tap_duration_ms, 16);
+        assert_eq!(state.hard_drop_tap_duration_ms, 16);
+        assert_eq!(state.soft_drop_tap_duration_ms, 12);
         assert_eq!(state.movement_interval_ms, 0);
         assert_eq!(state.rotation_interval_ms, 0);
         assert_eq!(state.piece_interval_ms, 0);
         assert_eq!(state.hard_drop_interval_ms, 0);
         assert_eq!(state.min_snapshot_age_ms, 0);
-        assert_eq!(state.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
-        assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
         assert!(state.handling.allow_post_softdrop_actions);
         assert!(!state.handling.allow_post_softdrop_horizontal);
         assert!(!state.handling.release_after_each_action);
@@ -778,18 +771,18 @@ mod tests {
             dry_run: false,
             poll_interval_ms: 4,
             target_pps: 0.0,
-            movement_tap_duration_ms: 25,
-            rotate_tap_duration_ms: 28,
-            hold_tap_duration_ms: 35,
-            hard_drop_tap_duration_ms: 30,
-            soft_drop_tap_duration_ms: 25,
+            movement_tap_duration_ms: 16,
+            rotate_tap_duration_ms: 18,
+            hold_tap_duration_ms: 20,
+            hard_drop_tap_duration_ms: 20,
+            soft_drop_tap_duration_ms: 16,
             movement_interval_ms: 0,
-            rotation_interval_ms: 8,
+            rotation_interval_ms: 0,
             piece_interval_ms: 0,
             hard_drop_interval_ms: 0,
             min_snapshot_age_ms: 0,
             handling: HandlingConfig {
-                release_after_each_action: true,
+                release_after_each_action: false,
                 action_settle_ms: 0,
                 ..HandlingConfig::default()
             },
@@ -798,11 +791,11 @@ mod tests {
 
         state.migrate_legacy_defaults();
 
-        assert_eq!(state.poll_interval_ms, 4);
-        assert_eq!(state.movement_tap_duration_ms, 16);
-        assert_eq!(state.rotate_tap_duration_ms, 18);
-        assert_eq!(state.hold_tap_duration_ms, 20);
-        assert_eq!(state.hard_drop_tap_duration_ms, 20);
+        assert_eq!(state.poll_interval_ms, 2);
+        assert_eq!(state.movement_tap_duration_ms, 12);
+        assert_eq!(state.rotate_tap_duration_ms, 14);
+        assert_eq!(state.hold_tap_duration_ms, 16);
+        assert_eq!(state.hard_drop_tap_duration_ms, 16);
         assert_eq!(state.movement_interval_ms, 0);
         assert_eq!(state.rotation_interval_ms, 0);
         assert_eq!(state.piece_interval_ms, 0);

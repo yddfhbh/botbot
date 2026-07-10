@@ -136,7 +136,7 @@ impl SnapshotScanner for JsonFileScanner {
             Err(err) if is_retryable_snapshot_io_error(&err) => {
                 if !self.waiting_for_file_logged {
                     println!(
-                        "[automation] waiting for scanner output at {}",
+                        "[automation] waiting for snapshot output at {}",
                         self.path.display()
                     );
                     self.waiting_for_file_logged = true;
@@ -195,12 +195,7 @@ impl SnapshotScanner for JsonFileScanner {
             .and_then(|timestamp| timestamp.elapsed().ok())
             .map(|age| age >= self.min_snapshot_age)
             .unwrap_or(true);
-        let required_stable_reads = if snapshot.source == "browser_cdp" {
-            1
-        } else {
-            2
-        };
-        let stable_enough = self.pending_seen_count >= required_stable_reads;
+        let stable_enough = self.pending_seen_count >= 1;
 
         if !age_ready || !stable_enough {
             return Ok(None);

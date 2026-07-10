@@ -30,7 +30,7 @@ where
             config.target_pps
         ),
     );
-    let mut provider = ProviderProcess::start(&paths, &config, logger.clone())?;
+    let provider = ProviderProcess::start(&paths, &config, logger.clone())?;
     let mut scanner = JsonFileScanner::new(
         config.snapshot_path.clone(),
         Duration::from_millis(config.min_snapshot_age_ms),
@@ -41,6 +41,6 @@ where
         emit_log(&logger_for_loop, line);
     });
     let release_result = backend.release_all_keys();
-    drop(provider.take());
+    drop(provider);
     result.and(release_result)
 }

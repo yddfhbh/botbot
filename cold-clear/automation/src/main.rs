@@ -79,16 +79,6 @@ fn apply_cli_overrides(config: &mut AutomationConfig, args: &[String]) -> Result
             .filter(|next| !next.starts_with("--"))
             .cloned();
         match key.as_str() {
-            "--snapshot-provider" => {
-                let value = value.context("missing value for --snapshot-provider")?;
-                config.snapshot_provider = match value.as_str() {
-                    "browser_cdp" => config::SnapshotProviderConfig::BrowserCdp,
-                    "scanner" => config::SnapshotProviderConfig::Scanner,
-                    "file" => config::SnapshotProviderConfig::File,
-                    _ => anyhow::bail!("unsupported snapshot provider: {value}"),
-                };
-                index += 2;
-            }
             "--input-backend" => {
                 let value = value.context("missing value for --input-backend")?;
                 config.input_backend = match value.as_str() {
