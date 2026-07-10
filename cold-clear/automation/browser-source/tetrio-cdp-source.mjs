@@ -2,14 +2,66 @@ import { spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { resolveGameStateSnapshot, writeDebugDump } from "./tetrio-state.mjs";
+import { inspectPayloadForGameOptions } from "./tetrio-ws-seed.mjs";
 
 const DEFAULT_URL = "https://tetr.io/";
 const DEFAULT_PORT = 9222;
 const DEFAULT_NEXT_COUNT = 6;
 const DEFAULT_STATUS_MS = 2500;
-const MIN_STABLE_POLL_MS = 8;
+const DEFAULT_STATE_POLL_MS = 40;
+const DEFAULT_MIN_STATE_POLL_MS = 16;
+const PROBE_TIMEOUT_MS = 120;
+const PROBE_COOLDOWN_MS = 10_000;
+const PERF_LOG_INTERVAL_MS = 5000;
+
+export function normalizeDebuggerProbeMode(value) {
+  return value === "manual" || value === "disabled" || value === "startup_only"
+    ? value
+    : "startup_only";
+}
+
+export function normalizeRibbonDecodeMode(value) {
+  return value === "always_debug" || value === "off" || value === "until_seed"
+    ? value
+    : "until_seed";
+}
+
+export function computeEffectiveStatePollMs(statePollMs, minStatePollMs) {
+  const configured = numberArg(statePollMs, DEFAULT_STATE_POLL_MS);
+  const minimum = numberArg(minStatePollMs, DEFAULT_MIN_STATE_POLL_MS);
+  return Math.max(configured, minimum);
+}
+
+export function shouldAttemptDebuggerProbe({
+  mode,
+  needsProbe,
+  gameCaptured,
+  playing,
+  now,
+  lastAttemptAt = 0,
+  lastKnownPlaying = false,
+  cooldownMs = PROBE_COOLDOWN_MS
+}) {
+  if (!needsProbe) return false;
+  if (normalizeDebuggerProbeMode(mode) !== "startup_only") return false;
+  if (gameCaptured) return false;
+  if (playing || lastKnownPlaying) return false;
+  return now - lastAttemptAt >= cooldownMs;
+}
+
+export function shouldDecodeRibbonFrame({ mode, seedCaptured, direction }) {
+  const normalizedMode = normalizeRibbonDecodeMode(mode);
+  if (normalizedMode === "off") {
+    return false;
+  }
+  if (normalizedMode === "always_debug") {
+    return true;
+  }
+  return !seedCaptured && direction === "received";
+}
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -17,9 +69,13 @@ async function main() {
   const url = args.url ?? DEFAULT_URL;
   const port = numberArg(args.port, DEFAULT_PORT);
   const targetHint = args.target ?? "TETR.IO";
-  const pollMs = numberArg(args.pollMs, 40);
+  const pollMs = computeEffectiveStatePollMs(args.pollMs, args.minPollMs);
   const connectOnly = args.connectOnly === "1";
   const chromePath = process.env.CHROME_PATH || "";
+  const debuggerProbeMode = normalizeDebuggerProbeMode(args.debuggerProbeMode ?? "startup_only");
+  const ribbonDecodeMode = normalizeRibbonDecodeMode(args.ribbonDecodeMode ?? "until_seed");
+  const perfLogEnabled = args.perfLogEnabled !== "0";
+  const manualCaptureOnce = args.manualCaptureOnce === "1";
   const msgpack = await loadOptionalMsgpack();
   const selector = {
     playerSelector: args.playerSelector ?? "auto",
@@ -57,21 +113,23 @@ async function main() {
     `[browser] selector=${selector.playerSelector} nickname=${selector.playerNickname || "-"} userId=${selector.playerUserId || "-"}`
   );
 
+  const perf = createBrowserPerfTracker({ enabled: perfLogEnabled });
   const network = createTetrioNetworkState();
   if (msgpack && args.useRibbonWebsocket !== "0") {
-    await installRibbonMonitor(cdp, network, msgpack);
+    await installRibbonMonitor(cdp, network, msgpack, ribbonDecodeMode);
   }
 
   let lastReason = "";
   let lastReasonAt = 0;
-  let stableSignature = "";
-  let stableCount = 0;
   let lastWrittenSignature = "";
   let lastLoggedToken = "";
   let lastSelectedPath = "";
   let lastSelectionReason = "";
   const probeState = {
-    lastCaptureAt: 0
+    lastAttemptAt: 0,
+    gameCaptured: false,
+    lastKnownPlaying: false,
+    lastDumpAt: 0
   };
 
   const stop = async () => {
@@ -81,16 +139,36 @@ async function main() {
   process.on("SIGINT", () => stop().finally(() => process.exit(0)));
   process.on("SIGTERM", () => stop().finally(() => process.exit(0)));
 
+  const stopEventLoopLag = perf.startEventLoopLagTracker();
+
+  if (manualCaptureOnce) {
+    const capture = await captureTetrioGame(cdp, perf).catch((error) => ({
+      ok: false,
+      reason: error?.message ?? String(error)
+    }));
+    stopEventLoopLag();
+    await stop();
+    if (capture.ok) {
+      console.log(`[browser] manual capture ok source=${capture.source}`);
+      process.exit(0);
+    }
+    console.log(`[browser] manual capture failed reason=${capture.reason}`);
+    process.exit(1);
+  }
+
   while (true) {
     const state = await readTetrioState(cdp, {
       selector,
       targetTitle: target.title ?? "",
       targetUrl: target.url ?? "",
       probePageState: args.probePageState !== "0",
+      debuggerProbeMode,
       useSeedSimulationFallback: args.useSeedSimulationFallback !== "0",
       network,
-      probeState
+      probeState,
+      perf
     });
+    perf.flushIfDue();
 
     if (!state.ok || !state.ready || !state.playing || state.countdown) {
       const reason =
@@ -111,17 +189,6 @@ async function main() {
     lastReasonAt = 0;
 
     const signature = `${state.token}|${state.playing}|${state.countdown}`;
-    if (signature === stableSignature) {
-      stableCount += 1;
-    } else {
-      stableSignature = signature;
-      stableCount = 1;
-    }
-    if (stableCount < 2) {
-      await sleep(pollMs);
-      continue;
-    }
-
     const snapshot = {
       ok: true,
       source: "browser_cdp",
@@ -143,6 +210,7 @@ async function main() {
 
     if (signature !== lastWrittenSignature) {
       writeSnapshot(snapshotPath, snapshot);
+      perf.recordSnapshotWrite();
       lastWrittenSignature = signature;
       const selectionChanged =
         state.selectedPath !== lastSelectedPath || state.selectionReason !== lastSelectionReason;
@@ -154,11 +222,11 @@ async function main() {
           console.log(line);
         }
       }
+    } else {
+      perf.recordDuplicateSkip();
     }
 
-    const nextPollMs =
-      signature === lastWrittenSignature ? Math.max(pollMs, MIN_STABLE_POLL_MS) : pollMs;
-    await sleep(nextPollMs);
+    await sleep(pollMs);
   }
 }
 
@@ -375,7 +443,12 @@ function createTetrioNetworkState() {
     nextCount: DEFAULT_NEXT_COUNT,
     readyAt: 0,
     ribbonSeen: false,
-    lastPageProbeAt: 0
+    lastPageProbeAt: 0,
+    frameCounts: {
+      received: 0,
+      sent: 0,
+      decoded: 0
+    }
   };
 }
 
@@ -429,7 +502,7 @@ async function installBackgroundInputKeepalive(cdp) {
   }).catch(() => undefined);
 }
 
-async function installRibbonMonitor(cdp, network, msgpack) {
+async function installRibbonMonitor(cdp, network, msgpack, decodeMode) {
   await cdp.send("Network.enable").catch(() => undefined);
   cdp.on("Network.webSocketCreated", (event) => {
     if (/spool\.tetr\.io\/ribbon/i.test(event?.url ?? "")) {
@@ -438,64 +511,30 @@ async function installRibbonMonitor(cdp, network, msgpack) {
     }
   });
   if (!msgpack?.unpack) return;
-  const handleFrame = (event) => {
+  const handleFrame = (direction) => (event) => {
+    network.frameCounts[direction] += 1;
+    if (
+      !shouldDecodeRibbonFrame({
+        mode: decodeMode,
+        seedCaptured: Boolean(network.seed),
+        direction
+      })
+    ) {
+      return;
+    }
     const payload = event?.response?.payloadData;
     if (!payload) return;
     const buffer = event?.response?.opcode === 2 ? Buffer.from(payload, "base64") : Buffer.from(payload, "utf8");
-    inspectRibbonPayload(buffer, network, msgpack.unpack);
+    const capture = inspectPayloadForGameOptions(buffer, msgpack.unpack);
+    if (!capture?.seed) return;
+    network.frameCounts.decoded += 1;
+    network.seed = String(capture.seed);
+    network.nextCount = Math.max(1, capture.nextcount || DEFAULT_NEXT_COUNT);
+    network.readyAt = Date.now() + estimateCountdownWait(capture.options ?? capture);
+    console.log(`[browser] ribbon seed captured seed=${network.seed}`);
   };
-  cdp.on("Network.webSocketFrameReceived", handleFrame);
-  cdp.on("Network.webSocketFrameSent", handleFrame);
-}
-
-function inspectRibbonPayload(payload, network, unpack) {
-  const candidates = [];
-  for (let offset = 0; offset <= Math.min(24, payload.length - 1); offset += 1) {
-    try {
-      candidates.push(unpack(payload.subarray(offset)));
-    } catch {}
-  }
-  for (const decoded of candidates) {
-    const options = findOptionsObject(decoded);
-    if (options?.seed !== undefined && options?.bagtype !== undefined) {
-      network.seed = String(options.seed);
-      network.nextCount = Math.max(
-        1,
-        Number.parseInt(options.nextcount ?? `${DEFAULT_NEXT_COUNT}`, 10) || DEFAULT_NEXT_COUNT
-      );
-      network.readyAt = Date.now() + estimateCountdownWait(options);
-      console.log(`[browser] ribbon seed captured seed=${network.seed}`);
-      return;
-    }
-  }
-}
-
-function findOptionsObject(root) {
-  let found = null;
-  walkObject(root, (value) => {
-    if (found || !value || typeof value !== "object") return;
-    if (Object.hasOwn(value, "seed") && Object.hasOwn(value, "bagtype")) {
-      found = value;
-    } else if (
-      value.options &&
-      typeof value.options === "object" &&
-      Object.hasOwn(value.options, "seed") &&
-      Object.hasOwn(value.options, "bagtype")
-    ) {
-      found = value.options;
-    }
-  });
-  return found;
-}
-
-function walkObject(value, visit) {
-  if (!value || typeof value !== "object") return;
-  visit(value);
-  if (Array.isArray(value)) {
-    value.forEach((item) => walkObject(item, visit));
-    return;
-  }
-  for (const child of Object.values(value)) walkObject(child, visit);
+  cdp.on("Network.webSocketFrameReceived", handleFrame("received"));
+  cdp.on("Network.webSocketFrameSent", handleFrame("sent"));
 }
 
 function estimateCountdownWait(options) {
@@ -519,11 +558,12 @@ function finiteNumber(value) {
 }
 
 async function readTetrioState(cdp, options) {
-  const readRawState = async () => {
+  const readRawState = async (allowShallowScan) => {
+    const startedAt = Date.now();
     const raw = await safeRuntimeEvaluate(
       cdp,
       {
-        expression: captureTetrioExportExpression(),
+        expression: captureTetrioExportExpression({ allowShallowScan }),
         returnByValue: true,
         awaitPromise: true
       },
@@ -536,10 +576,18 @@ async function readTetrioState(cdp, options) {
         }
       }
     );
-    return raw?.result?.value ?? { ok: false, reason: "page probe returned empty" };
+    const value = raw?.result?.value ?? { ok: false, reason: "page probe returned empty" };
+    const elapsedMs = Date.now() - startedAt;
+    options.perf?.recordStateEval(elapsedMs);
+    if (options.perf?.enabled && (!value?.quick || allowShallowScan || elapsedMs >= 8)) {
+      console.log(
+        `[perf][state] quick=${Boolean(value?.quick)} scan=${Boolean(value?.scanUsed)} eval_ms=${elapsedMs}`
+      );
+    }
+    return value;
   };
 
-  let rawState = await readRawState();
+  let rawState = await readRawState(!options.probeState.gameCaptured);
   const snapshotFromRaw = (value) =>
     resolveGameStateSnapshot({
       exported: value?.exported ?? null,
@@ -551,29 +599,37 @@ async function readTetrioState(cdp, options) {
       targetUrl: options.targetUrl
     });
 
-  let state = rawState.ok
-    ? snapshotFromRaw(rawState)
-    : buildNoGameFailure(rawState, options);
-  const shouldRecaptureGame =
-    !state.ok || !state.ready || !state.playing || state.countdown;
-  const shouldCapture =
-    options.probePageState &&
-    shouldRecaptureGame &&
-    Date.now() - (options.probeState?.lastCaptureAt ?? 0) >= 2000 &&
-    Date.now() - (options.network?.lastPageProbeAt ?? 0) >= 2000;
+  if (rawState?.ok) {
+    options.probeState.gameCaptured = true;
+  }
+
+  let state = rawState.ok ? snapshotFromRaw(rawState) : buildNoGameFailure(rawState, options);
+  options.probeState.lastKnownPlaying = Boolean(state?.playing);
+
+  const shouldCapture = options.probePageState &&
+    shouldAttemptDebuggerProbe({
+      mode: options.debuggerProbeMode,
+      needsProbe: !state.ok || !state.ready || !state.playing || state.countdown,
+      gameCaptured: options.probeState.gameCaptured,
+      playing: Boolean(state?.playing),
+      lastKnownPlaying: options.probeState.lastKnownPlaying,
+      now: Date.now(),
+      lastAttemptAt: options.probeState.lastAttemptAt
+    });
 
   if (shouldCapture) {
-    options.probeState.lastCaptureAt = Date.now();
+    options.probeState.lastAttemptAt = Date.now();
     if (options.network) {
       options.network.lastPageProbeAt = Date.now();
     }
-    const capture = await captureTetrioGame(cdp).catch((error) => ({
+    const capture = await captureTetrioGame(cdp, options.perf).catch((error) => ({
       ok: false,
       reason: error?.message ?? String(error)
     }));
     if (capture.ok) {
+      options.probeState.gameCaptured = true;
       console.log(`[browser] page probe exposed game object via ${capture.source}`);
-      rawState = await readRawState();
+      rawState = await readRawState(false);
       state = rawState.ok ? snapshotFromRaw(rawState) : buildNoGameFailure(rawState, options);
     } else if (state.reason) {
       state = {
@@ -594,7 +650,8 @@ async function readTetrioState(cdp, options) {
 }
 
 function buildNoGameFailure(rawState, options) {
-  if (options.selector?.dumpStateOnFail) {
+  if (options.selector?.dumpStateOnFail && Date.now() - (options.probeState?.lastDumpAt ?? 0) >= 2000) {
+    options.probeState.lastDumpAt = Date.now();
     writeDebugDump(options.selector.dumpStatePath, {
       href: rawState?.href ?? "",
       pageTitle: rawState?.pageTitle ?? "",
@@ -621,8 +678,9 @@ function buildNoGameFailure(rawState, options) {
   };
 }
 
-function captureTetrioExportExpression() {
+function captureTetrioExportExpression({ allowShallowScan }) {
   return `(() => {
+    const allowShallowScan = ${allowShallowScan ? "true" : "false"};
     const looksLikeGame = (value) =>
       value &&
       typeof value === "object" &&
@@ -630,11 +688,11 @@ function captureTetrioExportExpression() {
       typeof value.ejectBoardState === "function";
     const scanObject = (root, path, visited, depth = 0, limit = { count: 0 }, hits = []) => {
       if (!root || typeof root !== "object") return null;
-      if (visited.has(root) || depth > 3 || limit.count >= 400) return null;
+      if (visited.has(root) || depth > 2 || limit.count >= 120) return null;
       visited.add(root);
       limit.count += 1;
       let names = [];
-      try { names = Object.getOwnPropertyNames(root).slice(0, 80); } catch {}
+      try { names = Object.getOwnPropertyNames(root).slice(0, 40); } catch {}
       for (const name of names) {
         try {
           const value = root[name];
@@ -651,37 +709,77 @@ function captureTetrioExportExpression() {
       }
       return null;
     };
-    const findGame = () => {
+    const tryDirectGame = () => {
+      const directGame = window.__fusionTetrioGame;
+      if (looksLikeGame(directGame)) {
+        return {
+          game: directGame,
+          quick: true,
+          scanUsed: false
+        };
+      }
+      return null;
+    };
+    const findGameByScan = () => {
       const visited = new WeakSet();
       const hits = [];
       const limit = { count: 0 };
-      const direct = [window.__fusionTetrioGame, window.tetrioGame, window.TETRIO_GAME, window.game, window.app, window.tetrio];
+      const direct = [window.tetrioGame, window.TETRIO_GAME, window.game, window.app, window.tetrio];
       for (const candidate of direct) {
-        if (looksLikeGame(candidate)) return candidate;
+        if (looksLikeGame(candidate)) {
+          return {
+            game: candidate,
+            quick: false,
+            scanUsed: true
+          };
+        }
         const nested = scanObject(candidate, "direct", visited, 0, limit, hits);
-        if (nested) return nested;
+        if (nested) {
+          return {
+            game: nested,
+            quick: false,
+            scanUsed: true
+          };
+        }
       }
-      const names = Object.getOwnPropertyNames(window).slice(0, 1500);
+      const names = Object.getOwnPropertyNames(window).slice(0, 160);
       for (const name of names) {
         try {
           const value = window[name];
-          if (looksLikeGame(value)) return value;
+          if (looksLikeGame(value)) {
+            return {
+              game: value,
+              quick: false,
+              scanUsed: true
+            };
+          }
           if (value && typeof value === "object") {
             const nested = scanObject(value, "window." + name, visited, 0, limit, hits);
-            if (nested) return nested;
+            if (nested) {
+              return {
+                game: nested,
+                quick: false,
+                scanUsed: true
+              };
+            }
           }
         } catch {}
       }
       return null;
     };
 
-    const game = findGame();
-    if (!game) {
+    const quick = tryDirectGame();
+    const located = quick ?? (allowShallowScan ? findGameByScan() : null);
+    if (!located?.game) {
       let windowKeys = [];
       try { windowKeys = Object.getOwnPropertyNames(window).slice(0, 120); } catch {}
       return {
         ok: false,
-        reason: "TETR.IO game instance not captured yet",
+        quick: false,
+        scanUsed: allowShallowScan,
+        reason: allowShallowScan
+          ? "TETR.IO game instance not captured yet"
+          : "TETR.IO game instance is unavailable on quick path",
         href: location.href,
         pageTitle: document.title,
         windowKeys,
@@ -691,11 +789,14 @@ function captureTetrioExportExpression() {
         }
       };
     }
+    const game = located.game;
     window.__fusionTetrioGame = game;
     const exported = typeof game.ejectState === "function" ? game.ejectState() : null;
     const boardState = typeof game.ejectBoardState === "function" ? game.ejectBoardState() : null;
     return {
       ok: true,
+      quick: Boolean(located.quick),
+      scanUsed: Boolean(located.scanUsed),
       href: location.href,
       pageTitle: document.title,
       exported,
@@ -708,9 +809,13 @@ function captureTetrioExportExpression() {
   })()`;
 }
 
-async function captureTetrioGame(cdp) {
+async function captureTetrioGame(cdp, perf) {
   const breakpointIds = [];
   let paused = false;
+  const startedAt = Date.now();
+  if (perf?.enabled) {
+    console.log("[perf][probe] start");
+  }
 
   try {
     await cdp.send("Debugger.enable");
@@ -738,7 +843,7 @@ async function captureTetrioGame(cdp) {
       return { ok: false, reason: "TETR.IO probe could not attach function breakpoints" };
     }
 
-    const deadline = Date.now() + 900;
+    const deadline = Date.now() + PROBE_TIMEOUT_MS;
     while (Date.now() < deadline) {
       let event;
       try {
@@ -760,6 +865,11 @@ async function captureTetrioGame(cdp) {
 
     return { ok: false, reason: "TETR.IO game closure not visible yet" };
   } finally {
+    const elapsedMs = Date.now() - startedAt;
+    perf?.recordProbe(elapsedMs);
+    if (perf?.enabled) {
+      console.log(`[perf][probe] end elapsed_ms=${elapsedMs}`);
+    }
     if (paused) {
       await cdp.send("Debugger.resume").catch(() => undefined);
     }
@@ -949,11 +1059,84 @@ function writeSnapshot(snapshotPath, payload) {
   }
 }
 
+function createBrowserPerfTracker({ enabled }) {
+  const stateEvalSamples = [];
+  let probeCount = 0;
+  let probeTotalMs = 0;
+  let snapshotsWritten = 0;
+  let duplicateSkips = 0;
+  let eventLoopLagMaxMs = 0;
+  let lastFlushAt = Date.now();
+
+  return {
+    enabled,
+    recordStateEval(elapsedMs) {
+      stateEvalSamples.push(elapsedMs);
+    },
+    recordProbe(elapsedMs) {
+      probeCount += 1;
+      probeTotalMs += elapsedMs;
+    },
+    recordSnapshotWrite() {
+      snapshotsWritten += 1;
+    },
+    recordDuplicateSkip() {
+      duplicateSkips += 1;
+    },
+    startEventLoopLagTracker() {
+      if (!enabled) {
+        return () => undefined;
+      }
+      let expectedAt = Date.now() + 1000;
+      const interval = setInterval(() => {
+        const now = Date.now();
+        eventLoopLagMaxMs = Math.max(eventLoopLagMaxMs, Math.max(0, now - expectedAt));
+        expectedAt = now + 1000;
+      }, 1000);
+      return () => clearInterval(interval);
+    },
+    flushIfDue() {
+      if (!enabled || Date.now() - lastFlushAt < PERF_LOG_INTERVAL_MS) {
+        return;
+      }
+      const avg = average(stateEvalSamples);
+      const p95 = percentile(stateEvalSamples, 95);
+      console.log(
+        `[perf] cdp_eval_avg=${avg.toFixed(1)}ms cdp_eval_p95=${p95.toFixed(1)}ms probe_count=${probeCount} probe_ms=${probeTotalMs} snapshots_written=${snapshotsWritten} duplicate_skips=${duplicateSkips} event_loop_lag_ms=${eventLoopLagMaxMs.toFixed(1)}`
+      );
+      stateEvalSamples.length = 0;
+      probeCount = 0;
+      probeTotalMs = 0;
+      snapshotsWritten = 0;
+      duplicateSkips = 0;
+      eventLoopLagMaxMs = 0;
+      lastFlushAt = Date.now();
+    }
+  };
+}
+
+function average(values) {
+  if (!values.length) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function percentile(values, percentileValue) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  const index = Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.ceil((percentileValue / 100) * sorted.length) - 1)
+  );
+  return sorted[index];
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 }
 
-main().catch((error) => {
-  console.error("[browser] fatal:", error?.message ?? error);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    console.error("[browser] fatal:", error?.message ?? error);
+    process.exit(1);
+  });
+}

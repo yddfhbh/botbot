@@ -3,10 +3,57 @@ import { existsSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import { pathToFileURL } from "node:url";
 
 const DEFAULT_URL = "https://tetr.io/";
 const DEFAULT_PORT = 9222;
 const FOCUS_REUSE_MS = 250;
+
+export function normalizeFocusMode(value) {
+  return value === "per_action" || value === "per_harddrop" || value === "per_plan"
+    ? value
+    : "per_plan";
+}
+
+export function createFocusController(mode = "per_plan") {
+  const normalizedMode = normalizeFocusMode(mode);
+  let planNeedsFocus = true;
+
+  return {
+    mode: normalizedMode,
+    shouldFocusForTap(key) {
+      if (normalizedMode === "per_action") {
+        return true;
+      }
+      if (normalizedMode === "per_harddrop") {
+        return key === "hardDrop";
+      }
+      return planNeedsFocus;
+    },
+    afterTap(key) {
+      if (normalizedMode !== "per_plan") {
+        return;
+      }
+      if (planNeedsFocus) {
+        planNeedsFocus = false;
+      }
+      if (key === "hardDrop") {
+        planNeedsFocus = true;
+      }
+    },
+    noteReconnect() {
+      if (normalizedMode === "per_plan") {
+        planNeedsFocus = true;
+      }
+    },
+    snapshot() {
+      return {
+        mode: normalizedMode,
+        planNeedsFocus
+      };
+    }
+  };
+}
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -15,6 +62,7 @@ async function main() {
   const targetHint = args.target ?? "TETR.IO";
   const connectOnly = args.connectOnly === "1";
   const chromePath = process.env.CHROME_PATH || "";
+  const focusMode = normalizeFocusMode(args.inputFocusMode ?? "per_plan");
 
   let browserProcess = null;
   if (!connectOnly) {
@@ -27,6 +75,7 @@ async function main() {
   await waitForCdp(port);
   let cdp = await connectToTarget({ port, url, targetHint });
   const pressedKeys = new Set();
+  const focusController = createFocusController(focusMode);
   let lastFocus = {
     at: 0,
     activeBefore: "UNKNOWN",
@@ -89,13 +138,17 @@ async function main() {
         }
         cdp = await ensureConnected(cdp, { port, url, targetHint });
         const durationMs = numberArg(message.durationMs, 55);
-        const preKeyDownFocus = await ensureFocused(cdp, lastFocus);
-        lastFocus = preKeyDownFocus;
-        logInput(
-          `focus activeBefore=${preKeyDownFocus.activeBefore} activeAfter=${preKeyDownFocus.activeAfter} blurred=${preKeyDownFocus.blurred} cached=${preKeyDownFocus.cached}`
-        );
+        let focus = null;
+        if (focusController.shouldFocusForTap(message.key)) {
+          focus = await ensureFocused(cdp, lastFocus);
+          lastFocus = focus;
+          logInput(
+            `focus mode=${focusMode} activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred} cached=${focus.cached}`
+          );
+        }
         await dispatchWithReconnect(cdp, spec, "keyDown", { port, url, targetHint }, (nextCdp) => {
           cdp = nextCdp;
+          focusController.noteReconnect();
           lastFocus = {
             at: 0,
             activeBefore: "UNKNOWN",
@@ -109,6 +162,7 @@ async function main() {
         await sleep(durationMs);
         await dispatchWithReconnect(cdp, spec, "keyUp", { port, url, targetHint }, (nextCdp) => {
           cdp = nextCdp;
+          focusController.noteReconnect();
           lastFocus = {
             at: 0,
             activeBefore: "UNKNOWN",
@@ -118,15 +172,16 @@ async function main() {
           };
         });
         pressedKeys.delete(message.key);
+        focusController.afterTap(message.key);
         logInput(`dispatch keyUp key=${message.key}`);
-        logInput(`tap key=${message.key} durationMs=${durationMs}`);
+        logInput(`tap key=${message.key} durationMs=${durationMs} focusMode=${focusMode}`);
         writeResponse({
           ok: true,
           id: message.id ?? null,
           type: "tap",
           key: message.key,
           durationMs,
-          focus: preKeyDownFocus
+          focus
         });
       }
     } catch (error) {
@@ -282,14 +337,6 @@ async function connectToTarget({ port, url, targetHint }) {
   await cdp.send("Runtime.enable").catch(() => undefined);
   await cdp.send("Page.bringToFront").catch(() => undefined);
   await installBackgroundInputKeepalive(cdp);
-  const focus = await focusPage(cdp).catch(() => ({
-    activeBefore: "UNKNOWN",
-    activeAfter: "UNKNOWN",
-    blurred: false
-  }));
-  logInput(
-    `focus activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred} cached=false`
-  );
   return cdp;
 }
 
@@ -487,15 +534,25 @@ class CdpClient {
     this.socket = socket;
     this.nextId = 1;
     this.pending = new Map();
+    this.listeners = new Map();
     socket.addEventListener("message", (event) => {
       const message = JSON.parse(event.data);
-      if (!message.id) return;
+      if (!message.id) {
+        if (message.method) this.emit(message.method, message.params ?? {});
+        return;
+      }
       const pending = this.pending.get(message.id);
       if (!pending) return;
       this.pending.delete(message.id);
       if (message.error) pending.reject(new Error(message.error.message ?? JSON.stringify(message.error)));
       else pending.resolve(message.result);
     });
+  }
+
+  emit(method, params) {
+    const listeners = this.listeners.get(method);
+    if (!listeners) return;
+    for (const handler of [...listeners]) handler(params);
   }
 
   send(method, params = {}) {
@@ -509,13 +566,13 @@ class CdpClient {
     });
   }
 
+  isOpen() {
+    return this.socket.readyState === WebSocket.OPEN;
+  }
+
   close() {
     this.socket.close();
     return Promise.resolve();
-  }
-
-  isOpen() {
-    return this.socket.readyState === WebSocket.OPEN;
   }
 }
 
@@ -523,7 +580,9 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 }
 
-main().catch((error) => {
-  console.error("[input:cdp] fatal:", error?.message ?? error);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    console.error("[input:cdp] fatal:", error?.message ?? error);
+    process.exit(1);
+  });
+}

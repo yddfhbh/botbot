@@ -9,7 +9,8 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::config::{
-    AutomationConfig, BufferModeConfig, HandlingConfig, InputBackendConfig, KeyBindings,
+    AutomationConfig, BufferModeConfig, HandlingConfig, InputBackendConfig, InputFocusMode,
+    KeyBindings,
 };
 use crate::paths::AppPaths;
 
@@ -696,6 +697,8 @@ impl BrowserCdpInputBackend {
             .arg(&config.browser.url)
             .arg("--target")
             .arg(&config.browser.target_hint)
+            .arg("--input-focus-mode")
+            .arg(input_focus_mode_arg(config.browser.input_focus_mode))
             .arg("--connect-only")
             .arg("1")
             .current_dir(&paths.workspace_root)
@@ -917,6 +920,14 @@ fn emit_input_log(logger: &Option<InputHelperLogger>, line: impl Into<String>) {
         logger(line);
     } else {
         println!("{line}");
+    }
+}
+
+fn input_focus_mode_arg(value: InputFocusMode) -> &'static str {
+    match value {
+        InputFocusMode::PerPlan => "per_plan",
+        InputFocusMode::PerHarddrop => "per_harddrop",
+        InputFocusMode::PerAction => "per_action",
     }
 }
 

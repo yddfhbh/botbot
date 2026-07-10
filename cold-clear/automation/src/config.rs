@@ -9,6 +9,7 @@ pub struct AutomationConfig {
     pub snapshot_provider: SnapshotProviderConfig,
     pub dry_run: bool,
     pub poll_interval_ms: u64,
+    pub perf_log_enabled: bool,
     pub target_pps: f32,
     pub tap_duration_ms: u64,
     pub movement_tap_duration_ms: u64,
@@ -34,19 +35,20 @@ impl Default for AutomationConfig {
             snapshot_path: PathBuf::from("automation/live-snapshot.json"),
             snapshot_provider: SnapshotProviderConfig::BrowserCdp,
             dry_run: true,
-            poll_interval_ms: 2,
-            target_pps: 0.0,
+            poll_interval_ms: 20,
+            perf_log_enabled: true,
+            target_pps: 1.2,
             tap_duration_ms: 60,
-            movement_tap_duration_ms: 12,
-            rotate_tap_duration_ms: 14,
-            hold_tap_duration_ms: 16,
-            hard_drop_tap_duration_ms: 16,
-            soft_drop_tap_duration_ms: 12,
-            movement_interval_ms: 0,
-            rotation_interval_ms: 0,
-            piece_interval_ms: 0,
-            hard_drop_interval_ms: 0,
-            min_snapshot_age_ms: 0,
+            movement_tap_duration_ms: 20,
+            rotate_tap_duration_ms: 30,
+            hold_tap_duration_ms: 30,
+            hard_drop_tap_duration_ms: 40,
+            soft_drop_tap_duration_ms: 20,
+            movement_interval_ms: 20,
+            rotation_interval_ms: 30,
+            piece_interval_ms: 60,
+            hard_drop_interval_ms: 40,
+            min_snapshot_age_ms: 30,
             input_backend: InputBackendConfig::BrowserCdp,
             browser: BrowserCdpConfig::default(),
             bot: BotConfig::default(),
@@ -74,8 +76,13 @@ pub struct BrowserCdpConfig {
     pub target_hint: String,
     pub connect_only: bool,
     pub probe_page_state: bool,
+    pub debugger_probe_mode: DebuggerProbeMode,
+    pub state_poll_ms: u64,
+    pub min_state_poll_ms: u64,
     pub use_ribbon_websocket: bool,
+    pub ribbon_decode_mode: RibbonDecodeMode,
     pub use_seed_simulation_fallback: bool,
+    pub input_focus_mode: InputFocusMode,
     pub player_selector: PlayerSelectorConfig,
     pub player_nickname: String,
     pub player_user_id: String,
@@ -94,8 +101,13 @@ impl Default for BrowserCdpConfig {
             target_hint: "TETR.IO".to_owned(),
             connect_only: false,
             probe_page_state: true,
-            use_ribbon_websocket: true,
-            use_seed_simulation_fallback: true,
+            debugger_probe_mode: DebuggerProbeMode::StartupOnly,
+            state_poll_ms: 40,
+            min_state_poll_ms: 16,
+            use_ribbon_websocket: false,
+            ribbon_decode_mode: RibbonDecodeMode::UntilSeed,
+            use_seed_simulation_fallback: false,
+            input_focus_mode: InputFocusMode::PerPlan,
             player_selector: PlayerSelectorConfig::Auto,
             player_nickname: String::new(),
             player_user_id: String::new(),
@@ -116,6 +128,30 @@ pub enum PlayerSelectorConfig {
     UserId,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DebuggerProbeMode {
+    StartupOnly,
+    Manual,
+    Disabled,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RibbonDecodeMode {
+    UntilSeed,
+    AlwaysDebug,
+    Off,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputFocusMode {
+    PerPlan,
+    PerHarddrop,
+    PerAction,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BotConfig {
@@ -131,9 +167,9 @@ pub struct BotConfig {
 impl Default for BotConfig {
     fn default() -> Self {
         Self {
-            threads: 4,
-            min_nodes: 4_000,
-            max_nodes: 400_000,
+            threads: 1,
+            min_nodes: 0,
+            max_nodes: 100_000,
             use_hold: true,
             speculate: false,
             movement_mode: MovementModeConfig::ZeroGSafe,
@@ -278,6 +314,11 @@ mod tests {
     fn browser_cdp_config_defaults_include_vs_selector_and_dump_settings() {
         let config = BrowserCdpConfig::default();
 
+        assert_eq!(config.debugger_probe_mode, DebuggerProbeMode::StartupOnly);
+        assert_eq!(config.state_poll_ms, 40);
+        assert_eq!(config.min_state_poll_ms, 16);
+        assert_eq!(config.ribbon_decode_mode, RibbonDecodeMode::UntilSeed);
+        assert_eq!(config.input_focus_mode, InputFocusMode::PerPlan);
         assert_eq!(config.player_selector, PlayerSelectorConfig::Auto);
         assert!(config.player_nickname.is_empty());
         assert!(config.player_user_id.is_empty());
@@ -295,6 +336,11 @@ mod tests {
                 "player_selector": "user_id",
                 "player_nickname": "hebi_",
                 "player_user_id": "user-123",
+                "debugger_probe_mode": "manual",
+                "state_poll_ms": 24,
+                "min_state_poll_ms": 16,
+                "ribbon_decode_mode": "off",
+                "input_focus_mode": "per_harddrop",
                 "dump_state_on_fail": false,
                 "dump_state_path": "automation/debug/custom-dump.json"
             }"#,
@@ -304,6 +350,11 @@ mod tests {
         assert_eq!(parsed.player_selector, PlayerSelectorConfig::UserId);
         assert_eq!(parsed.player_nickname, "hebi_");
         assert_eq!(parsed.player_user_id, "user-123");
+        assert_eq!(parsed.debugger_probe_mode, DebuggerProbeMode::Manual);
+        assert_eq!(parsed.state_poll_ms, 24);
+        assert_eq!(parsed.min_state_poll_ms, 16);
+        assert_eq!(parsed.ribbon_decode_mode, RibbonDecodeMode::Off);
+        assert_eq!(parsed.input_focus_mode, InputFocusMode::PerHarddrop);
         assert!(!parsed.dump_state_on_fail);
         assert_eq!(parsed.dump_state_path, "automation/debug/custom-dump.json");
     }

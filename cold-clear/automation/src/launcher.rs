@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Write;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -10,9 +11,9 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    AutomationConfig, BotConfig, BrowserCdpConfig, BufferModeConfig, HandlingConfig, KeyBindings,
-    MovementModeConfig, PlayerSelectorConfig, SnapshotProviderConfig, SoftDropModeConfig,
-    SpawnRuleConfig,
+    AutomationConfig, BotConfig, BrowserCdpConfig, BufferModeConfig, DebuggerProbeMode,
+    HandlingConfig, InputFocusMode, KeyBindings, MovementModeConfig, PlayerSelectorConfig,
+    RibbonDecodeMode, SnapshotProviderConfig, SoftDropModeConfig, SpawnRuleConfig,
 };
 use crate::driver::create_input_backend;
 use crate::paths::AppPaths;
@@ -45,6 +46,7 @@ struct LauncherState {
     always_on_top: bool,
     dry_run: bool,
     poll_interval_ms: u64,
+    perf_log_enabled: bool,
     target_pps: f32,
     tap_duration_ms: u64,
     movement_tap_duration_ms: u64,
@@ -71,19 +73,20 @@ impl Default for LauncherState {
             browser: BrowserCdpConfig::default(),
             always_on_top: false,
             dry_run: true,
-            poll_interval_ms: 2,
-            target_pps: 0.0,
+            poll_interval_ms: 20,
+            perf_log_enabled: true,
+            target_pps: 1.2,
             tap_duration_ms: 60,
-            movement_tap_duration_ms: 12,
-            rotate_tap_duration_ms: 14,
-            hold_tap_duration_ms: 16,
-            hard_drop_tap_duration_ms: 16,
-            soft_drop_tap_duration_ms: 12,
-            movement_interval_ms: 0,
-            rotation_interval_ms: 0,
-            piece_interval_ms: 0,
-            hard_drop_interval_ms: 0,
-            min_snapshot_age_ms: 0,
+            movement_tap_duration_ms: 20,
+            rotate_tap_duration_ms: 30,
+            hold_tap_duration_ms: 30,
+            hard_drop_tap_duration_ms: 40,
+            soft_drop_tap_duration_ms: 20,
+            movement_interval_ms: 20,
+            rotation_interval_ms: 30,
+            piece_interval_ms: 60,
+            hard_drop_interval_ms: 40,
+            min_snapshot_age_ms: 30,
             bot: BotConfig::default(),
             handling: HandlingConfig::default(),
             keys: KeyBindings::default(),
@@ -109,19 +112,20 @@ pub fn launcher_viewport(paths: &AppPaths) -> egui::ViewportBuilder {
 impl LauncherState {
     fn apply_tetrio_safe_preset(&mut self) {
         self.snapshot_provider = SnapshotProviderConfig::BrowserCdp;
-        self.target_pps = 0.0;
+        self.target_pps = 1.2;
         self.tap_duration_ms = 60;
-        self.poll_interval_ms = 2;
-        self.movement_tap_duration_ms = 12;
-        self.rotate_tap_duration_ms = 14;
-        self.hold_tap_duration_ms = 16;
-        self.hard_drop_tap_duration_ms = 16;
-        self.soft_drop_tap_duration_ms = 12;
-        self.movement_interval_ms = 0;
-        self.rotation_interval_ms = 0;
-        self.piece_interval_ms = 0;
-        self.hard_drop_interval_ms = 0;
-        self.min_snapshot_age_ms = 0;
+        self.poll_interval_ms = 20;
+        self.perf_log_enabled = true;
+        self.movement_tap_duration_ms = 20;
+        self.rotate_tap_duration_ms = 30;
+        self.hold_tap_duration_ms = 30;
+        self.hard_drop_tap_duration_ms = 40;
+        self.soft_drop_tap_duration_ms = 20;
+        self.movement_interval_ms = 20;
+        self.rotation_interval_ms = 30;
+        self.piece_interval_ms = 60;
+        self.hard_drop_interval_ms = 40;
+        self.min_snapshot_age_ms = 30;
         self.browser = BrowserCdpConfig::default();
         self.bot.threads = BotConfig::default().threads;
         self.bot.min_nodes = BotConfig::default().min_nodes;
@@ -139,6 +143,24 @@ impl LauncherState {
         self.handling.prefer_soft_drop_over_movement = false;
         self.handling.irs_mode = BufferModeConfig::Off;
         self.handling.ihs_mode = BufferModeConfig::Off;
+    }
+
+    fn apply_fast_perf_preset(&mut self) {
+        self.apply_tetrio_safe_preset();
+        self.target_pps = 1.5;
+        self.poll_interval_ms = 16;
+        self.browser.state_poll_ms = 16;
+        self.bot.threads = 2;
+        self.bot.max_nodes = 200_000;
+    }
+
+    fn apply_benchmark_preset(&mut self) {
+        self.apply_fast_perf_preset();
+        self.poll_interval_ms = 2;
+        self.browser.state_poll_ms = 16;
+        self.bot.threads = 4;
+        self.bot.max_nodes = 400_000;
+        self.bot.speculate = false;
     }
 
     fn apply_preset(&mut self) {
@@ -262,6 +284,7 @@ impl LauncherState {
             snapshot_provider: self.snapshot_provider,
             dry_run: self.dry_run,
             poll_interval_ms: self.poll_interval_ms,
+            perf_log_enabled: self.perf_log_enabled,
             target_pps: self.target_pps,
             tap_duration_ms: self.tap_duration_ms,
             movement_tap_duration_ms: self.movement_tap_duration_ms,
@@ -376,6 +399,56 @@ impl LauncherApp {
                 self.paths
                     .display_workspace_relative(&self.paths.launcher_state_path)
             ));
+        }
+    }
+
+    fn capture_game_object_now(&mut self) {
+        let script = &self.paths.browser_snapshot_script_path;
+        let mut command = Command::new(&self.state.browser.node_command);
+        command
+            .arg(script)
+            .arg("--port")
+            .arg(self.state.browser.cdp_port.to_string())
+            .arg("--url")
+            .arg(&self.state.browser.url)
+            .arg("--target")
+            .arg(&self.state.browser.target_hint)
+            .arg("--connect-only")
+            .arg(if self.state.browser.connect_only {
+                "1"
+            } else {
+                "0"
+            })
+            .arg("--manual-capture-once")
+            .arg("1")
+            .current_dir(&self.paths.workspace_root);
+
+        if !self.state.browser.chrome_path.trim().is_empty() {
+            command.env("CHROME_PATH", &self.state.browser.chrome_path);
+        }
+
+        match command.output() {
+            Ok(output) => {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    self.push_log(line.to_owned());
+                }
+                for line in String::from_utf8_lossy(&output.stderr).lines() {
+                    self.push_log(format!("[browser][err] {line}"));
+                }
+                if output.status.success() {
+                    self.push_log("[launcher] manual game-object capture completed");
+                } else {
+                    self.push_log(format!(
+                        "[launcher] manual game-object capture failed status={}",
+                        output.status
+                    ));
+                }
+            }
+            Err(err) => {
+                self.push_log(format!(
+                    "[launcher] failed to run manual game-object capture: {err}"
+                ));
+            }
         }
     }
 
@@ -630,6 +703,81 @@ impl eframe::App for LauncherApp {
                             "Use seed simulation fallback",
                         );
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("State Poll");
+                        ui.add(
+                            egui::DragValue::new(&mut self.state.browser.state_poll_ms)
+                                .range(16..=200)
+                                .speed(1),
+                        );
+                        ui.label("Min Poll");
+                        ui.add(
+                            egui::DragValue::new(&mut self.state.browser.min_state_poll_ms)
+                                .range(1..=200)
+                                .speed(1),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Debugger Probe");
+                        egui::ComboBox::from_id_salt("debugger_probe_mode")
+                            .selected_text(debugger_probe_mode_label(
+                                self.state.browser.debugger_probe_mode,
+                            ))
+                            .show_ui(ui, |ui| {
+                                for mode in [
+                                    DebuggerProbeMode::StartupOnly,
+                                    DebuggerProbeMode::Manual,
+                                    DebuggerProbeMode::Disabled,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.state.browser.debugger_probe_mode,
+                                        mode,
+                                        debugger_probe_mode_label(mode),
+                                    );
+                                }
+                            });
+                        if ui.button("Capture game object").clicked() {
+                            self.capture_game_object_now();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Ribbon Decode");
+                        egui::ComboBox::from_id_salt("ribbon_decode_mode")
+                            .selected_text(ribbon_decode_mode_label(
+                                self.state.browser.ribbon_decode_mode,
+                            ))
+                            .show_ui(ui, |ui| {
+                                for mode in [
+                                    RibbonDecodeMode::UntilSeed,
+                                    RibbonDecodeMode::AlwaysDebug,
+                                    RibbonDecodeMode::Off,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.state.browser.ribbon_decode_mode,
+                                        mode,
+                                        ribbon_decode_mode_label(mode),
+                                    );
+                                }
+                            });
+                        ui.label("Input Focus");
+                        egui::ComboBox::from_id_salt("input_focus_mode")
+                            .selected_text(input_focus_mode_label(
+                                self.state.browser.input_focus_mode,
+                            ))
+                            .show_ui(ui, |ui| {
+                                for mode in [
+                                    InputFocusMode::PerPlan,
+                                    InputFocusMode::PerHarddrop,
+                                    InputFocusMode::PerAction,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.state.browser.input_focus_mode,
+                                        mode,
+                                        input_focus_mode_label(mode),
+                                    );
+                                }
+                            });
+                    });
                 }
                 SnapshotProviderConfig::WebsocketSeed => {
                     let snapshot_status = load_websocket_seed_status(
@@ -697,6 +845,7 @@ impl eframe::App for LauncherApp {
             ui.heading("Runtime");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.state.dry_run, "Dry run");
+                ui.checkbox(&mut self.state.perf_log_enabled, "Perf log");
                 ui.checkbox(&mut self.state.bot.use_hold, "Use hold");
                 ui.checkbox(&mut self.state.bot.speculate, "Speculate");
                 ui.checkbox(
@@ -709,6 +858,17 @@ impl eframe::App for LauncherApp {
                 );
                 ui.label("Input");
                 ui.monospace("Browser CDP");
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Stable").clicked() {
+                    self.state.apply_tetrio_safe_preset();
+                }
+                if ui.button("Fast but risky").clicked() {
+                    self.state.apply_fast_perf_preset();
+                }
+                if ui.button("Benchmark").clicked() {
+                    self.state.apply_benchmark_preset();
+                }
             });
             ui.horizontal(|ui| {
                 ui.checkbox(
@@ -795,7 +955,7 @@ impl eframe::App for LauncherApp {
                 ui.label("Min Nodes");
                 ui.add(
                     egui::DragValue::new(&mut self.state.bot.min_nodes)
-                        .range(50..=50_000)
+                        .range(0..=50_000)
                         .speed(50),
                 );
                 ui.label("Max Nodes");
@@ -931,6 +1091,30 @@ fn player_selector_label(selector: PlayerSelectorConfig) -> &'static str {
     }
 }
 
+fn debugger_probe_mode_label(mode: DebuggerProbeMode) -> &'static str {
+    match mode {
+        DebuggerProbeMode::StartupOnly => "Startup only",
+        DebuggerProbeMode::Manual => "Manual",
+        DebuggerProbeMode::Disabled => "Disabled",
+    }
+}
+
+fn ribbon_decode_mode_label(mode: RibbonDecodeMode) -> &'static str {
+    match mode {
+        RibbonDecodeMode::UntilSeed => "Until seed",
+        RibbonDecodeMode::AlwaysDebug => "Always debug",
+        RibbonDecodeMode::Off => "Off",
+    }
+}
+
+fn input_focus_mode_label(mode: InputFocusMode) -> &'static str {
+    match mode {
+        InputFocusMode::PerPlan => "Per plan",
+        InputFocusMode::PerHarddrop => "Per harddrop",
+        InputFocusMode::PerAction => "Per action",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,22 +1128,33 @@ mod tests {
         assert_eq!(state.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
         assert_eq!(state.bot.movement_mode, MovementModeConfig::ZeroGSafe);
         assert_eq!(state.bot.spawn_rule, SpawnRuleConfig::Row19Or20);
-        assert_eq!(state.target_pps, 0.0);
+        assert_eq!(state.target_pps, 1.2);
         assert_eq!(state.tap_duration_ms, 60);
-        assert_eq!(state.poll_interval_ms, 2);
-        assert_eq!(state.movement_tap_duration_ms, 12);
-        assert_eq!(state.rotate_tap_duration_ms, 14);
-        assert_eq!(state.hold_tap_duration_ms, 16);
-        assert_eq!(state.hard_drop_tap_duration_ms, 16);
-        assert_eq!(state.soft_drop_tap_duration_ms, 12);
-        assert_eq!(state.movement_interval_ms, 0);
-        assert_eq!(state.rotation_interval_ms, 0);
-        assert_eq!(state.piece_interval_ms, 0);
-        assert_eq!(state.hard_drop_interval_ms, 0);
-        assert_eq!(state.min_snapshot_age_ms, 0);
-        assert_eq!(state.bot.threads, 4);
-        assert_eq!(state.bot.min_nodes, 4_000);
-        assert_eq!(state.bot.max_nodes, 400_000);
+        assert_eq!(state.poll_interval_ms, 20);
+        assert_eq!(state.movement_tap_duration_ms, 20);
+        assert_eq!(state.rotate_tap_duration_ms, 30);
+        assert_eq!(state.hold_tap_duration_ms, 30);
+        assert_eq!(state.hard_drop_tap_duration_ms, 40);
+        assert_eq!(state.soft_drop_tap_duration_ms, 20);
+        assert_eq!(state.movement_interval_ms, 20);
+        assert_eq!(state.rotation_interval_ms, 30);
+        assert_eq!(state.piece_interval_ms, 60);
+        assert_eq!(state.hard_drop_interval_ms, 40);
+        assert_eq!(state.min_snapshot_age_ms, 30);
+        assert_eq!(state.bot.threads, 1);
+        assert_eq!(state.bot.min_nodes, 0);
+        assert_eq!(state.bot.max_nodes, 100_000);
+        assert_eq!(
+            state.browser.debugger_probe_mode,
+            DebuggerProbeMode::StartupOnly
+        );
+        assert_eq!(state.browser.state_poll_ms, 40);
+        assert_eq!(
+            state.browser.ribbon_decode_mode,
+            RibbonDecodeMode::UntilSeed
+        );
+        assert_eq!(state.browser.input_focus_mode, InputFocusMode::PerPlan);
+        assert!(state.perf_log_enabled);
         assert_eq!(state.browser.player_selector, PlayerSelectorConfig::Auto);
         assert!(state.browser.player_nickname.is_empty());
         assert!(state.browser.player_user_id.is_empty());
@@ -979,12 +1174,14 @@ mod tests {
     #[test]
     fn readme_matches_safe_preset_defaults() {
         let readme = include_str!("../README.md");
-        assert!(readme.contains("TETR.IO Safe preset"));
+        assert!(readme.contains("Stable Preset"));
         assert!(readme.contains("ZeroG Safe"));
         assert!(readme.contains("Hard Drop Only"));
         assert!(readme.contains("ZeroG Complete"));
+        assert!(readme.contains("Fast but risky"));
+        assert!(readme.contains("Debugger probe mode"));
         assert!(readme.contains("Advanced/Experimental"));
-        assert!(readme.contains("VS room"));
+        assert!(readme.contains("VS Room"));
         assert!(readme.contains("\"player_selector\": \"auto\""));
         assert!(readme.contains("WebSocket Seed"));
     }
@@ -1016,19 +1213,19 @@ mod tests {
 
         state.migrate_legacy_defaults();
 
-        assert_eq!(state.poll_interval_ms, 2);
-        assert_eq!(state.movement_tap_duration_ms, 12);
-        assert_eq!(state.rotate_tap_duration_ms, 14);
-        assert_eq!(state.hold_tap_duration_ms, 16);
-        assert_eq!(state.hard_drop_tap_duration_ms, 16);
-        assert_eq!(state.movement_interval_ms, 0);
-        assert_eq!(state.rotation_interval_ms, 0);
-        assert_eq!(state.piece_interval_ms, 0);
-        assert_eq!(state.hard_drop_interval_ms, 0);
-        assert_eq!(state.min_snapshot_age_ms, 0);
-        assert_eq!(state.bot.threads, 4);
-        assert_eq!(state.bot.min_nodes, 4_000);
-        assert_eq!(state.bot.max_nodes, 400_000);
+        assert_eq!(state.poll_interval_ms, 20);
+        assert_eq!(state.movement_tap_duration_ms, 20);
+        assert_eq!(state.rotate_tap_duration_ms, 30);
+        assert_eq!(state.hold_tap_duration_ms, 30);
+        assert_eq!(state.hard_drop_tap_duration_ms, 40);
+        assert_eq!(state.movement_interval_ms, 20);
+        assert_eq!(state.rotation_interval_ms, 30);
+        assert_eq!(state.piece_interval_ms, 60);
+        assert_eq!(state.hard_drop_interval_ms, 40);
+        assert_eq!(state.min_snapshot_age_ms, 30);
+        assert_eq!(state.bot.threads, 1);
+        assert_eq!(state.bot.min_nodes, 0);
+        assert_eq!(state.bot.max_nodes, 100_000);
         assert_eq!(state.handling.action_settle_ms, 0);
         assert!(!state.handling.release_after_each_action);
     }

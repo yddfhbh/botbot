@@ -214,13 +214,23 @@ fn build_browser_provider_args(config: &AutomationConfig, snapshot_path: &PathBu
         "--target".to_owned(),
         config.browser.target_hint.clone(),
         "--poll-ms".to_owned(),
-        config.poll_interval_ms.to_string(),
+        config.browser.state_poll_ms.to_string(),
+        "--min-poll-ms".to_owned(),
+        config.browser.min_state_poll_ms.to_string(),
         "--probe-page-state".to_owned(),
         bool_flag(config.browser.probe_page_state).to_owned(),
+        "--debugger-probe-mode".to_owned(),
+        debugger_probe_mode_arg(config.browser.debugger_probe_mode).to_owned(),
         "--use-ribbon-websocket".to_owned(),
         bool_flag(config.browser.use_ribbon_websocket).to_owned(),
+        "--ribbon-decode-mode".to_owned(),
+        ribbon_decode_mode_arg(config.browser.ribbon_decode_mode).to_owned(),
         "--use-seed-simulation-fallback".to_owned(),
         bool_flag(config.browser.use_seed_simulation_fallback).to_owned(),
+        "--input-focus-mode".to_owned(),
+        input_focus_mode_arg(config.browser.input_focus_mode).to_owned(),
+        "--perf-log-enabled".to_owned(),
+        bool_flag(config.perf_log_enabled).to_owned(),
         "--connect-only".to_owned(),
         bool_flag(config.browser.connect_only).to_owned(),
         "--player-selector".to_owned(),
@@ -319,6 +329,30 @@ fn selector_arg_name(value: crate::config::PlayerSelectorConfig) -> &'static str
         crate::config::PlayerSelectorConfig::Right => "right",
         crate::config::PlayerSelectorConfig::Nickname => "nickname",
         crate::config::PlayerSelectorConfig::UserId => "user_id",
+    }
+}
+
+fn debugger_probe_mode_arg(value: crate::config::DebuggerProbeMode) -> &'static str {
+    match value {
+        crate::config::DebuggerProbeMode::StartupOnly => "startup_only",
+        crate::config::DebuggerProbeMode::Manual => "manual",
+        crate::config::DebuggerProbeMode::Disabled => "disabled",
+    }
+}
+
+fn ribbon_decode_mode_arg(value: crate::config::RibbonDecodeMode) -> &'static str {
+    match value {
+        crate::config::RibbonDecodeMode::UntilSeed => "until_seed",
+        crate::config::RibbonDecodeMode::AlwaysDebug => "always_debug",
+        crate::config::RibbonDecodeMode::Off => "off",
+    }
+}
+
+fn input_focus_mode_arg(value: crate::config::InputFocusMode) -> &'static str {
+    match value {
+        crate::config::InputFocusMode::PerPlan => "per_plan",
+        crate::config::InputFocusMode::PerHarddrop => "per_harddrop",
+        crate::config::InputFocusMode::PerAction => "per_action",
     }
 }
 

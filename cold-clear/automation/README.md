@@ -8,16 +8,13 @@ This crate turns the Cold Clear planner into a Browser CDP driven TETR.IO automa
 - Browser mode avoids color recognition errors and many Windows foreground `SendInput` issues.
 - Use only in private/solo/custom practice, not public matchmaking.
 
-Jstris extension bots avoid OS focus by dispatching DOM KeyboardEvents, but TETR.IO desktop cannot rely on that; use conservative SendInput timing instead. In browser mode this project now prefers conservative CDP key dispatch with the same timing philosophy.
-
 ## What It Does
 
 - reads TETR.IO state from a Chromium tab through CDP
 - writes the live state into `automation/live-snapshot.json` as internal transport
 - rebuilds a `libtetris::Board` from that snapshot
 - asks Cold Clear for a move
-- executes a `ZeroG Safe` route by default so spins remain available
-- falls back to `Hard Drop Only` only when no safe executable route exists
+- uses a stability-first preset by default
 
 ## Runner
 
@@ -47,81 +44,70 @@ Running without arguments opens the launcher.
 - choose `Browser CDP Direct`, `WebSocket Seed`, or `File`
 - set snapshot path, Chrome path, CDP port, URL, and target hint
 - choose `Player` selector plus optional nickname / user id when using VS rooms
-- toggle page probing, ribbon websocket capture, and seed simulation fallback
-- tune dry-run, target PPS, tap timings, and planner limits
-- `Target PPS` changes apply immediately while a session is running
-- start or stop the bot session
+- tune `Browser state poll ms`, `Debugger probe mode`, `Ribbon decode mode`, `Input focus mode`, planner limits, and `Perf log`
+- use `Stable`, `Fast but risky`, or `Benchmark`
+- `Capture game object` manually triggers the debugger probe once
 
-## TETR.IO Safe preset
+## Stable Preset
 
-The built-in presets now target a faster Browser CDP setup for personal practice.
+The default preset now favors stability over raw throughput.
 
-- `Snapshot transport`: internal `live-snapshot.json`
 - `Snapshot provider`: `Browser CDP Direct`
 - `Input backend`: `Browser CDP`
-- `URL`: `https://tetr.io/`
-- `CDP Port`: `9222`
-- `Target`: `TETR.IO`
 - `Movement`: `ZeroG Safe`
 - `Spawn`: `Row 19 or 20`
+- `Target PPS`: `1.2`
+- `Runner poll`: `20ms`
+- `Browser state poll`: `40ms`
+- `Browser min state poll`: `16ms`
+- `Min Snapshot Age`: `30ms`
+- `Planner threads`: `1`
+- `Planner min nodes`: `0`
+- `Planner max nodes`: `100000`
+- `Debugger probe mode`: `startup_only`
+- `Ribbon decode mode`: `until_seed`
+- `Use ribbon websocket`: `Off`
+- `Use seed simulation fallback`: `Off`
+- `Input focus mode`: `per_plan`
+- `Move Delay`: `20ms`
+- `Rotate Delay`: `30ms`
+- `HardDrop Delay`: `40ms`
+- `Piece Delay`: `60ms`
+- `ZeroG Complete` remains available as `Advanced/Experimental`
+- `Hard Drop Only` remains available as an emergency fallback
+
+## Fast But Risky
+
+- `Runner poll`: `16ms`
+- `Browser state poll`: `16ms`
+- `Planner threads`: `2`
+- `Planner max nodes`: `200000`
+
+## Benchmark
+
+- `Runner poll`: `2ms`
 - `Planner threads`: `4`
-- `Planner min nodes`: `4000`
 - `Planner max nodes`: `400000`
-- `Target PPS`: `0.0` (`0 = unlimited`)
-- `Poll`: `2ms`
-- `Move Tap`: `12ms`
-- `Rotate Tap`: `14ms`
-- `HardDrop Tap`: `16ms`
-- `Move Delay`: `0ms`
-- `Rotate Delay`: `0ms`
-- `HardDrop Delay`: `0ms`
-- `Piece Delay`: `0ms`
-- `Min Snapshot Age`: `0ms`
-- `IRS/IHS`: `Off`
-- `Speculate`: `Off`
-- `Allow spin routes`: `On`
-- `Allow post-softdrop horizontal`: `Off`
-- `Release after each action`: `Off`
-- `Action settle`: `0ms`
 
-If you need a simpler emergency path, switch `Movement` to `Hard Drop Only`.
-
-`ZeroG Complete` is still available, but it should be treated as `Advanced/Experimental`.
+`Poll 2ms` is for debug / benchmark use only and should not be your default.
 
 ## Speed Notes
 
-If the bot still feels capped around low PPS, planner cost is one of the main bottlenecks. This preset now keeps the stronger planner defaults instead of aggressively cutting search quality.
-
-- lower `Planner min nodes` and `Planner max nodes` first
-- keep `Target PPS` at `0` while testing raw speed
-- keep `Use hold` on for strength, but turn it off temporarily if you only want a speed ceiling test
-- watch the log line with `planner=... elapsed_ms=...`
+- If the TETR.IO screen freezes every 2 seconds, check whether the debugger probe is repeating.
+- Do not leave debugger breakpoint probing enabled during live play.
+- Browser CDP `Runtime.evaluate` usually only needs to run every `30-60ms`.
+- `Poll 2ms` is for debug / benchmark use only, not a recommended default.
+- When performance is bad, start testing from `threads=1` and `max_nodes=100000`.
 
 ## Browser CDP Mode
 
-Browser CDP mode attaches to Chromium launched with `--remote-debugging-port=9222`, or connects to an already running browser on that port.
-
 - `Probe page state`: reads the live board/current/hold/queue directly from the page when possible
-- `Use ribbon websocket`: captures ribbon metadata such as seed/options when available
-- `Use seed simulation fallback`: reconstructs queue state when direct page data is incomplete
+- `Debugger probe mode=startup_only`: allows the heavy `Debugger` probe only until the game object is first captured
+- `Debugger probe mode=manual`: only the launcher button or one-off CLI probe can run it
+- `Debugger probe mode=disabled`: never uses the debugger probe
+- `Ribbon decode mode=until_seed`: decode only received ribbon frames until the seed is found
 
-The runtime will not input while `playing=false` or `countdown=true`, and it skips duplicate `pieceCounter` values.
-
-## WebSocket Seed
-
-`WebSocket Seed` is the first VS room experimental provider.
-
-- it listens to TETR.IO websocket frames over CDP
-- it decodes msgpack payloads and searches for `seed`, `bagtype`, `nextcount`, and board size
-- it reproduces the 7-bag queue from `seed` and writes `automation/live-snapshot.json`
-- launcher status shows `seed captured`, `bagtype`, and `pieceIndex`
-
-Current phase-1 limitations:
-
-- no board feedback updates
-- no garbage / incoming reconstruction
-- no hold progression or piece index advancement after the initial snapshot
-- use it only to verify VS room seed/options capture and initial `current` / `queue`
+The runtime will not input while `playing=false` or `countdown=true`, and it skips duplicate tokens.
 
 ## VS Room
 
@@ -142,24 +128,3 @@ Browser CDP VS room settings:
 - `player_selector=auto` first prefers `isLocal`/`local` style flags, then user id, then nickname, then the first alive candidate with a current piece
 - `player_selector=left` or `right` forces index `0` or `1` among valid player candidates
 - `player_selector=nickname` and `user_id` only select exact matches
-
-WebSocket Seed example:
-
-```json
-{
-  "snapshot_provider": "websocket_seed",
-  "browser": {
-    "cdp_port": 9222,
-    "url": "https://tetr.io/",
-    "target_hint": "TETR.IO",
-    "connect_only": false
-  }
-}
-```
-
-If VS room state detection fails, check these in order:
-
-1. `automation/live-snapshot.json` for `ok`, `current`, `queue`, and `token`
-2. `automation/debug/tetrio-state-dump.json` for the saved state shape summary
-3. launcher or terminal logs for `[browser] candidates`, `selectedPath`, and `reject reason`
-4. input helper logs for `[input:cdp] focus ...` and dispatch lines

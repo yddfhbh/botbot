@@ -21,8 +21,23 @@ use crate::driver::{
     ExecutionTimings, GameAction, InputBackend,
 };
 use crate::scanner::{
-    read_snapshot_file, GameSnapshot, PieceToken, RotationToken, SnapshotScanner,
+    read_snapshot_file, GameSnapshot, PieceToken, RotationToken, SnapshotPollMetrics,
+    SnapshotScanner,
 };
+
+const PERF_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct RunnerPerfTracker {
+    snapshot_read_samples: Vec<u128>,
+    planner_samples: Vec<u128>,
+    input_samples: Vec<u128>,
+    total_samples: Vec<u128>,
+    processed_snapshots: u64,
+    duplicate_skips: u64,
+    same_token_skips: u64,
+    last_flush_at: Option<Instant>,
+}
 
 #[allow(dead_code)]
 pub fn run_loop<S: SnapshotScanner, D: InputBackend + ?Sized>(
@@ -74,8 +89,13 @@ where
         hard_drop_interval: Duration::from_millis(config.hard_drop_interval_ms),
     };
     let mut buffered_snapshot = None;
+    let mut perf = RunnerPerfTracker {
+        last_flush_at: Some(Instant::now()),
+        ..RunnerPerfTracker::default()
+    };
 
     loop {
+        let loop_started_at = Instant::now();
         if stop.load(AtomicOrdering::Relaxed) {
             return Ok(());
         }
@@ -84,6 +104,9 @@ where
         } else {
             scanner.next_snapshot()?
         };
+        let poll_metrics = scanner.take_last_poll_metrics();
+        record_snapshot_poll_metrics(&mut perf, &poll_metrics);
+        maybe_log_snapshot_poll_metrics(config, &poll_metrics, &mut log);
         match snapshot_option {
             Some(snapshot) => {
                 if let (Some(current), Some(previous)) =
@@ -98,12 +121,15 @@ where
                         "[automation] source={} token={} skip because {}",
                         snapshot.source, snapshot.token, reason
                     ));
+                    record_total_cycle(&mut perf, loop_started_at.elapsed());
+                    maybe_flush_perf(config, &mut perf, &mut log);
                     thread::sleep(poll_delay);
                     continue;
                 }
                 match prepare_execution(config, &snapshot, &mut log)? {
                     Some(prepared) => {
                         emit_move_logs(config, &snapshot, &prepared, &mut log);
+                        let input_started_at = Instant::now();
                         execute_plan_until_hard_drop(
                             driver,
                             &prepared.execution_plan,
@@ -149,11 +175,43 @@ where
                                     }
                                 }
                                 HardDropDecision::Retry(retry_snapshot) => {
+                                    let input_elapsed_ms = input_started_at.elapsed().as_millis();
+                                    record_execution_perf(
+                                        &mut perf,
+                                        prepared.planner_elapsed_ms,
+                                        input_elapsed_ms,
+                                        loop_started_at.elapsed().as_millis(),
+                                    );
+                                    maybe_log_execution_perf(
+                                        config,
+                                        &mut log,
+                                        poll_metrics.read_ms + poll_metrics.parse_ms,
+                                        prepared.planner_elapsed_ms,
+                                        input_elapsed_ms,
+                                        loop_started_at.elapsed().as_millis(),
+                                    );
+                                    maybe_flush_perf(config, &mut perf, &mut log);
                                     buffered_snapshot = Some(retry_snapshot);
                                     thread::sleep(poll_delay);
                                     continue;
                                 }
                             }
+
+                            let input_elapsed_ms = input_started_at.elapsed().as_millis();
+                            record_execution_perf(
+                                &mut perf,
+                                prepared.planner_elapsed_ms,
+                                input_elapsed_ms,
+                                loop_started_at.elapsed().as_millis(),
+                            );
+                            maybe_log_execution_perf(
+                                config,
+                                &mut log,
+                                poll_metrics.read_ms + poll_metrics.parse_ms,
+                                prepared.planner_elapsed_ms,
+                                input_elapsed_ms,
+                                loop_started_at.elapsed().as_millis(),
+                            );
 
                             buffered_snapshot = wait_for_next_piece_snapshot(
                                 scanner,
@@ -163,17 +221,39 @@ where
                                 piece_interval,
                                 &mut log,
                             )?;
+                            maybe_flush_perf(config, &mut perf, &mut log);
                             if buffered_snapshot.is_none() && stop.load(AtomicOrdering::Relaxed) {
                                 return Ok(());
                             }
+                        } else {
+                            let input_elapsed_ms = input_started_at.elapsed().as_millis();
+                            record_execution_perf(
+                                &mut perf,
+                                prepared.planner_elapsed_ms,
+                                input_elapsed_ms,
+                                loop_started_at.elapsed().as_millis(),
+                            );
+                            maybe_log_execution_perf(
+                                config,
+                                &mut log,
+                                poll_metrics.read_ms + poll_metrics.parse_ms,
+                                prepared.planner_elapsed_ms,
+                                input_elapsed_ms,
+                                loop_started_at.elapsed().as_millis(),
+                            );
+                            maybe_flush_perf(config, &mut perf, &mut log);
                         }
                     }
                     None => {
+                        record_total_cycle(&mut perf, loop_started_at.elapsed());
+                        maybe_flush_perf(config, &mut perf, &mut log);
                         thread::sleep(poll_delay);
                     }
                 }
             }
             None => {
+                record_total_cycle(&mut perf, loop_started_at.elapsed());
+                maybe_flush_perf(config, &mut perf, &mut log);
                 thread::sleep(poll_delay);
             }
         }
@@ -451,6 +531,129 @@ fn sleep_with_stop(stop: &AtomicBool, duration: Duration) -> bool {
         }
         thread::sleep(step.min(deadline.saturating_duration_since(now)));
     }
+}
+
+fn record_snapshot_poll_metrics(perf: &mut RunnerPerfTracker, metrics: &SnapshotPollMetrics) {
+    perf.snapshot_read_samples
+        .push(metrics.read_ms + metrics.parse_ms);
+    if metrics.skipped_same_token {
+        perf.same_token_skips += 1;
+    }
+    if metrics.skipped_same_mtime {
+        perf.duplicate_skips += 1;
+    }
+}
+
+fn record_execution_perf(
+    perf: &mut RunnerPerfTracker,
+    planner_ms: u128,
+    input_ms: u128,
+    total_ms: u128,
+) {
+    perf.planner_samples.push(planner_ms);
+    perf.input_samples.push(input_ms);
+    perf.total_samples.push(total_ms);
+    perf.processed_snapshots += 1;
+}
+
+fn record_total_cycle(perf: &mut RunnerPerfTracker, total: Duration) {
+    perf.total_samples.push(total.as_millis());
+}
+
+fn maybe_log_snapshot_poll_metrics<F>(
+    config: &AutomationConfig,
+    metrics: &SnapshotPollMetrics,
+    log: &mut F,
+) where
+    F: FnMut(String),
+{
+    if !config.perf_log_enabled {
+        return;
+    }
+    if metrics.read_ms == 0
+        && metrics.parse_ms == 0
+        && !metrics.skipped_same_token
+        && !metrics.skipped_same_mtime
+    {
+        return;
+    }
+    log(format!(
+        "[perf][runner] snapshot_read_ms={} snapshot_parse_ms={} skipped_same_token={} skipped_same_mtime={}",
+        metrics.read_ms,
+        metrics.parse_ms,
+        metrics.skipped_same_token,
+        metrics.skipped_same_mtime
+    ));
+}
+
+fn maybe_log_execution_perf<F>(
+    config: &AutomationConfig,
+    log: &mut F,
+    snapshot_read_ms: u128,
+    planner_ms: u128,
+    input_ms: u128,
+    total_ms: u128,
+) where
+    F: FnMut(String),
+{
+    if !config.perf_log_enabled {
+        return;
+    }
+    log(format!(
+        "[perf][runner] snapshot_read_ms={} planner_ms={} input_ms={} total_ms={}",
+        snapshot_read_ms, planner_ms, input_ms, total_ms
+    ));
+}
+
+fn maybe_flush_perf<F>(config: &AutomationConfig, perf: &mut RunnerPerfTracker, log: &mut F)
+where
+    F: FnMut(String),
+{
+    if !config.perf_log_enabled {
+        return;
+    }
+    let Some(last_flush_at) = perf.last_flush_at else {
+        perf.last_flush_at = Some(Instant::now());
+        return;
+    };
+    if last_flush_at.elapsed() < PERF_LOG_INTERVAL {
+        return;
+    }
+    log(format!(
+        "[perf] planner_avg={}ms planner_p95={}ms input_avg={}ms input_p95={}ms snapshots_processed={} duplicate_skips={}",
+        average_u128(&perf.planner_samples),
+        percentile_u128(&perf.planner_samples, 95),
+        average_u128(&perf.input_samples),
+        percentile_u128(&perf.input_samples, 95),
+        perf.processed_snapshots,
+        perf.duplicate_skips + perf.same_token_skips,
+    ));
+    perf.snapshot_read_samples.clear();
+    perf.planner_samples.clear();
+    perf.input_samples.clear();
+    perf.total_samples.clear();
+    perf.processed_snapshots = 0;
+    perf.duplicate_skips = 0;
+    perf.same_token_skips = 0;
+    perf.last_flush_at = Some(Instant::now());
+}
+
+fn average_u128(values: &[u128]) -> u128 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.iter().sum::<u128>() / values.len() as u128
+}
+
+fn percentile_u128(values: &[u128], percentile: usize) -> u128 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let index = (((percentile as f64) / 100.0) * (sorted.len() as f64)).ceil() as usize;
+    let bounded = index.saturating_sub(1).min(sorted.len() - 1);
+    sorted[bounded]
 }
 
 #[derive(Clone, Debug)]
@@ -1672,5 +1875,28 @@ mod tests {
             pps_wait_duration(Some(Duration::from_millis(500)), Duration::from_millis(750)),
             None
         );
+    }
+
+    #[test]
+    fn runner_perf_counters_accumulate_snapshot_and_execution_metrics() {
+        let mut perf = RunnerPerfTracker::default();
+        record_snapshot_poll_metrics(
+            &mut perf,
+            &SnapshotPollMetrics {
+                read_ms: 3,
+                parse_ms: 2,
+                skipped_same_token: true,
+                skipped_same_mtime: true,
+            },
+        );
+        record_execution_perf(&mut perf, 25, 11, 40);
+
+        assert_eq!(perf.snapshot_read_samples, vec![5]);
+        assert_eq!(perf.planner_samples, vec![25]);
+        assert_eq!(perf.input_samples, vec![11]);
+        assert_eq!(perf.total_samples, vec![40]);
+        assert_eq!(perf.processed_snapshots, 1);
+        assert_eq!(perf.same_token_skips, 1);
+        assert_eq!(perf.duplicate_skips, 1);
     }
 }

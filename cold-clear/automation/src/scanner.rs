@@ -2,7 +2,7 @@ use std::convert::TryInto;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use libtetris::{Piece, RotationState};
@@ -87,6 +87,18 @@ pub trait SnapshotScanner {
     fn next_snapshot(&mut self) -> Result<Option<GameSnapshot>>;
 
     fn arm_piece_transition(&mut self, _: &GameSnapshot) {}
+
+    fn take_last_poll_metrics(&mut self) -> SnapshotPollMetrics {
+        SnapshotPollMetrics::default()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotPollMetrics {
+    pub read_ms: u128,
+    pub parse_ms: u128,
+    pub skipped_same_token: bool,
+    pub skipped_same_mtime: bool,
 }
 
 pub struct JsonFileScanner {
@@ -97,12 +109,20 @@ pub struct JsonFileScanner {
     piece_transition_guard: Option<PieceTransitionGuard>,
     pending_token: Option<String>,
     pending_seen_count: u32,
+    cached_snapshot: Option<CachedSnapshot>,
+    last_poll_metrics: SnapshotPollMetrics,
 }
 
 #[derive(Clone, Debug)]
 struct PieceTransitionGuard {
     queue: Vec<PieceToken>,
     piece_counter: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedSnapshot {
+    modified_at: SystemTime,
+    snapshot: GameSnapshot,
 }
 
 impl JsonFileScanner {
@@ -115,6 +135,8 @@ impl JsonFileScanner {
             piece_transition_guard: None,
             pending_token: None,
             pending_seen_count: 0,
+            cached_snapshot: None,
+            last_poll_metrics: SnapshotPollMetrics::default(),
         }
     }
 }
@@ -128,11 +150,13 @@ impl SnapshotScanner for JsonFileScanner {
     }
 
     fn next_snapshot(&mut self) -> Result<Option<GameSnapshot>> {
-        let raw = match fs::read_to_string(&self.path) {
-            Ok(raw) => {
-                self.waiting_for_file_logged = false;
-                raw
-            }
+        self.last_poll_metrics = SnapshotPollMetrics::default();
+
+        let modified_at = match fs::metadata(&self.path) {
+            Ok(metadata) => match metadata.modified() {
+                Ok(modified_at) => modified_at,
+                Err(_) => SystemTime::UNIX_EPOCH,
+            },
             Err(err) if is_retryable_snapshot_io_error(&err) => {
                 if !self.waiting_for_file_logged {
                     println!(
@@ -145,42 +169,91 @@ impl SnapshotScanner for JsonFileScanner {
             }
             Err(err) => {
                 return Err(err).with_context(|| {
-                    format!("failed to read snapshot JSON from {}", self.path.display())
+                    format!(
+                        "failed to read snapshot metadata from {}",
+                        self.path.display()
+                    )
                 });
             }
         };
-        if raw.trim().is_empty() {
-            return Ok(None);
-        }
-        let modified_at = if self.min_snapshot_age.is_zero() {
-            None
+
+        let snapshot = if let Some(cached) = &self.cached_snapshot {
+            if cached.modified_at == modified_at {
+                self.last_poll_metrics.skipped_same_mtime = true;
+                cached.snapshot.clone()
+            } else {
+                let read_started_at = Instant::now();
+                let raw = match fs::read_to_string(&self.path) {
+                    Ok(raw) => {
+                        self.waiting_for_file_logged = false;
+                        raw
+                    }
+                    Err(err) if is_retryable_snapshot_io_error(&err) => {
+                        return Ok(None);
+                    }
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!("failed to read snapshot JSON from {}", self.path.display())
+                        });
+                    }
+                };
+                self.last_poll_metrics.read_ms = read_started_at.elapsed().as_millis();
+                if raw.trim().is_empty() {
+                    return Ok(None);
+                }
+                let parse_started_at = Instant::now();
+                let parsed = match parse_snapshot_json(&raw) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) if is_retryable_snapshot_parse_error(&raw, &err) => {
+                        return Ok(None);
+                    }
+                    Err(err) => return Err(err).context("failed to parse snapshot JSON"),
+                };
+                self.last_poll_metrics.parse_ms = parse_started_at.elapsed().as_millis();
+                self.cached_snapshot = Some(CachedSnapshot {
+                    modified_at,
+                    snapshot: parsed.clone(),
+                });
+                parsed
+            }
         } else {
-            match fs::metadata(&self.path) {
-                Ok(metadata) => match metadata.modified() {
-                    Ok(modified_at) => Some(modified_at),
-                    Err(_) => None,
-                },
+            let read_started_at = Instant::now();
+            let raw = match fs::read_to_string(&self.path) {
+                Ok(raw) => {
+                    self.waiting_for_file_logged = false;
+                    raw
+                }
                 Err(err) if is_retryable_snapshot_io_error(&err) => {
                     return Ok(None);
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
-                        format!(
-                            "failed to read snapshot metadata from {}",
-                            self.path.display()
-                        )
+                        format!("failed to read snapshot JSON from {}", self.path.display())
                     });
                 }
-            }
-        };
-        let snapshot = match parse_snapshot_json(&raw) {
-            Ok(snapshot) => snapshot,
-            Err(err) if is_retryable_snapshot_parse_error(&raw, &err) => {
+            };
+            self.last_poll_metrics.read_ms = read_started_at.elapsed().as_millis();
+            if raw.trim().is_empty() {
                 return Ok(None);
             }
-            Err(err) => return Err(err).context("failed to parse snapshot JSON"),
+            let parse_started_at = Instant::now();
+            let parsed = match parse_snapshot_json(&raw) {
+                Ok(snapshot) => snapshot,
+                Err(err) if is_retryable_snapshot_parse_error(&raw, &err) => {
+                    return Ok(None);
+                }
+                Err(err) => return Err(err).context("failed to parse snapshot JSON"),
+            };
+            self.last_poll_metrics.parse_ms = parse_started_at.elapsed().as_millis();
+            self.cached_snapshot = Some(CachedSnapshot {
+                modified_at,
+                snapshot: parsed.clone(),
+            });
+            parsed
         };
+
         if self.last_token.as_deref() == Some(snapshot.token.as_str()) {
+            self.last_poll_metrics.skipped_same_token = true;
             return Ok(None);
         }
         let is_same_pending = self.pending_token.as_deref() == Some(snapshot.token.as_str());
@@ -191,7 +264,7 @@ impl SnapshotScanner for JsonFileScanner {
             self.pending_seen_count = 1;
         }
 
-        let age_ready = modified_at
+        let age_ready = Some(modified_at)
             .and_then(|timestamp| timestamp.elapsed().ok())
             .map(|age| age >= self.min_snapshot_age)
             .unwrap_or(true);
@@ -212,6 +285,10 @@ impl SnapshotScanner for JsonFileScanner {
         self.pending_token = None;
         self.pending_seen_count = 0;
         Ok(Some(snapshot))
+    }
+
+    fn take_last_poll_metrics(&mut self) -> SnapshotPollMetrics {
+        std::mem::take(&mut self.last_poll_metrics)
     }
 }
 
@@ -307,6 +384,7 @@ impl From<PieceToken> for Piece {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     #[test]
     fn queue_transition_requires_queue_change() {
@@ -399,5 +477,43 @@ mod tests {
         assert!(!is_retryable_snapshot_io_error(&std::io::Error::from(
             ErrorKind::InvalidData
         )));
+    }
+
+    #[test]
+    fn same_token_snapshot_is_skipped_without_re_emitting() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let snapshot_path = temp_dir.path().join("live-snapshot.json");
+        fs::write(
+            &snapshot_path,
+            r#"{"ok":true,"source":"browser_cdp","field":[[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false]],"current":"T","hold":"I","queue":["J","L","O"],"token":"browser-123"}"#,
+        )
+        .unwrap();
+
+        let mut scanner = JsonFileScanner::new(snapshot_path, Duration::ZERO);
+        assert!(scanner.next_snapshot().unwrap().is_some());
+        assert!(scanner.next_snapshot().unwrap().is_none());
+        let metrics = scanner.take_last_poll_metrics();
+        assert!(metrics.skipped_same_token);
+        assert!(metrics.skipped_same_mtime);
+    }
+
+    #[test]
+    fn unchanged_mtime_reuses_cached_snapshot_without_reparse() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let snapshot_path = temp_dir.path().join("live-snapshot.json");
+        fs::write(
+            &snapshot_path,
+            r#"{"ok":true,"source":"browser_cdp","field":[[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false]],"current":"T","hold":"I","queue":["J","L","O"],"token":"browser-123"}"#,
+        )
+        .unwrap();
+
+        let mut scanner = JsonFileScanner::new(snapshot_path.clone(), Duration::from_millis(200));
+        assert!(scanner.next_snapshot().unwrap().is_none());
+        thread::sleep(Duration::from_millis(250));
+        assert!(scanner.next_snapshot().unwrap().is_some());
+        let metrics = scanner.take_last_poll_metrics();
+        assert!(metrics.skipped_same_mtime);
+        assert_eq!(metrics.read_ms, 0);
+        assert_eq!(metrics.parse_ms, 0);
     }
 }
