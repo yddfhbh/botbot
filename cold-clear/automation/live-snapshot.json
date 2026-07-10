@@ -3,27 +3,27 @@
   "source": "browser_cdp",
   "field": [
     [
-      false,
-      false,
-      false,
-      false,
-      false,
-      false,
-      false,
       true,
       true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
       false
     ],
     [
-      false,
-      false,
-      false,
-      false,
-      false,
-      false,
+      true,
       false,
       true,
       true,
+      false,
+      false,
+      false,
+      false,
+      false,
       false
     ],
     [
@@ -483,29 +483,29 @@
       false
     ]
   ],
-  "current": "S",
-  "hold": "Z",
+  "current": "T",
+  "hold": "O",
   "queue": [
+    "I",
     "S",
-    "O",
-    "L",
     "J",
+    "L",
+    "O",
+    "O",
     "T",
     "Z",
-    "I",
-    "S",
     "L",
     "I",
-    "J",
-    "Z"
+    "S",
+    "J"
   ],
   "b2b": false,
   "combo": 0,
   "incoming": 0,
-  "pieceCounter": 1,
-  "token": "browser-1",
+  "pieceCounter": 2,
+  "token": "browser-2",
   "playing": true,
   "countdown": false,
   "activeX": 4,
-  "activeY": 18
+  "activeY": 17
 }

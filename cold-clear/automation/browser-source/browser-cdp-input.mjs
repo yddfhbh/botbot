@@ -73,7 +73,6 @@ async function main() {
           return;
         }
         cdp = await ensureConnected(cdp, { port, url, targetHint });
-        await focusPage(cdp);
         await dispatchWithReconnect(cdp, spec, "keyDown", { port, url, targetHint }, (nextCdp) => {
           cdp = nextCdp;
         });

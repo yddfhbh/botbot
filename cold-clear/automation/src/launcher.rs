@@ -79,13 +79,13 @@ impl Default for LauncherState {
             poll_interval_ms: 4,
             target_pps: 0.0,
             tap_duration_ms: 60,
-            movement_tap_duration_ms: 25,
-            rotate_tap_duration_ms: 28,
-            hold_tap_duration_ms: 35,
-            hard_drop_tap_duration_ms: 30,
-            soft_drop_tap_duration_ms: 25,
+            movement_tap_duration_ms: 16,
+            rotate_tap_duration_ms: 18,
+            hold_tap_duration_ms: 20,
+            hard_drop_tap_duration_ms: 20,
+            soft_drop_tap_duration_ms: 16,
             movement_interval_ms: 0,
-            rotation_interval_ms: 8,
+            rotation_interval_ms: 0,
             piece_interval_ms: 0,
             hard_drop_interval_ms: 0,
             min_snapshot_age_ms: 0,
@@ -117,13 +117,13 @@ impl LauncherState {
         self.target_pps = 0.0;
         self.tap_duration_ms = 60;
         self.poll_interval_ms = 4;
-        self.movement_tap_duration_ms = 25;
-        self.rotate_tap_duration_ms = 28;
-        self.hold_tap_duration_ms = 35;
-        self.hard_drop_tap_duration_ms = 30;
-        self.soft_drop_tap_duration_ms = 25;
+        self.movement_tap_duration_ms = 16;
+        self.rotate_tap_duration_ms = 18;
+        self.hold_tap_duration_ms = 20;
+        self.hard_drop_tap_duration_ms = 20;
+        self.soft_drop_tap_duration_ms = 16;
         self.movement_interval_ms = 0;
-        self.rotation_interval_ms = 8;
+        self.rotation_interval_ms = 0;
         self.piece_interval_ms = 0;
         self.hard_drop_interval_ms = 0;
         self.min_snapshot_age_ms = 0;
@@ -139,7 +139,7 @@ impl LauncherState {
         self.handling.soft_drop_mode = SoftDropModeConfig::Infinite;
         self.handling.allow_post_softdrop_actions = true;
         self.handling.allow_post_softdrop_horizontal = false;
-        self.handling.release_after_each_action = true;
+        self.handling.release_after_each_action = false;
         self.handling.action_settle_ms = 0;
         self.handling.prevent_accidental_hard_drops = true;
         self.handling.cancel_das_on_direction_change = true;
@@ -181,7 +181,9 @@ impl LauncherState {
 
     fn matches_known_legacy_safe_preset(&self) -> bool {
         self.target_pps == 0.0
-            && (self.matches_first_safe_preset_family() || self.matches_second_safe_preset_family())
+            && (self.matches_first_safe_preset_family()
+                || self.matches_second_safe_preset_family()
+                || self.matches_third_safe_preset_family())
     }
 
     fn matches_first_safe_preset_family(&self) -> bool {
@@ -212,6 +214,22 @@ impl LauncherState {
             && self.hard_drop_interval_ms == 35
             && self.min_snapshot_age_ms == 8
             && self.handling.action_settle_ms == 8
+    }
+
+    fn matches_third_safe_preset_family(&self) -> bool {
+        self.poll_interval_ms == 4
+            && self.movement_tap_duration_ms == 25
+            && self.rotate_tap_duration_ms == 28
+            && self.hold_tap_duration_ms == 35
+            && self.hard_drop_tap_duration_ms == 30
+            && self.soft_drop_tap_duration_ms == 25
+            && self.movement_interval_ms == 0
+            && self.rotation_interval_ms == 8
+            && self.piece_interval_ms == 0
+            && self.hard_drop_interval_ms == 0
+            && self.min_snapshot_age_ms == 0
+            && self.handling.action_settle_ms == 0
+            && self.handling.release_after_each_action
     }
 
     fn to_automation_config(&self, paths: &AppPaths) -> AutomationConfig {
@@ -706,13 +724,13 @@ mod tests {
         assert_eq!(state.target_pps, 0.0);
         assert_eq!(state.tap_duration_ms, 60);
         assert_eq!(state.poll_interval_ms, 4);
-        assert_eq!(state.movement_tap_duration_ms, 25);
-        assert_eq!(state.rotate_tap_duration_ms, 28);
-        assert_eq!(state.hold_tap_duration_ms, 35);
-        assert_eq!(state.hard_drop_tap_duration_ms, 30);
-        assert_eq!(state.soft_drop_tap_duration_ms, 25);
+        assert_eq!(state.movement_tap_duration_ms, 16);
+        assert_eq!(state.rotate_tap_duration_ms, 18);
+        assert_eq!(state.hold_tap_duration_ms, 20);
+        assert_eq!(state.hard_drop_tap_duration_ms, 20);
+        assert_eq!(state.soft_drop_tap_duration_ms, 16);
         assert_eq!(state.movement_interval_ms, 0);
-        assert_eq!(state.rotation_interval_ms, 8);
+        assert_eq!(state.rotation_interval_ms, 0);
         assert_eq!(state.piece_interval_ms, 0);
         assert_eq!(state.hard_drop_interval_ms, 0);
         assert_eq!(state.min_snapshot_age_ms, 0);
@@ -720,7 +738,7 @@ mod tests {
         assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
         assert!(state.handling.allow_post_softdrop_actions);
         assert!(!state.handling.allow_post_softdrop_horizontal);
-        assert!(state.handling.release_after_each_action);
+        assert!(!state.handling.release_after_each_action);
         assert_eq!(state.handling.action_settle_ms, 0);
         assert_eq!(state.handling.irs_mode, BufferModeConfig::Off);
         assert_eq!(state.handling.ihs_mode, BufferModeConfig::Off);
@@ -741,20 +759,21 @@ mod tests {
         let mut state = LauncherState {
             preset: ModePreset::Solo1080p,
             dry_run: false,
-            poll_interval_ms: 16,
+            poll_interval_ms: 4,
             target_pps: 0.0,
-            movement_tap_duration_ms: 40,
-            rotate_tap_duration_ms: 45,
-            hold_tap_duration_ms: 55,
-            hard_drop_tap_duration_ms: 55,
-            soft_drop_tap_duration_ms: 40,
-            movement_interval_ms: 18,
-            rotation_interval_ms: 45,
-            piece_interval_ms: 20,
-            hard_drop_interval_ms: 35,
-            min_snapshot_age_ms: 8,
+            movement_tap_duration_ms: 25,
+            rotate_tap_duration_ms: 28,
+            hold_tap_duration_ms: 35,
+            hard_drop_tap_duration_ms: 30,
+            soft_drop_tap_duration_ms: 25,
+            movement_interval_ms: 0,
+            rotation_interval_ms: 8,
+            piece_interval_ms: 0,
+            hard_drop_interval_ms: 0,
+            min_snapshot_age_ms: 0,
             handling: HandlingConfig {
-                action_settle_ms: 8,
+                release_after_each_action: true,
+                action_settle_ms: 0,
                 ..HandlingConfig::default()
             },
             ..LauncherState::default()
@@ -763,15 +782,16 @@ mod tests {
         state.migrate_legacy_defaults();
 
         assert_eq!(state.poll_interval_ms, 4);
-        assert_eq!(state.movement_tap_duration_ms, 25);
-        assert_eq!(state.rotate_tap_duration_ms, 28);
-        assert_eq!(state.hold_tap_duration_ms, 35);
-        assert_eq!(state.hard_drop_tap_duration_ms, 30);
+        assert_eq!(state.movement_tap_duration_ms, 16);
+        assert_eq!(state.rotate_tap_duration_ms, 18);
+        assert_eq!(state.hold_tap_duration_ms, 20);
+        assert_eq!(state.hard_drop_tap_duration_ms, 20);
         assert_eq!(state.movement_interval_ms, 0);
-        assert_eq!(state.rotation_interval_ms, 8);
+        assert_eq!(state.rotation_interval_ms, 0);
         assert_eq!(state.piece_interval_ms, 0);
         assert_eq!(state.hard_drop_interval_ms, 0);
         assert_eq!(state.min_snapshot_age_ms, 0);
         assert_eq!(state.handling.action_settle_ms, 0);
+        assert!(!state.handling.release_after_each_action);
     }
 }

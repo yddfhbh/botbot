@@ -419,7 +419,7 @@ fn fallback_aware_duration(
 }
 
 fn clamp_movement_tap_duration(requested_duration: Duration, das_duration: Duration) -> Duration {
-    let min_duration = Duration::from_millis(25);
+    let min_duration = Duration::from_millis(12);
     let das_guard = Duration::from_millis(20);
     let das_capped = das_duration.saturating_sub(das_guard).max(min_duration);
     requested_duration.min(das_capped).max(min_duration)
@@ -901,13 +901,13 @@ mod tests {
     fn timings() -> ExecutionTimings {
         ExecutionTimings {
             tap_duration: Duration::from_millis(60),
-            movement_tap_duration: Duration::from_millis(25),
-            rotate_tap_duration: Duration::from_millis(28),
-            hold_tap_duration: Duration::from_millis(35),
-            hard_drop_tap_duration: Duration::from_millis(30),
-            soft_drop_tap_duration: Duration::from_millis(25),
+            movement_tap_duration: Duration::from_millis(16),
+            rotate_tap_duration: Duration::from_millis(18),
+            hold_tap_duration: Duration::from_millis(20),
+            hard_drop_tap_duration: Duration::from_millis(20),
+            soft_drop_tap_duration: Duration::from_millis(16),
             movement_interval: Duration::ZERO,
-            rotation_interval: Duration::from_millis(8),
+            rotation_interval: Duration::ZERO,
             piece_interval: Duration::ZERO,
             hard_drop_interval: Duration::ZERO,
         }
@@ -916,6 +916,7 @@ mod tests {
     fn handling_for_tests() -> HandlingConfig {
         HandlingConfig {
             action_settle_ms: 0,
+            release_after_each_action: true,
             ..HandlingConfig::default()
         }
     }
@@ -943,16 +944,16 @@ mod tests {
             &*backend.events.borrow(),
             &[
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::Hold, Duration::from_millis(35)),
+                RecordedEvent::Tap(GameAction::Hold, Duration::from_millis(20)),
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::RotateCw, Duration::from_millis(28)),
+                RecordedEvent::Tap(GameAction::RotateCw, Duration::from_millis(18)),
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::Left, Duration::from_millis(25)),
+                RecordedEvent::Tap(GameAction::Left, Duration::from_millis(16)),
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::SoftDrop, Duration::from_millis(25)),
+                RecordedEvent::Tap(GameAction::SoftDrop, Duration::from_millis(16)),
                 RecordedEvent::ReleaseAll,
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::HardDrop, Duration::from_millis(30)),
+                RecordedEvent::Tap(GameAction::HardDrop, Duration::from_millis(20)),
                 RecordedEvent::ReleaseAll,
             ]
         );
@@ -964,7 +965,7 @@ mod tests {
             .any(|line| line.contains("release_after_each_action=On action=RotateCw")));
         assert!(logs
             .iter()
-            .any(|line| line.contains("after_rotate_delay 8ms")));
+            .any(|line| line.contains("release_after_each_action=On action=RotateCw")));
     }
 
     #[test]
@@ -991,7 +992,7 @@ mod tests {
         );
         assert_eq!(
             backend.events.borrow()[backend.events.borrow().len() - 2],
-            RecordedEvent::Tap(GameAction::HardDrop, Duration::from_millis(30))
+            RecordedEvent::Tap(GameAction::HardDrop, Duration::from_millis(20))
         );
     }
 
@@ -1029,7 +1030,7 @@ mod tests {
 
         assert_eq!(
             duration_for_action(GameAction::Left, &handling, timings),
-            Duration::from_millis(25)
+            Duration::from_millis(12)
         );
     }
 
@@ -1040,23 +1041,23 @@ mod tests {
 
         assert_eq!(
             duration_for_action(GameAction::RotateCw, &handling, timings),
-            Duration::from_millis(28)
+            Duration::from_millis(18)
         );
         assert_eq!(
             duration_for_action(GameAction::RotateCcw, &handling, timings),
-            Duration::from_millis(28)
+            Duration::from_millis(18)
         );
         assert_eq!(
             duration_for_action(GameAction::Hold, &handling, timings),
-            Duration::from_millis(35)
+            Duration::from_millis(20)
         );
         assert_eq!(
             duration_for_action(GameAction::SoftDrop, &handling, timings),
-            Duration::from_millis(25)
+            Duration::from_millis(16)
         );
         assert_eq!(
             duration_for_action(GameAction::HardDrop, &handling, timings),
-            Duration::from_millis(30)
+            Duration::from_millis(20)
         );
     }
 }

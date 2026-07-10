@@ -195,7 +195,12 @@ impl SnapshotScanner for JsonFileScanner {
             .and_then(|timestamp| timestamp.elapsed().ok())
             .map(|age| age >= self.min_snapshot_age)
             .unwrap_or(true);
-        let stable_enough = self.pending_seen_count >= 2;
+        let required_stable_reads = if snapshot.source == "browser_cdp" {
+            1
+        } else {
+            2
+        };
+        let stable_enough = self.pending_seen_count >= required_stable_reads;
 
         if !age_ready || !stable_enough {
             return Ok(None);
