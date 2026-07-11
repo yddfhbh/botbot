@@ -52,6 +52,33 @@ test("manual mode never auto probes while playing", () => {
   );
 });
 
+test("startup_only allows one initial probe while already playing", () => {
+  assert.equal(
+    shouldAttemptDebuggerProbe({
+      mode: "startup_only",
+      needsProbe: true,
+      gameCaptured: false,
+      playing: true,
+      lastKnownPlaying: true,
+      now: 20_000,
+      lastAttemptAt: 0
+    }),
+    true
+  );
+  assert.equal(
+    shouldAttemptDebuggerProbe({
+      mode: "startup_only",
+      needsProbe: true,
+      gameCaptured: false,
+      playing: true,
+      lastKnownPlaying: true,
+      now: 20_000,
+      lastAttemptAt: 10_000
+    }),
+    false
+  );
+});
+
 test("ribbon until_seed stops deep decode after seed capture", () => {
   assert.equal(
     shouldDecodeRibbonFrame({

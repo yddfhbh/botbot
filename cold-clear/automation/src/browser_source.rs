@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AutomationConfig, DebuggerProbeMode, SnapshotProviderConfig};
+use crate::config::AutomationConfig;
 use crate::paths::AppPaths;
 use crate::scanner::{ActivePieceState, GameSnapshot, PieceToken, RotationToken};
 
@@ -225,13 +225,6 @@ fn build_browser_provider_args(config: &AutomationConfig, snapshot_path: &PathBu
         bool_flag(config.browser.probe_page_state).to_owned(),
         "--debugger-probe-mode".to_owned(),
         debugger_probe_mode_arg(config.browser.debugger_probe_mode).to_owned(),
-        "--manual-capture-once".to_owned(),
-        bool_flag(
-            config.snapshot_provider == SnapshotProviderConfig::BrowserCdp
-                && config.browser.probe_page_state
-                && config.browser.debugger_probe_mode != DebuggerProbeMode::Disabled,
-        )
-        .to_owned(),
         "--use-ribbon-websocket".to_owned(),
         bool_flag(config.browser.use_ribbon_websocket).to_owned(),
         "--ribbon-decode-mode".to_owned(),
@@ -378,6 +371,7 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DebuggerProbeMode, SnapshotProviderConfig};
     use std::process::Command;
 
     #[test]
@@ -440,7 +434,6 @@ mod tests {
         assert!(joined.contains("--player-user-id user-123"));
         assert!(joined.contains("--dump-state-on-fail 1"));
         assert!(joined.contains("--dump-state-path automation/debug/tetrio-state-dump.json"));
-        assert!(joined.contains("--manual-capture-once 1"));
         assert!(joined.contains("--state-poll-ms 40"));
         assert!(joined.contains("--min-state-poll-ms 16"));
     }

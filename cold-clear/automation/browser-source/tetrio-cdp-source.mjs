@@ -49,7 +49,7 @@ export function shouldAttemptDebuggerProbe({
   if (!needsProbe) return false;
   if (normalizeDebuggerProbeMode(mode) !== "startup_only") return false;
   if (gameCaptured) return false;
-  if (playing || lastKnownPlaying) return false;
+  if ((playing || lastKnownPlaying) && lastAttemptAt > 0) return false;
   const effectiveCooldownMs =
     !gameCaptured && !playing && !lastKnownPlaying
       ? Math.min(cooldownMs, UNCAPTURED_PROBE_COOLDOWN_MS)
