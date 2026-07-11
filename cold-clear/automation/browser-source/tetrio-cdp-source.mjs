@@ -701,7 +701,6 @@ async function installBackgroundInputKeepalive(cdp) {
     return window.__fusionBackgroundInputKeepalive;
   })()`;
 
-  await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source }).catch(() => undefined);
   await cdp.send("Runtime.evaluate", {
     expression: source,
     returnByValue: true,

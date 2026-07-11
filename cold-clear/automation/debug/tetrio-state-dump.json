@@ -1,18 +1,18 @@
 {
-  "href": "https://tetr.io/",
-  "pageTitle": "TETR.IO",
+  "href": "about:blank",
+  "pageTitle": "",
   "target": {
     "title": "",
     "url": "https://tetr.io/"
   },
   "lastReason": "TETR.IO game instance not captured yet",
   "pageHints": {
-    "likelyGamePage": true,
-    "pathname": "/",
+    "likelyGamePage": false,
+    "pathname": "blank",
     "hash": "",
-    "bodyClass": "socket_offline anon",
-    "canvasCount": 2,
-    "largeCanvasCount": 2
+    "bodyClass": "",
+    "canvasCount": 0,
+    "largeCanvasCount": 0
   },
   "windowKeys": [],
   "directCandidatePaths": [],
