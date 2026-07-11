@@ -1,14 +1,15 @@
 use std::fs;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
+use crate::browser_source::{ChromiumHostProcess, SharedLogger};
 use crate::config::{
     AutomationConfig, BotConfig, BrowserCdpConfig, BufferModeConfig, HandlingConfig,
     InputBackendConfig, KeyBindings, MovementModeConfig, ScannerSourceConfig,
@@ -31,6 +32,44 @@ impl ModePreset {
             ModePreset::VsLeft1080p => "2P Left 1080p",
             ModePreset::Solo1080p => "Solo 1080p",
             ModePreset::Custom => "Custom",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum BrowserStatus {
+    Closed,
+    Starting,
+    Ready,
+    Error,
+}
+
+impl BrowserStatus {
+    fn label(self) -> &'static str {
+        match self {
+            BrowserStatus::Closed => "Closed",
+            BrowserStatus::Starting => "Starting",
+            BrowserStatus::Ready => "Ready",
+            BrowserStatus::Error => "Error",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum BotStatus {
+    Off,
+    Starting,
+    On,
+    Error,
+}
+
+impl BotStatus {
+    fn label(self) -> &'static str {
+        match self {
+            BotStatus::Off => "Off",
+            BotStatus::Starting => "Starting",
+            BotStatus::On => "On",
+            BotStatus::Error => "Error",
         }
     }
 }
@@ -261,19 +300,31 @@ impl LauncherState {
             keys: self.keys.clone(),
         }
     }
+
+    fn to_bot_automation_config(&self, paths: &AppPaths) -> AutomationConfig {
+        let mut config = self.to_automation_config(paths);
+        config.browser.connect_only = true;
+        config
+    }
 }
 
 enum LauncherEvent {
-    Log(String),
-    AutomationExited(Result<(), String>),
+    BrowserLog(String),
+    BrowserExited(Result<(), String>),
+    BotLog(String),
+    BotExited(Result<(), String>),
 }
 
-struct RunningSession {
+struct BrowserSession {
+    process: ChromiumHostProcess,
+}
+
+struct BotSession {
     stop: Arc<AtomicBool>,
     automation_thread: Option<JoinHandle<()>>,
 }
 
-impl RunningSession {
+impl BotSession {
     fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.automation_thread.take() {
@@ -286,9 +337,13 @@ pub struct LauncherApp {
     paths: AppPaths,
     state: LauncherState,
     logs: Vec<String>,
-    status: String,
-    event_rx: Option<Receiver<LauncherEvent>>,
-    running: Option<RunningSession>,
+    event_tx: Sender<LauncherEvent>,
+    event_rx: Receiver<LauncherEvent>,
+    browser_session: Option<BrowserSession>,
+    bot_session: Option<BotSession>,
+    browser_status: BrowserStatus,
+    bot_status: BotStatus,
+    ignore_next_bot_exit: bool,
 }
 
 impl LauncherApp {
@@ -298,25 +353,30 @@ impl LauncherApp {
             state.apply_preset();
         }
         state.migrate_legacy_defaults();
+        let (event_tx, event_rx) = mpsc::channel();
         Self {
             paths,
             state,
             logs: vec!["Launcher ready".to_owned()],
-            status: "Idle".to_owned(),
-            event_rx: None,
-            running: None,
+            event_tx,
+            event_rx,
+            browser_session: None,
+            bot_session: None,
+            browser_status: BrowserStatus::Closed,
+            bot_status: BotStatus::Off,
+            ignore_next_bot_exit: false,
         }
+    }
+
+    fn browser_logger(&self) -> SharedLogger {
+        let tx = self.event_tx.clone();
+        Arc::new(Mutex::new(Box::new(move |line| {
+            let _ = tx.send(LauncherEvent::BrowserLog(line));
+        })))
     }
 
     fn push_log(&mut self, line: impl Into<String>) {
         let line = line.into();
-        if line.contains("[automation] idle waiting for next live game") {
-            self.status = "Waiting".to_owned();
-        } else if line.contains("[automation] live game resumed")
-            || line.contains("[automation] source=")
-        {
-            self.status = "Running".to_owned();
-        }
         self.append_log_file(&line);
         self.logs.push(line);
         if self.logs.len() > 400 {
@@ -361,37 +421,41 @@ impl LauncherApp {
         }
     }
 
-    fn start(&mut self) {
-        if self.running.is_some() {
+    fn open_browser(&mut self) {
+        if self.browser_session.is_some() {
             return;
         }
 
         self.save_state();
-        self.clear_snapshot_file();
+        self.browser_status = BrowserStatus::Starting;
+        self.push_log("[launcher] opening Chromium");
 
-        let (tx, rx) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
+        match ChromiumHostProcess::start(&self.paths, &self.state.browser, self.browser_logger()) {
+            Ok(process) => {
+                self.browser_session = Some(BrowserSession { process });
+                self.browser_status = BrowserStatus::Ready;
+                self.push_log("[launcher] browser ready");
+            }
+            Err(err) => {
+                self.browser_status = BrowserStatus::Error;
+                self.push_log(format!("[launcher] failed to open Chromium: {err:#}"));
+            }
+        }
+    }
 
-        let config = self.state.to_automation_config(&self.paths);
-        let paths = self.paths.clone();
-        let worker_stop = stop.clone();
-        let worker_tx = tx.clone();
-        let worker_log_tx = worker_tx.clone();
-        let automation_thread = thread::spawn(move || {
-            let result = run_automation(paths, config, &worker_stop, move |line| {
-                let _ = worker_log_tx.send(LauncherEvent::Log(line));
-            })
-            .map_err(|err| format!("{err:#}"));
-            let _ = worker_tx.send(LauncherEvent::AutomationExited(result));
-        });
+    fn close_browser(&mut self) {
+        if self.bot_session.is_some() {
+            self.stop_bot();
+        }
 
-        self.push_log("[launcher] session started");
-        self.status = "Running".to_owned();
-        self.event_rx = Some(rx);
-        self.running = Some(RunningSession {
-            stop,
-            automation_thread: Some(automation_thread),
-        });
+        if let Some(mut browser) = self.browser_session.take() {
+            self.push_log("[launcher] closing Chromium");
+            match browser.process.shutdown() {
+                Ok(()) => self.push_log("[launcher] browser closed"),
+                Err(err) => self.push_log(format!("[launcher] browser shutdown failed: {err:#}")),
+            }
+        }
+        self.browser_status = BrowserStatus::Closed;
     }
 
     fn clear_snapshot_file(&mut self) {
@@ -410,69 +474,171 @@ impl LauncherApp {
         }
     }
 
-    fn stop(&mut self) {
-        if let Some(mut running) = self.running.take() {
-            running.stop();
-            if let Err(err) = self.release_all_keys_now() {
-                self.push_log(format!(
-                    "[launcher] failed to release keys on stop: {err:#}"
-                ));
-            } else {
-                self.push_log("[launcher] released keys on stop");
-            }
-            self.push_log("[launcher] session stopped");
+    fn start_bot(&mut self) {
+        if self.bot_session.is_some() {
+            return;
         }
-        self.event_rx = None;
-        self.status = "Idle".to_owned();
+        if self.browser_status != BrowserStatus::Ready || self.browser_session.is_none() {
+            self.bot_status = BotStatus::Error;
+            self.push_log("[launcher] bot on blocked: browser is not ready");
+            return;
+        }
+
+        self.save_state();
+        self.clear_snapshot_file();
+        self.bot_status = BotStatus::Starting;
+        self.push_log("[launcher] bot on");
+
+        let config = self.state.to_bot_automation_config(&self.paths);
+        self.push_log(format!(
+            "[bot] connecting to existing Chromium port={}",
+            config.browser.cdp_port
+        ));
+
+        let paths = self.paths.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let tx = self.event_tx.clone();
+        let automation_thread = thread::spawn(move || {
+            let log_tx = tx.clone();
+            let result = run_automation(paths, config, &worker_stop, move |line| {
+                let _ = log_tx.send(LauncherEvent::BotLog(line));
+            })
+            .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(LauncherEvent::BotExited(result));
+        });
+
+        self.bot_session = Some(BotSession {
+            stop,
+            automation_thread: Some(automation_thread),
+        });
+        self.bot_status = BotStatus::On;
+    }
+
+    fn stop_bot(&mut self) {
+        self.stop_bot_with_browser_hint(self.browser_session.is_some());
+    }
+
+    fn stop_bot_with_browser_hint(&mut self, browser_remains_open: bool) {
+        if let Some(mut bot) = self.bot_session.take() {
+            self.ignore_next_bot_exit = true;
+            self.push_log("[bot] stopping");
+            bot.stop();
+            match self.release_all_keys_now() {
+                Ok(()) => self.push_log("[bot] released all keys"),
+                Err(err) => self.push_log(format!("[bot] failed to release keys: {err:#}")),
+            }
+            self.push_log("[bot] stopped");
+            if browser_remains_open {
+                self.push_log("[browser-host] Chromium remains open");
+            }
+        }
+        self.bot_status = BotStatus::Off;
     }
 
     fn release_all_keys_now(&self) -> Result<()> {
         if self.state.dry_run {
             return Ok(());
         }
-        let config = self.state.to_automation_config(&self.paths);
+        let config = self.state.to_bot_automation_config(&self.paths);
         let mut backend = create_input_backend(&self.paths, &config)?;
         backend.release_all_keys()
     }
 
-    fn poll_events(&mut self) {
-        let mut should_stop = false;
-        let mut events = Vec::new();
-        if let Some(rx) = &self.event_rx {
-            while let Ok(event) = rx.try_recv() {
-                events.push(event);
+    fn poll_browser_session(&mut self) {
+        let Some(session) = self.browser_session.as_mut() else {
+            return;
+        };
+        match session.process.is_running() {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = self.event_tx.send(LauncherEvent::BrowserExited(Ok(())));
+            }
+            Err(err) => {
+                let _ = self
+                    .event_tx
+                    .send(LauncherEvent::BrowserExited(Err(format!("{err:#}"))));
             }
         }
+    }
+
+    fn handle_browser_exited(&mut self, result: Result<(), String>) {
+        self.browser_session = None;
+        self.browser_status = BrowserStatus::Closed;
+        match result {
+            Ok(()) => self.push_log("[browser-host] Chromium exited"),
+            Err(err) => self.push_log(format!("[launcher] browser exited with error: {err}")),
+        }
+        if self.bot_session.is_some() {
+            self.push_log("[launcher] browser closed while bot was on");
+            self.stop_bot_with_browser_hint(false);
+        }
+        self.push_log("[launcher] browser closed");
+    }
+
+    fn poll_events(&mut self) {
+        let mut events = Vec::new();
+        while let Ok(event) = self.event_rx.try_recv() {
+            events.push(event);
+        }
+
         for event in events {
             match event {
-                LauncherEvent::Log(line) => self.push_log(line),
-                LauncherEvent::AutomationExited(result) => {
-                    match result {
-                        Ok(()) => self.push_log("[launcher] automation exited cleanly"),
-                        Err(err) => self.push_log(format!("[launcher] automation failed: {err}")),
+                LauncherEvent::BrowserLog(line) => self.push_log(line),
+                LauncherEvent::BrowserExited(result) => {
+                    if self.browser_session.is_some() {
+                        self.handle_browser_exited(result);
                     }
-                    should_stop = true;
+                }
+                LauncherEvent::BotLog(line) => {
+                    if line.contains("[automation] live game resumed")
+                        || line.contains("[automation] idle waiting for next live game")
+                        || line.contains("[automation] source=")
+                    {
+                        self.bot_status = BotStatus::On;
+                    }
+                    self.push_log(line);
+                }
+                LauncherEvent::BotExited(result) => {
+                    if self.ignore_next_bot_exit {
+                        self.ignore_next_bot_exit = false;
+                        continue;
+                    }
+                    self.bot_session = None;
+                    self.bot_status = match result {
+                        Ok(()) => {
+                            self.push_log("[bot] automation exited cleanly");
+                            BotStatus::Off
+                        }
+                        Err(err) => {
+                            self.push_log(format!("[bot] automation failed: {err}"));
+                            BotStatus::Error
+                        }
+                    };
                 }
             }
-        }
-        if should_stop {
-            self.stop();
         }
     }
 }
 
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_browser_session();
         self.poll_events();
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level(
             self.state.always_on_top,
         )));
 
+        let browser_locked = self.browser_session.is_some();
+        let bot_locked = self.bot_session.is_some();
+
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Cold Clear Launcher");
                 ui.separator();
-                ui.label(format!("Status: {}", self.status));
+                ui.label(format!("Browser: {}", self.browser_status.label()));
+                ui.separator();
+                ui.label(format!("Bot: {}", self.bot_status.label()));
             });
         });
 
@@ -480,45 +646,53 @@ impl eframe::App for LauncherApp {
             ui.horizontal(|ui| {
                 ui.label("Mode");
                 let old_preset = self.state.preset;
-                egui::ComboBox::from_id_salt("preset")
-                    .selected_text(self.state.preset.label())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.state.preset,
-                            ModePreset::VsLeft1080p,
-                            ModePreset::VsLeft1080p.label(),
-                        );
-                        ui.selectable_value(
-                            &mut self.state.preset,
-                            ModePreset::Solo1080p,
-                            ModePreset::Solo1080p.label(),
-                        );
-                        ui.selectable_value(
-                            &mut self.state.preset,
-                            ModePreset::Custom,
-                            ModePreset::Custom.label(),
-                        );
-                    });
+                ui.add_enabled_ui(!browser_locked && !bot_locked, |ui| {
+                    egui::ComboBox::from_id_salt("preset")
+                        .selected_text(self.state.preset.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.state.preset,
+                                ModePreset::VsLeft1080p,
+                                ModePreset::VsLeft1080p.label(),
+                            );
+                            ui.selectable_value(
+                                &mut self.state.preset,
+                                ModePreset::Solo1080p,
+                                ModePreset::Solo1080p.label(),
+                            );
+                            ui.selectable_value(
+                                &mut self.state.preset,
+                                ModePreset::Custom,
+                                ModePreset::Custom.label(),
+                            );
+                        });
+                });
                 if self.state.preset != old_preset {
                     self.state.apply_preset();
                 }
             });
 
-            ui.label("Browser CDP mode only. Screen scanner and file mode stay as internal fallback/debug paths.");
-            ui.horizontal(|ui| {
-                ui.label("Chrome Path");
-                ui.text_edit_singleline(&mut self.state.browser.chrome_path);
-            });
-            ui.horizontal(|ui| {
-                ui.label("CDP Port");
-                ui.add(egui::DragValue::new(&mut self.state.browser.cdp_port).speed(1));
-                ui.label("URL");
-                ui.text_edit_singleline(&mut self.state.browser.url);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Target");
-                ui.text_edit_singleline(&mut self.state.browser.target_hint);
-                ui.checkbox(&mut self.state.browser.connect_only, "Connect only");
+            ui.label(
+                "Browser host keeps Chromium alive on its own. Bot ON later reconnects with Browser CDP only.",
+            );
+            if browser_locked {
+                ui.small("Browser settings are locked while Chromium is open.");
+            }
+            ui.add_enabled_ui(!browser_locked, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Chrome Path");
+                    ui.text_edit_singleline(&mut self.state.browser.chrome_path);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("CDP Port");
+                    ui.add(egui::DragValue::new(&mut self.state.browser.cdp_port).speed(1));
+                    ui.label("URL");
+                    ui.text_edit_singleline(&mut self.state.browser.url);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Target");
+                    ui.text_edit_singleline(&mut self.state.browser.target_hint);
+                });
             });
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.state.browser.probe_page_state, "Probe page state");
@@ -530,140 +704,175 @@ impl eframe::App for LauncherApp {
                     &mut self.state.browser.use_seed_simulation_fallback,
                     "Use seed simulation fallback",
                 );
-            });
-            ui.horizontal(|ui| {
                 ui.checkbox(&mut self.state.always_on_top, "Always on top");
             });
 
             ui.separator();
-            ui.heading("Runtime");
+            ui.heading("Browser");
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.state.dry_run, "Dry run");
-                ui.checkbox(&mut self.state.bot.use_hold, "Use hold");
-                ui.checkbox(&mut self.state.bot.speculate, "Speculate");
-                ui.checkbox(
-                    &mut self.state.handling.allow_post_softdrop_actions,
-                    "Allow spin routes",
-                );
-                ui.checkbox(
-                    &mut self.state.handling.allow_post_softdrop_horizontal,
-                    "Allow post-softdrop horizontal",
-                );
-                ui.label("Input");
-                ui.monospace("Browser CDP");
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(
-                    &mut self.state.handling.release_after_each_action,
-                    "Release after each action",
-                );
-                ui.label("Settle");
-                ui.add(egui::DragValue::new(&mut self.state.handling.action_settle_ms).speed(1));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Poll");
-                ui.add(egui::DragValue::new(&mut self.state.poll_interval_ms).speed(1));
-                ui.label("Target PPS");
-                ui.add(
-                    egui::DragValue::new(&mut self.state.target_pps)
-                        .speed(0.05)
-                        .range(0.0..=20.0),
-                );
-                ui.small("0 = unlimited");
-            });
-            ui.horizontal(|ui| {
-                ui.label("Move Tap");
-                ui.add(egui::DragValue::new(&mut self.state.movement_tap_duration_ms).speed(1));
-                ui.label("Rotate Tap");
-                ui.add(egui::DragValue::new(&mut self.state.rotate_tap_duration_ms).speed(1));
-            });
-            ui.horizontal(|ui| {
-                ui.label("HardDrop Tap");
-                ui.add(egui::DragValue::new(&mut self.state.hard_drop_tap_duration_ms).speed(1));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Move Delay");
-                ui.add(egui::DragValue::new(&mut self.state.movement_interval_ms).speed(1));
-                ui.label("Rotate Delay");
-                ui.add(egui::DragValue::new(&mut self.state.rotation_interval_ms).speed(1));
-                ui.label("HardDrop Delay");
-                ui.add(egui::DragValue::new(&mut self.state.hard_drop_interval_ms).speed(1));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Piece Delay");
-                ui.add(egui::DragValue::new(&mut self.state.piece_interval_ms).speed(1));
-                ui.label("Min age");
-                ui.add(egui::DragValue::new(&mut self.state.min_snapshot_age_ms).speed(1));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Movement");
-                egui::ComboBox::from_id_salt("movement_mode")
-                    .selected_text(movement_mode_label(self.state.bot.movement_mode))
-                    .show_ui(ui, |ui| {
-                        for mode in [
-                            MovementModeConfig::HardDropOnly,
-                            MovementModeConfig::ZeroGSafe,
-                            MovementModeConfig::ZeroG,
-                            MovementModeConfig::ZeroGComplete,
-                            MovementModeConfig::TwentyG,
-                        ] {
-                            ui.selectable_value(
-                                &mut self.state.bot.movement_mode,
-                                mode,
-                                movement_mode_label(mode),
-                            );
-                        }
-                    });
-                ui.label("Spawn");
-                egui::ComboBox::from_id_salt("spawn_rule")
-                    .selected_text(spawn_rule_label(self.state.bot.spawn_rule))
-                    .show_ui(ui, |ui| {
-                        for rule in [SpawnRuleConfig::Row19Or20, SpawnRuleConfig::Row21AndFall] {
-                            ui.selectable_value(
-                                &mut self.state.bot.spawn_rule,
-                                rule,
-                                spawn_rule_label(rule),
-                            );
-                        }
-                    });
-                ui.label("Planner");
-                ui.monospace("Safe spawn tap route");
-            });
-            ui.horizontal(|ui| {
-                ui.label("Threads");
-                ui.add(egui::DragValue::new(&mut self.state.bot.threads).range(1..=8).speed(1));
-                ui.label("Min Nodes");
-                ui.add(
-                    egui::DragValue::new(&mut self.state.bot.min_nodes)
-                        .range(50..=50_000)
-                        .speed(50),
-                );
-                ui.label("Max Nodes");
-                ui.add(
-                    egui::DragValue::new(&mut self.state.bot.max_nodes)
-                        .range(100..=500_000)
-                        .speed(100),
-                );
+                ui.label(format!("Status: {}", self.browser_status.label()));
+                if ui
+                    .add_enabled(!browser_locked, egui::Button::new("Open Chromium"))
+                    .clicked()
+                {
+                    self.open_browser();
+                }
+                if ui
+                    .add_enabled(browser_locked, egui::Button::new("Close Chromium"))
+                    .clicked()
+                {
+                    self.close_browser();
+                }
             });
 
             ui.separator();
+            ui.heading("Bot");
+            if bot_locked {
+                ui.small("Runtime settings are locked while the bot is on.");
+            }
+            ui.add_enabled_ui(!bot_locked, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.state.dry_run, "Dry run");
+                    ui.checkbox(&mut self.state.bot.use_hold, "Use hold");
+                    ui.checkbox(&mut self.state.bot.speculate, "Speculate");
+                    ui.checkbox(
+                        &mut self.state.handling.allow_post_softdrop_actions,
+                        "Allow spin routes",
+                    );
+                    ui.checkbox(
+                        &mut self.state.handling.allow_post_softdrop_horizontal,
+                        "Allow post-softdrop horizontal",
+                    );
+                    ui.label("Input");
+                    ui.monospace("Browser CDP");
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.state.handling.release_after_each_action,
+                        "Release after each action",
+                    );
+                    ui.label("Settle");
+                    ui.add(
+                        egui::DragValue::new(&mut self.state.handling.action_settle_ms).speed(1),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Poll");
+                    ui.add(egui::DragValue::new(&mut self.state.poll_interval_ms).speed(1));
+                    ui.label("Target PPS");
+                    ui.add(
+                        egui::DragValue::new(&mut self.state.target_pps)
+                            .speed(0.05)
+                            .range(0.0..=20.0),
+                    );
+                    ui.small("0 = unlimited");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Move Tap");
+                    ui.add(
+                        egui::DragValue::new(&mut self.state.movement_tap_duration_ms).speed(1),
+                    );
+                    ui.label("Rotate Tap");
+                    ui.add(
+                        egui::DragValue::new(&mut self.state.rotate_tap_duration_ms).speed(1),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("HardDrop Tap");
+                    ui.add(
+                        egui::DragValue::new(&mut self.state.hard_drop_tap_duration_ms).speed(1),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Move Delay");
+                    ui.add(egui::DragValue::new(&mut self.state.movement_interval_ms).speed(1));
+                    ui.label("Rotate Delay");
+                    ui.add(egui::DragValue::new(&mut self.state.rotation_interval_ms).speed(1));
+                    ui.label("HardDrop Delay");
+                    ui.add(egui::DragValue::new(&mut self.state.hard_drop_interval_ms).speed(1));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Piece Delay");
+                    ui.add(egui::DragValue::new(&mut self.state.piece_interval_ms).speed(1));
+                    ui.label("Min age");
+                    ui.add(egui::DragValue::new(&mut self.state.min_snapshot_age_ms).speed(1));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Movement");
+                    egui::ComboBox::from_id_salt("movement_mode")
+                        .selected_text(movement_mode_label(self.state.bot.movement_mode))
+                        .show_ui(ui, |ui| {
+                            for mode in [
+                                MovementModeConfig::HardDropOnly,
+                                MovementModeConfig::ZeroGSafe,
+                                MovementModeConfig::ZeroG,
+                                MovementModeConfig::ZeroGComplete,
+                                MovementModeConfig::TwentyG,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.state.bot.movement_mode,
+                                    mode,
+                                    movement_mode_label(mode),
+                                );
+                            }
+                        });
+                    ui.label("Spawn");
+                    egui::ComboBox::from_id_salt("spawn_rule")
+                        .selected_text(spawn_rule_label(self.state.bot.spawn_rule))
+                        .show_ui(ui, |ui| {
+                            for rule in [SpawnRuleConfig::Row19Or20, SpawnRuleConfig::Row21AndFall]
+                            {
+                                ui.selectable_value(
+                                    &mut self.state.bot.spawn_rule,
+                                    rule,
+                                    spawn_rule_label(rule),
+                                );
+                            }
+                        });
+                    ui.label("Planner");
+                    ui.monospace("Safe spawn tap route");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Threads");
+                    ui.add(egui::DragValue::new(&mut self.state.bot.threads).range(1..=8).speed(1));
+                    ui.label("Min Nodes");
+                    ui.add(
+                        egui::DragValue::new(&mut self.state.bot.min_nodes)
+                            .range(50..=50_000)
+                            .speed(50),
+                    );
+                    ui.label("Max Nodes");
+                    ui.add(
+                        egui::DragValue::new(&mut self.state.bot.max_nodes)
+                            .range(100..=500_000)
+                            .speed(100),
+                    );
+                });
+            });
             ui.horizontal(|ui| {
+                ui.label(format!("Status: {}", self.bot_status.label()));
                 if ui
-                    .add_enabled(self.running.is_none(), egui::Button::new("Start"))
+                    .add_enabled(
+                        self.browser_status == BrowserStatus::Ready && !bot_locked,
+                        egui::Button::new("Bot ON"),
+                    )
                     .clicked()
                 {
-                    self.start();
+                    self.start_bot();
                 }
                 if ui
-                    .add_enabled(self.running.is_some(), egui::Button::new("Stop"))
+                    .add_enabled(bot_locked, egui::Button::new("Bot OFF"))
                     .clicked()
                 {
-                    self.stop();
-                }
-                if ui.button("Save Settings").clicked() {
-                    self.save_state();
+                    self.stop_bot();
                 }
             });
+
+            ui.separator();
+            ui.heading("Settings");
+            if ui.button("Save Settings").clicked() {
+                self.save_state();
+            }
 
             ui.separator();
             ui.heading("Log");
@@ -683,7 +892,8 @@ impl eframe::App for LauncherApp {
 
 impl Drop for LauncherApp {
     fn drop(&mut self) {
-        self.stop();
+        self.stop_bot();
+        self.close_browser();
         let _ = save_launcher_state(&self.paths, &self.state);
     }
 }
@@ -768,7 +978,8 @@ mod tests {
         assert!(readme.contains("ZeroG Safe"));
         assert!(readme.contains("Hard Drop Only"));
         assert!(readme.contains("ZeroG Complete"));
-        assert!(readme.contains("Advanced/Experimental"));
+        assert!(readme.contains("Open Chromium"));
+        assert!(readme.contains("Bot ON"));
     }
 
     #[test]
@@ -810,5 +1021,19 @@ mod tests {
         assert_eq!(state.min_snapshot_age_ms, 0);
         assert_eq!(state.handling.action_settle_ms, 0);
         assert!(!state.handling.release_after_each_action);
+    }
+
+    #[test]
+    fn bot_config_forces_connect_only() {
+        let paths = AppPaths::discover();
+        let state = LauncherState::default();
+        let config = state.to_bot_automation_config(&paths);
+        assert!(config.browser.connect_only);
+    }
+
+    #[test]
+    fn bot_requires_ready_browser() {
+        assert!(BrowserStatus::Ready == BrowserStatus::Ready);
+        assert!(BrowserStatus::Closed != BrowserStatus::Ready);
     }
 }

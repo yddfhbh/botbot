@@ -1,6 +1,8 @@
+use std::io::Write;
 use std::io::{BufRead, BufReader};
+use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -8,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AutomationConfig, SnapshotProviderConfig};
+use crate::config::{AutomationConfig, BrowserCdpConfig, SnapshotProviderConfig};
 use crate::paths::AppPaths;
 use crate::scanner::{ActivePieceState, GameSnapshot, PieceToken, RotationToken};
 
@@ -23,6 +25,13 @@ pub fn emit_log(logger: &SharedLogger, line: impl Into<String>) {
 pub struct ProviderProcess {
     child: Child,
     log_threads: Vec<JoinHandle<()>>,
+}
+
+pub struct ChromiumHostProcess {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    log_threads: Vec<JoinHandle<()>>,
+    exited: bool,
 }
 
 impl ProviderProcess {
@@ -64,9 +73,119 @@ impl ProviderProcess {
     }
 }
 
+impl ChromiumHostProcess {
+    pub fn start(
+        paths: &AppPaths,
+        config: &BrowserCdpConfig,
+        logger: SharedLogger,
+    ) -> Result<Self> {
+        let script = &paths.browser_host_script_path;
+        let mut command = Command::new(&config.node_command);
+        command
+            .arg(script)
+            .arg("--port")
+            .arg(config.cdp_port.to_string())
+            .arg("--url")
+            .arg(&config.url)
+            .arg("--target")
+            .arg(&config.target_hint)
+            .current_dir(&paths.workspace_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if !config.chrome_path.trim().is_empty() {
+            command.arg("--chrome-path").arg(&config.chrome_path);
+            command.env("CHROME_PATH", &config.chrome_path);
+        }
+
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to launch browser host helper with {} {}",
+                config.node_command,
+                script.display()
+            )
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("browser host helper stdin was not available")?;
+        let log_threads = take_process_logs(
+            &mut child,
+            "[browser-host] ",
+            "[browser-host][err] ",
+            logger,
+        );
+        wait_for_cdp_health(
+            &mut child,
+            Duration::from_millis(config.bootstrap_timeout_ms.max(1000)),
+            config.cdp_port,
+        )?;
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            log_threads,
+            exited: false,
+        })
+    }
+
+    pub fn is_running(&mut self) -> Result<bool> {
+        if self.exited {
+            return Ok(false);
+        }
+        if self.child.try_wait()?.is_some() {
+            self.exited = true;
+            self.join_logs();
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    pub fn shutdown(&mut self) -> Result<()> {
+        if self.exited {
+            return Ok(());
+        }
+
+        if let Some(mut stdin) = self.stdin.take() {
+            let _ = stdin.write_all(br#"{"type":"shutdown"}"#);
+            let _ = stdin.write_all(b"\n");
+            let _ = stdin.flush();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if self.child.try_wait()?.is_some() {
+                self.exited = true;
+                self.join_logs();
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.exited = true;
+        self.join_logs();
+        Ok(())
+    }
+
+    fn join_logs(&mut self) {
+        for handle in self.log_threads.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
 impl Drop for ProviderProcess {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+impl Drop for ChromiumHostProcess {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 
@@ -200,8 +319,8 @@ fn spawn_browser_provider(
     emit_log(
         &logger,
         format!(
-            "[browser] helper running on port {} target={}",
-            config.browser.cdp_port, config.browser.target_hint
+            "[browser] helper running target={} connect_only={}",
+            config.browser.target_hint, config.browser.connect_only
         ),
     );
     Ok(ProviderProcess { child, log_threads })
@@ -256,6 +375,44 @@ fn wait_for_launch_health(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn wait_for_cdp_health(child: &mut Child, timeout: Duration, port: u16) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cdp_endpoint_responding(port) {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("browser host helper exited early with status {status}");
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("Chrome DevTools endpoint did not open on port {port}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn cdp_endpoint_responding(port: u16) -> bool {
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    if stream
+        .write_all(
+            format!(
+                "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).is_ok() && status_line.contains("200")
 }
 
 fn take_process_logs(
