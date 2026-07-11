@@ -3,6 +3,8 @@ import test from "node:test";
 import vm from "node:vm";
 
 import {
+  attachBrowserDiagnostics,
+  buildChromiumLaunchArgs,
   captureTetrioGame,
   captureTetrioExportExpression,
   computeEffectiveStatePollMs,
@@ -16,13 +18,15 @@ import {
   resetDiscoveryState,
   resetProbeRetryState,
   selectExistingTarget,
+  shouldInstallBackgroundInputKeepalive,
   shouldResetDiscoveryOnExecutionContextsCleared,
   shouldAttemptClosureProbe,
   shouldAttemptDebuggerProbe,
   shouldAttemptStartupDirectScan,
   startupDirectScanDisabledReason,
   shouldDecodeRibbonFrame,
-  updateLikelyGamePageState
+  updateLikelyGamePageState,
+  waitForExistingTarget
 } from "./tetrio-cdp-source.mjs";
 
 function createMockGame() {
@@ -143,6 +147,22 @@ function createMockProbeCdp(options = {}) {
         throw new Error("Timed out waiting for CDP event Debugger.paused");
       }
       return pausedEvents.shift();
+    }
+  };
+}
+
+function createEventEmitterCdp() {
+  const listeners = new Map();
+  return {
+    on(method, handler) {
+      const current = listeners.get(method) ?? [];
+      current.push(handler);
+      listeners.set(method, current);
+    },
+    emit(method, payload) {
+      for (const handler of listeners.get(method) ?? []) {
+        handler(payload);
+      }
     }
   };
 }
@@ -285,6 +305,17 @@ test("effective state poll never runs faster than the minimum", () => {
   assert.equal(computeEffectiveStatePollMs(40, 16), 40);
 });
 
+test("chromium launch args open the requested url directly", () => {
+  const args = buildChromiumLaunchArgs({
+    port: 9222,
+    url: "https://tetr.io/",
+    profileDir: "C:/temp/botbot-profile"
+  });
+
+  assert.equal(args.at(-1), "https://tetr.io/");
+  assert.equal(args.includes("about:blank"), false);
+});
+
 test("startup direct scan finds nested game under window.game", () => {
   const mockGame = createMockGame();
   const { result, windowObject } = runCaptureExpression(
@@ -389,6 +420,69 @@ test("target selection prefers explicit tetrio matches", () => {
   );
 
   assert.equal(selected?.webSocketDebuggerUrl, "ws://tetrio");
+});
+
+test("waitForExistingTarget returns a tetrio tab without needing a new blank tab", async () => {
+  let pollCount = 0;
+  const result = await waitForExistingTarget({
+    port: 9222,
+    url: "https://tetr.io/",
+    targetHint: "TETR.IO",
+    timeoutMs: 1000,
+    pollMs: 1,
+    fetchTargets: async () => {
+      pollCount += 1;
+      if (pollCount < 2) {
+        return [
+          {
+            type: "page",
+            title: "New Tab",
+            url: "about:blank",
+            webSocketDebuggerUrl: "ws://blank"
+          }
+        ];
+      }
+      return [
+        {
+          type: "page",
+          title: "TETR.IO",
+          url: "https://tetr.io/",
+          webSocketDebuggerUrl: "ws://tetrio"
+        }
+      ];
+    },
+    sleepFn: async () => undefined
+  });
+
+  assert.equal(result?.webSocketDebuggerUrl, "ws://tetrio");
+  assert.equal(pollCount >= 2, true);
+});
+
+test("background input keepalive stays off until an active game state exists", () => {
+  assert.equal(
+    shouldInstallBackgroundInputKeepalive({
+      enabled: false,
+      installed: false,
+      state: { ok: true, ready: true, playing: true, countdown: false }
+    }),
+    false
+  );
+  assert.equal(
+    shouldInstallBackgroundInputKeepalive({
+      enabled: true,
+      installed: false,
+      state: { ok: false, ready: false, playing: false, countdown: false }
+    }),
+    false
+  );
+  assert.equal(
+    shouldInstallBackgroundInputKeepalive({
+      enabled: true,
+      installed: false,
+      state: { ok: true, ready: true, playing: true, countdown: false }
+    }),
+    true
+  );
 });
 
 test("root home page skips expensive top-level discovery", () => {
@@ -779,6 +873,23 @@ test("execution context clears only reset captured discovery state", () => {
       gameCaptured: false,
       lastCaptureSource: "window.game"
     }),
+    true
+  );
+});
+
+test("browser diagnostics forward runtime exceptions", () => {
+  const cdp = createEventEmitterCdp();
+  const lines = [];
+  attachBrowserDiagnostics(cdp, (line) => lines.push(line));
+
+  cdp.emit("Runtime.exceptionThrown", {
+    exceptionDetails: {
+      text: "ReferenceError: foo is not defined"
+    }
+  });
+
+  assert.equal(
+    lines.some((line) => line.includes("[browser][exception] ReferenceError: foo is not defined")),
     true
   );
 });

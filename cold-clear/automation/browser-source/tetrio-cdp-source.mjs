@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, createWriteStream, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -20,6 +20,9 @@ const PROBE_RETRY_COOLDOWN_MS = 750;
 const MAX_PROBE_ATTEMPTS = 4;
 const PERF_LOG_INTERVAL_MS = 5000;
 const DISCOVERY_RESET_DEBOUNCE_MS = 250;
+const TARGET_WAIT_TIMEOUT_MS = 10_000;
+const TARGET_WAIT_POLL_MS = 250;
+const PAGE_LOAD_TIMEOUT_MS = 15_000;
 const CLOSURE_PROBE_BREAKPOINTS = [
   { label: "raf", expression: "window.requestAnimationFrame" },
   { label: "setTimeout", expression: "window.setTimeout" }
@@ -197,6 +200,15 @@ export function getClosureProbeBreakpoints() {
   return [...CLOSURE_PROBE_BREAKPOINTS];
 }
 
+export function shouldInstallBackgroundInputKeepalive({
+  enabled,
+  installed,
+  state
+}) {
+  if (!enabled || installed) return false;
+  return Boolean(state?.ok && state?.ready && state?.playing && !state?.countdown);
+}
+
 async function clearCachedGameHandle(cdp) {
   await safeRuntimeEvaluate(
     cdp,
@@ -266,6 +278,7 @@ async function main() {
   const ribbonDecodeMode = normalizeRibbonDecodeMode(args.ribbonDecodeMode ?? "until_seed");
   const perfLogEnabled = args.perfLogEnabled !== "0";
   const manualCaptureOnce = args.manualCaptureOnce === "1";
+  const backgroundInputKeepalive = args.backgroundInputKeepalive === "1";
   const msgpack = await loadOptionalMsgpack();
   const selector = {
     playerSelector: args.playerSelector ?? "auto",
@@ -279,17 +292,28 @@ async function main() {
   if (!connectOnly) {
     const alreadyOpen = await isCdpOpen(port);
     if (!alreadyOpen) {
-      browserProcess = launchChromium({ port, url, chromePath });
+      browserProcess = launchChromium({ port, url, chromePath, profileDir: args.profileDir ?? "" });
     }
   }
 
-  await waitForCdp(port);
+  await waitForCdp(port, browserProcess);
   const target = await findOrCreateTarget({ port, url, targetHint });
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
   await cdp.send("Page.enable").catch(() => undefined);
   await cdp.send("Runtime.enable").catch(() => undefined);
+  await cdp.send("Log.enable").catch(() => undefined);
+  await cdp.send("Network.enable").catch(() => undefined);
   await cdp.send("Page.bringToFront").catch(() => undefined);
-  await installBackgroundInputKeepalive(cdp);
+  attachBrowserDiagnostics(cdp);
+  console.log("[browser] waiting for TETR.IO page load");
+  const loadStatus = await waitForTetrioPageLoad(cdp, { url, timeoutMs: PAGE_LOAD_TIMEOUT_MS });
+  if (!loadStatus.ok) {
+    console.log("[browser] TETR.IO bootstrap failed; see browser exception/chrome stderr logs");
+    await cdp.close().catch(() => undefined);
+    browserProcess?.kill();
+    process.exit(1);
+  }
+  console.log(`[browser] page loaded readyState=${loadStatus.readyState} href=${loadStatus.href}`);
   await safeRuntimeEvaluate(
     cdp,
     {
@@ -321,6 +345,7 @@ async function main() {
   let lastLoggedToken = "";
   let lastSelectedPath = "";
   let lastSelectionReason = "";
+  let keepaliveInstalled = false;
   const probeState = {
     startupDirectScanAttempts: 0,
     startupDirectScanLastAt: 0,
@@ -390,6 +415,16 @@ async function main() {
 
     lastReason = "";
     lastReasonAt = 0;
+
+    if (shouldInstallBackgroundInputKeepalive({
+      enabled: backgroundInputKeepalive,
+      installed: keepaliveInstalled,
+      state
+    })) {
+      await installBackgroundInputKeepalive(cdp);
+      keepaliveInstalled = true;
+      console.log("[browser] background input keepalive enabled");
+    }
 
     const signature = `${state.token}|${state.playing}|${state.countdown}`;
     const snapshot = {
@@ -468,36 +503,92 @@ async function loadOptionalMsgpack() {
   }
 }
 
-function launchChromium({ port, url, chromePath }) {
+function launchChromium({ port, url, chromePath, profileDir = "" }) {
   const executable = chromePath || findChromiumExecutable();
   if (!executable) {
     throw new Error("Could not find Chrome/Edge. Set CHROME_PATH to the browser executable.");
   }
-  const profileDir = createFreshChromiumProfileDir(port);
-  return spawn(
+  const resolvedProfileDir = resolveChromiumProfileDir({ port, profileDir });
+  const browserProcess = spawn(
     executable,
-    [
-      `--remote-debugging-port=${port}`,
-      "--remote-allow-origins=*",
-      `--user-data-dir=${profileDir}`,
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-background-timer-throttling",
-      "--disable-renderer-backgrounding",
-      "--disable-backgrounding-occluded-windows",
-      "--disable-features=Translate,CalculateNativeWinOcclusion",
-      "about:blank"
-    ],
+    buildChromiumLaunchArgs({ port, url, profileDir: resolvedProfileDir }),
     {
       detached: false,
-      stdio: ["ignore", "ignore", "ignore"]
+      stdio: ["ignore", "pipe", "pipe"]
     }
   );
+  browserProcess.launchState = {
+    exited: false,
+    code: null,
+    signal: null,
+    profileDir: resolvedProfileDir
+  };
+  browserProcess.once("exit", (code, signal) => {
+    browserProcess.launchState.exited = true;
+    browserProcess.launchState.code = code;
+    browserProcess.launchState.signal = signal;
+  });
+  pipeProcessStream(browserProcess.stdout, "[chrome][out]");
+  pipeProcessStream(browserProcess.stderr, "[chrome][err]", "automation/debug/chrome-stderr.log");
+  return browserProcess;
 }
 
-function createFreshChromiumProfileDir(port) {
-  const prefix = path.join(os.tmpdir(), `botbot-tetrio-cdp-${port}-`);
-  return mkdtempSync(prefix);
+export function buildChromiumLaunchArgs({ port, url, profileDir }) {
+  return [
+    `--remote-debugging-port=${port}`,
+    "--remote-allow-origins=*",
+    `--user-data-dir=${profileDir}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-background-timer-throttling",
+    "--disable-renderer-backgrounding",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-features=Translate,CalculateNativeWinOcclusion",
+    url
+  ];
+}
+
+function resolveChromiumProfileDir({ port, profileDir = "" }) {
+  const resolved =
+    `${profileDir}`.trim() || path.join(os.tmpdir(), `botbot-tetrio-cdp-${port}-profile`);
+  mkdirSync(resolved, { recursive: true });
+  return resolved;
+}
+
+function pipeProcessStream(stream, prefix, outputPath = "") {
+  if (!stream) {
+    return;
+  }
+  let buffer = "";
+  if (outputPath) {
+    mkdirSync(path.dirname(outputPath), { recursive: true });
+  }
+  const fileStream = outputPath
+    ? createWriteStream(outputPath, { flags: "a", encoding: "utf8" })
+    : null;
+  const flush = () => {
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const message = `${prefix} ${line}`;
+      console.log(message);
+      fileStream?.write(`${message}\n`);
+    }
+  };
+  stream.setEncoding("utf8");
+  stream.on("data", (chunk) => {
+    buffer += chunk;
+    flush();
+  });
+  stream.on("close", () => {
+    if (buffer.trim()) {
+      const message = `${prefix} ${buffer.trim()}`;
+      console.log(message);
+      fileStream?.write(`${message}\n`);
+    }
+    fileStream?.end();
+  });
 }
 
 function findChromiumExecutable() {
@@ -523,23 +614,56 @@ async function isCdpOpen(port) {
   }
 }
 
-async function waitForCdp(port) {
+async function waitForCdp(port, browserProcess = null) {
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     if (await isCdpOpen(port)) return;
+    if (browserProcess?.launchState?.exited) {
+      throw new Error(
+        `Chrome exited before CDP opened (profile=${browserProcess.launchState.profileDir}, code=${browserProcess.launchState.code ?? "unknown"})`
+      );
+    }
     await sleep(250);
   }
   throw new Error(`Chrome DevTools endpoint did not open on port ${port}`);
 }
 
 async function findOrCreateTarget({ port, url, targetHint }) {
-  const list = await fetchJson(`http://127.0.0.1:${port}/json/list`);
-  const pages = list.filter((item) => item.type === "page");
-  const existing = selectExistingTarget(pages, url, targetHint);
+  const existing = await waitForExistingTarget({
+    port,
+    url,
+    targetHint,
+    timeoutMs: TARGET_WAIT_TIMEOUT_MS,
+    pollMs: TARGET_WAIT_POLL_MS
+  });
   if (existing?.webSocketDebuggerUrl) return existing;
   return await fetchJson(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, {
     method: "PUT"
   });
+}
+
+export async function waitForExistingTarget({
+  port,
+  url,
+  targetHint,
+  timeoutMs = TARGET_WAIT_TIMEOUT_MS,
+  pollMs = TARGET_WAIT_POLL_MS,
+  fetchTargets = null,
+  sleepFn = sleep
+}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const list = fetchTargets
+      ? await fetchTargets()
+      : await fetchJson(`http://127.0.0.1:${port}/json/list`);
+    const pages = list.filter((item) => item.type === "page");
+    const existing = selectExistingTarget(pages, url, targetHint);
+    if (existing?.webSocketDebuggerUrl) {
+      return existing;
+    }
+    await sleepFn(pollMs);
+  }
+  return null;
 }
 
 export function selectExistingTarget(pages, url, targetHint) {
@@ -651,6 +775,97 @@ class CdpClient {
     this.socket.close();
     return Promise.resolve();
   }
+}
+
+export function attachBrowserDiagnostics(cdp, logger = console.log) {
+  cdp.on("Runtime.exceptionThrown", (event) => {
+    const details = event?.exceptionDetails;
+    const text = details?.text ?? details?.exception?.description ?? "unknown exception";
+    logger(`[browser][exception] ${text}`);
+  });
+  cdp.on("Log.entryAdded", (event) => {
+    const entry = event?.entry;
+    logger(
+      `[browser][console] ${entry?.level ?? "info"} ${entry?.source ?? "log"} ${entry?.text ?? ""}`.trim()
+    );
+  });
+  cdp.on("Network.loadingFailed", (event) => {
+    logger(
+      `[browser][network] failed url=${event?.url ?? "-"} reason=${event?.errorText ?? event?.blockedReason ?? "unknown"}`
+    );
+  });
+  cdp.on("Inspector.targetCrashed", () => {
+    logger("[browser][target] crashed");
+  });
+}
+
+function pageLoadStatusExpression() {
+  return `(() => {
+    const bodyText = typeof document.body?.innerText === "string"
+      ? document.body.innerText.slice(0, 2000)
+      : "";
+    const canvasCount = (() => {
+      try { return document.querySelectorAll("canvas").length; } catch { return 0; }
+    })();
+    const hasAppElement = (() => {
+      try {
+        return Boolean(document.querySelector("#app, #js-app, canvas"));
+      } catch {
+        return false;
+      }
+    })();
+    return {
+      href: location.href,
+      hostname: location.hostname,
+      readyState: document.readyState,
+      title: document.title,
+      canvasCount,
+      hasAppElement,
+      bootstrapFailed: bodyText.includes("ERROR LOADING TETR.IO"),
+      bodyText
+    };
+  })()`;
+}
+
+export async function waitForTetrioPageLoad(cdp, { url, timeoutMs = PAGE_LOAD_TIMEOUT_MS } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const status = await safeRuntimeEvaluate(
+      cdp,
+      {
+        expression: pageLoadStatusExpression(),
+        returnByValue: true,
+        awaitPromise: true
+      },
+      {
+        result: {
+          value: {
+            href: "",
+            hostname: "",
+            readyState: "loading",
+            title: "",
+            canvasCount: 0,
+            hasAppElement: false,
+            bootstrapFailed: false,
+            bodyText: ""
+          }
+        }
+      }
+    );
+    const value = status?.result?.value ?? {};
+    if (value.bootstrapFailed) {
+      return { ok: false, ...value };
+    }
+    if (
+      value.hostname === "tetr.io" &&
+      value.readyState === "complete" &&
+      (value.hasAppElement || value.canvasCount > 0 || value.href.startsWith(url))
+    ) {
+      return { ok: true, ...value };
+    }
+    await sleep(TARGET_WAIT_POLL_MS);
+  }
+  return { ok: false, reason: "Timed out waiting for TETR.IO page load" };
 }
 
 function createTetrioNetworkState() {
