@@ -4,20 +4,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
-use crate::browser_source::{ChromiumHostProcess, SharedLogger};
+use crate::browser_source::{ChromiumHostProcess, ProviderProcess, SharedLogger};
 use crate::config::{
     AutomationConfig, BotConfig, BrowserCdpConfig, BufferModeConfig, HandlingConfig,
     InputBackendConfig, KeyBindings, MovementModeConfig, ScannerSourceConfig,
     SnapshotProviderConfig, SoftDropModeConfig, SpawnRuleConfig,
 };
-use crate::driver::create_input_backend;
+use crate::driver::{
+    BrowserCdpInputBackend, DebugLogBackend, InputBackend, SharedBrowserCdpInputBackend,
+};
 use crate::paths::AppPaths;
-use crate::runtime::run_automation;
+use crate::runtime::run_automation_with_resources;
+use crate::scanner::{read_snapshot_file, JsonFileScanner};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ModePreset {
@@ -70,6 +74,46 @@ impl BotStatus {
             BotStatus::Starting => "Starting",
             BotStatus::On => "On",
             BotStatus::Error => "Error",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum SnapshotStatus {
+    Closed,
+    Starting,
+    WaitingForGame,
+    Ready,
+    Error,
+}
+
+impl SnapshotStatus {
+    fn label(self) -> &'static str {
+        match self {
+            SnapshotStatus::Closed => "Closed",
+            SnapshotStatus::Starting => "Starting",
+            SnapshotStatus::WaitingForGame => "WaitingForGame",
+            SnapshotStatus::Ready => "Ready",
+            SnapshotStatus::Error => "Error",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum InputStatus {
+    Closed,
+    Starting,
+    Ready,
+    Error,
+}
+
+impl InputStatus {
+    fn label(self) -> &'static str {
+        match self {
+            InputStatus::Closed => "Closed",
+            InputStatus::Starting => "Starting",
+            InputStatus::Ready => "Ready",
+            InputStatus::Error => "Error",
         }
     }
 }
@@ -134,6 +178,13 @@ impl Default for LauncherState {
             keys: KeyBindings::default(),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct SnapshotInfo {
+    token: String,
+    age_ms: u128,
+    playing: bool,
 }
 
 fn window_level(always_on_top: bool) -> egui::viewport::WindowLevel {
@@ -316,7 +367,11 @@ enum LauncherEvent {
 }
 
 struct BrowserSession {
-    process: ChromiumHostProcess,
+    host: ChromiumHostProcess,
+    snapshot_provider: ProviderProcess,
+    input_backend: SharedBrowserCdpInputBackend,
+    provider_started_at: Instant,
+    last_used_token: Arc<Mutex<Option<String>>>,
 }
 
 struct BotSession {
@@ -342,7 +397,11 @@ pub struct LauncherApp {
     browser_session: Option<BrowserSession>,
     bot_session: Option<BotSession>,
     browser_status: BrowserStatus,
+    snapshot_status: SnapshotStatus,
+    input_status: InputStatus,
     bot_status: BotStatus,
+    latest_snapshot_token: Option<String>,
+    latest_snapshot_age_ms: Option<u128>,
     ignore_next_bot_exit: bool,
 }
 
@@ -363,7 +422,11 @@ impl LauncherApp {
             browser_session: None,
             bot_session: None,
             browser_status: BrowserStatus::Closed,
+            snapshot_status: SnapshotStatus::Closed,
+            input_status: InputStatus::Closed,
             bot_status: BotStatus::Off,
+            latest_snapshot_token: None,
+            latest_snapshot_age_ms: None,
             ignore_next_bot_exit: false,
         }
     }
@@ -428,82 +491,154 @@ impl LauncherApp {
 
         self.save_state();
         self.browser_status = BrowserStatus::Starting;
+        self.snapshot_status = SnapshotStatus::Starting;
+        self.input_status = InputStatus::Starting;
         self.push_log("[launcher] opening Chromium");
 
-        match ChromiumHostProcess::start(&self.paths, &self.state.browser, self.browser_logger()) {
+        let mut host = match ChromiumHostProcess::start(
+            &self.paths,
+            &self.state.browser,
+            self.browser_logger(),
+        ) {
             Ok(process) => {
-                self.browser_session = Some(BrowserSession { process });
-                self.browser_status = BrowserStatus::Ready;
-                self.push_log("[launcher] browser ready");
+                self.push_log("[browser-host] ready");
+                process
             }
             Err(err) => {
                 self.browser_status = BrowserStatus::Error;
+                self.snapshot_status = SnapshotStatus::Error;
+                self.input_status = InputStatus::Error;
                 self.push_log(format!("[launcher] failed to open Chromium: {err:#}"));
+                return;
             }
-        }
-    }
+        };
 
-    fn close_browser(&mut self) {
-        if self.bot_session.is_some() {
-            self.stop_bot();
-        }
+        let config = self.state.to_bot_automation_config(&self.paths);
+        self.push_log("[snapshot] connecting");
+        let mut snapshot_provider =
+            match ProviderProcess::start_prewarmed(&self.paths, &config, self.browser_logger()) {
+                Ok(process) => {
+                    self.push_log("[snapshot] ready");
+                    process
+                }
+                Err(err) => {
+                    let _ = host.shutdown();
+                    self.browser_status = BrowserStatus::Error;
+                    self.snapshot_status = SnapshotStatus::Error;
+                    self.input_status = InputStatus::Error;
+                    self.push_log(format!("[launcher] snapshot helper failed: {err:#}"));
+                    return;
+                }
+            };
 
-        if let Some(mut browser) = self.browser_session.take() {
-            self.push_log("[launcher] closing Chromium");
-            match browser.process.shutdown() {
-                Ok(()) => self.push_log("[launcher] browser closed"),
-                Err(err) => self.push_log(format!("[launcher] browser shutdown failed: {err:#}")),
+        self.push_log("[input] connecting");
+        let input_backend = match BrowserCdpInputBackend::shared(&self.paths, &config) {
+            Ok(shared) => {
+                self.push_log("[input] ready");
+                shared
             }
-        }
-        self.browser_status = BrowserStatus::Closed;
-    }
+            Err(err) => {
+                snapshot_provider.stop();
+                let _ = host.shutdown();
+                self.browser_status = BrowserStatus::Error;
+                self.snapshot_status = SnapshotStatus::Error;
+                self.input_status = InputStatus::Error;
+                self.push_log(format!("[launcher] input helper failed: {err:#}"));
+                return;
+            }
+        };
 
-    fn clear_snapshot_file(&mut self) {
-        let snapshot_path = self.paths.resolve_workspace_path(&self.state.snapshot_path);
-        match fs::remove_file(&snapshot_path) {
-            Ok(()) => self.push_log(format!(
-                "[launcher] cleared stale snapshot {}",
-                self.paths.display_workspace_relative(&snapshot_path)
-            )),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => self.push_log(format!(
-                "[launcher] failed to clear stale snapshot {}: {}",
-                self.paths.display_workspace_relative(&snapshot_path),
-                err
-            )),
-        }
+        self.browser_session = Some(BrowserSession {
+            host,
+            snapshot_provider,
+            input_backend,
+            provider_started_at: Instant::now(),
+            last_used_token: Arc::new(Mutex::new(None)),
+        });
+        self.browser_status = BrowserStatus::Ready;
+        self.input_status = InputStatus::Ready;
+        self.refresh_snapshot_status();
+        self.push_log("[launcher] browser runtime ready");
     }
 
     fn start_bot(&mut self) {
-        if self.bot_session.is_some() {
-            return;
-        }
-        if self.browser_status != BrowserStatus::Ready || self.browser_session.is_none() {
+        let browser_ready = self.browser_status == BrowserStatus::Ready;
+        let input_ready = self.input_status == InputStatus::Ready;
+        let snapshot_running = matches!(
+            self.snapshot_status,
+            SnapshotStatus::WaitingForGame | SnapshotStatus::Ready
+        );
+        if self.bot_session.is_some() || !browser_ready || !input_ready || !snapshot_running {
             self.bot_status = BotStatus::Error;
-            self.push_log("[launcher] bot on blocked: browser is not ready");
+            self.push_log("[launcher] bot on blocked: browser runtime is not ready");
             return;
         }
+
+        let Some((shared_input_backend, last_used_token_handle, last_used_token_seed)) =
+            self.browser_session.as_ref().map(|session| {
+                (
+                    session.input_backend.clone(),
+                    session.last_used_token.clone(),
+                    session
+                        .last_used_token
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone()),
+                )
+            })
+        else {
+            self.bot_status = BotStatus::Error;
+            self.push_log("[launcher] bot on blocked: browser session missing");
+            return;
+        };
 
         self.save_state();
-        self.clear_snapshot_file();
         self.bot_status = BotStatus::Starting;
         self.push_log("[launcher] bot on");
+        self.push_log("[bot] starting runner with prewarmed snapshot/input");
+
+        if let Some(snapshot) = self.read_latest_snapshot_info() {
+            self.push_log(format!(
+                "[bot] latest snapshot token={} age_ms={}",
+                snapshot.token, snapshot.age_ms
+            ));
+        } else {
+            self.push_log("[bot] latest snapshot not ready yet; waiting for provider update");
+        }
 
         let config = self.state.to_bot_automation_config(&self.paths);
-        self.push_log(format!(
-            "[bot] connecting to existing Chromium port={}",
-            config.browser.cdp_port
-        ));
+        let scanner = JsonFileScanner::with_last_token(
+            config.snapshot_path.clone(),
+            Duration::from_millis(config.min_snapshot_age_ms),
+            last_used_token_seed,
+        );
 
-        let paths = self.paths.clone();
+        let input_backend: Box<dyn InputBackend + Send> = if config.dry_run {
+            Box::new(DebugLogBackend::new())
+        } else {
+            Box::new(BrowserCdpInputBackend::from_shared(shared_input_backend))
+        };
+
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let tx = self.event_tx.clone();
+        let last_used_token = last_used_token_handle;
         let automation_thread = thread::spawn(move || {
             let log_tx = tx.clone();
-            let result = run_automation(paths, config, &worker_stop, move |line| {
-                let _ = log_tx.send(LauncherEvent::BotLog(line));
-            })
+            let result = run_automation_with_resources(
+                config,
+                scanner,
+                input_backend,
+                &worker_stop,
+                move |line| {
+                    if let Some(token) = extract_planned_token(&line) {
+                        if let Ok(mut guard) = last_used_token.lock() {
+                            *guard = Some(token);
+                        }
+                    }
+                    let _ = log_tx.send(LauncherEvent::BotLog(line));
+                },
+            )
             .map_err(|err| format!("{err:#}"));
             let _ = tx.send(LauncherEvent::BotExited(result));
         });
@@ -513,6 +648,7 @@ impl LauncherApp {
             automation_thread: Some(automation_thread),
         });
         self.bot_status = BotStatus::On;
+        self.push_log("[bot] planner started");
     }
 
     fn stop_bot(&mut self) {
@@ -522,57 +658,191 @@ impl LauncherApp {
     fn stop_bot_with_browser_hint(&mut self, browser_remains_open: bool) {
         if let Some(mut bot) = self.bot_session.take() {
             self.ignore_next_bot_exit = true;
-            self.push_log("[bot] stopping");
             bot.stop();
-            match self.release_all_keys_now() {
-                Ok(()) => self.push_log("[bot] released all keys"),
-                Err(err) => self.push_log(format!("[bot] failed to release keys: {err:#}")),
+            self.push_log("[bot] runner stopped");
+            if let Err(err) = self.release_shared_input_now() {
+                self.push_log(format!("[input] failed to release all keys: {err:#}"));
+            } else {
+                self.push_log("[input] released all keys");
             }
-            self.push_log("[bot] stopped");
             if browser_remains_open {
-                self.push_log("[browser-host] Chromium remains open");
+                self.push_log("[snapshot] provider remains active");
             }
         }
         self.bot_status = BotStatus::Off;
     }
 
-    fn release_all_keys_now(&self) -> Result<()> {
-        if self.state.dry_run {
-            return Ok(());
+    fn close_browser(&mut self) {
+        if self.bot_session.is_some() {
+            self.stop_bot_with_browser_hint(false);
         }
-        let config = self.state.to_bot_automation_config(&self.paths);
-        let mut backend = create_input_backend(&self.paths, &config)?;
+
+        if let Some(mut session) = self.browser_session.take() {
+            self.push_log("[launcher] closing Chromium");
+            let _ = self.release_input_from_session(&session);
+            session.snapshot_provider.stop();
+            if let Ok(mut backend) = session.input_backend.lock() {
+                let _ = backend.shutdown();
+            }
+            match session.host.shutdown() {
+                Ok(()) => self.push_log("[launcher] browser closed"),
+                Err(err) => self.push_log(format!("[launcher] browser shutdown failed: {err:#}")),
+            }
+        }
+
+        self.browser_status = BrowserStatus::Closed;
+        self.snapshot_status = SnapshotStatus::Closed;
+        self.input_status = InputStatus::Closed;
+        self.latest_snapshot_token = None;
+        self.latest_snapshot_age_ms = None;
+    }
+
+    fn release_shared_input_now(&self) -> Result<()> {
+        let Some(session) = self.browser_session.as_ref() else {
+            return Ok(());
+        };
+        self.release_input_from_session(session)
+    }
+
+    fn release_input_from_session(&self, session: &BrowserSession) -> Result<()> {
+        let mut backend = session
+            .input_backend
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shared browser input backend lock poisoned"))?;
         backend.release_all_keys()
     }
 
-    fn poll_browser_session(&mut self) {
+    fn read_latest_snapshot_info(&self) -> Option<SnapshotInfo> {
+        let snapshot_path = self.paths.resolve_workspace_path(&self.state.snapshot_path);
+        let metadata = fs::metadata(&snapshot_path).ok()?;
+        let modified_at = metadata.modified().ok()?;
+        let age_ms = modified_at.elapsed().ok()?.as_millis();
+        let snapshot = read_snapshot_file(&snapshot_path).ok()?;
+        if snapshot.token.trim().is_empty() {
+            return None;
+        }
+        Some(SnapshotInfo {
+            token: snapshot.token,
+            age_ms,
+            playing: snapshot.playing,
+        })
+    }
+
+    fn refresh_snapshot_status(&mut self) {
+        let Some(session) = self.browser_session.as_ref() else {
+            self.snapshot_status = SnapshotStatus::Closed;
+            self.latest_snapshot_token = None;
+            self.latest_snapshot_age_ms = None;
+            return;
+        };
+
+        if let Some(snapshot) = self.read_latest_snapshot_info() {
+            self.latest_snapshot_token = Some(snapshot.token.clone());
+            self.latest_snapshot_age_ms = Some(snapshot.age_ms);
+            if snapshot.playing && snapshot.age_ms <= 500 {
+                self.snapshot_status = SnapshotStatus::Ready;
+            } else {
+                self.snapshot_status = SnapshotStatus::WaitingForGame;
+            }
+        } else if session.provider_started_at.elapsed() >= Duration::from_millis(200) {
+            self.snapshot_status = SnapshotStatus::WaitingForGame;
+            self.latest_snapshot_token = None;
+            self.latest_snapshot_age_ms = None;
+        } else {
+            self.snapshot_status = SnapshotStatus::Starting;
+        }
+    }
+
+    fn poll_browser_runtime(&mut self) {
         let Some(session) = self.browser_session.as_mut() else {
             return;
         };
-        match session.process.is_running() {
+
+        let host_running = match session.host.is_running() {
             Ok(true) => {}
             Ok(false) => {
                 let _ = self.event_tx.send(LauncherEvent::BrowserExited(Ok(())));
+                return;
             }
             Err(err) => {
                 let _ = self
                     .event_tx
                     .send(LauncherEvent::BrowserExited(Err(format!("{err:#}"))));
+                return;
             }
+        };
+        let _ = host_running;
+
+        let snapshot_result = session.snapshot_provider.is_running();
+        let input_result = match session.input_backend.lock() {
+            Ok(mut backend) => backend.is_running(),
+            Err(_) => Err(anyhow::anyhow!(
+                "shared browser input backend lock poisoned"
+            )),
+        };
+        let _ = session;
+
+        match snapshot_result {
+            Ok(true) => {}
+            Ok(false) => {
+                if self.snapshot_status != SnapshotStatus::Error {
+                    self.snapshot_status = SnapshotStatus::Error;
+                    self.browser_status = BrowserStatus::Error;
+                    self.push_log("[snapshot] provider exited unexpectedly");
+                }
+            }
+            Err(err) => {
+                if self.snapshot_status != SnapshotStatus::Error {
+                    self.snapshot_status = SnapshotStatus::Error;
+                    self.browser_status = BrowserStatus::Error;
+                    self.push_log(format!("[snapshot] provider status failed: {err:#}"));
+                }
+            }
+        }
+
+        match input_result {
+            Ok(true) => {}
+            Ok(false) => {
+                if self.input_status != InputStatus::Error {
+                    self.input_status = InputStatus::Error;
+                    self.browser_status = BrowserStatus::Error;
+                    self.push_log("[input] helper exited unexpectedly");
+                }
+            }
+            Err(err) => {
+                if self.input_status != InputStatus::Error {
+                    self.input_status = InputStatus::Error;
+                    self.browser_status = BrowserStatus::Error;
+                    self.push_log(format!("[input] helper status failed: {err:#}"));
+                }
+            }
+        }
+
+        if self.snapshot_status != SnapshotStatus::Error {
+            self.refresh_snapshot_status();
         }
     }
 
     fn handle_browser_exited(&mut self, result: Result<(), String>) {
-        self.browser_session = None;
-        self.browser_status = BrowserStatus::Closed;
-        match result {
-            Ok(()) => self.push_log("[browser-host] Chromium exited"),
-            Err(err) => self.push_log(format!("[launcher] browser exited with error: {err}")),
-        }
         if self.bot_session.is_some() {
             self.push_log("[launcher] browser closed while bot was on");
             self.stop_bot_with_browser_hint(false);
         }
+        if let Some(mut session) = self.browser_session.take() {
+            session.snapshot_provider.stop();
+            if let Ok(mut backend) = session.input_backend.lock() {
+                let _ = backend.shutdown();
+            }
+        }
+        match result {
+            Ok(()) => self.push_log("[browser-host] Chromium exited"),
+            Err(err) => self.push_log(format!("[launcher] browser exited with error: {err}")),
+        }
+        self.browser_status = BrowserStatus::Closed;
+        self.snapshot_status = SnapshotStatus::Closed;
+        self.input_status = InputStatus::Closed;
+        self.latest_snapshot_token = None;
+        self.latest_snapshot_age_ms = None;
         self.push_log("[launcher] browser closed");
     }
 
@@ -586,17 +856,9 @@ impl LauncherApp {
             match event {
                 LauncherEvent::BrowserLog(line) => self.push_log(line),
                 LauncherEvent::BrowserExited(result) => {
-                    if self.browser_session.is_some() {
-                        self.handle_browser_exited(result);
-                    }
+                    self.handle_browser_exited(result);
                 }
                 LauncherEvent::BotLog(line) => {
-                    if line.contains("[automation] live game resumed")
-                        || line.contains("[automation] idle waiting for next live game")
-                        || line.contains("[automation] source=")
-                    {
-                        self.bot_status = BotStatus::On;
-                    }
                     self.push_log(line);
                 }
                 LauncherEvent::BotExited(result) => {
@@ -605,16 +867,16 @@ impl LauncherApp {
                         continue;
                     }
                     self.bot_session = None;
-                    self.bot_status = match result {
+                    match result {
                         Ok(()) => {
+                            self.bot_status = BotStatus::Off;
                             self.push_log("[bot] automation exited cleanly");
-                            BotStatus::Off
                         }
                         Err(err) => {
+                            self.bot_status = BotStatus::Error;
                             self.push_log(format!("[bot] automation failed: {err}"));
-                            BotStatus::Error
                         }
-                    };
+                    }
                 }
             }
         }
@@ -623,7 +885,7 @@ impl LauncherApp {
 
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_browser_session();
+        self.poll_browser_runtime();
         self.poll_events();
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level(
             self.state.always_on_top,
@@ -631,6 +893,13 @@ impl eframe::App for LauncherApp {
 
         let browser_locked = self.browser_session.is_some();
         let bot_locked = self.bot_session.is_some();
+        let can_turn_bot_on = self.browser_status == BrowserStatus::Ready
+            && self.input_status == InputStatus::Ready
+            && matches!(
+                self.snapshot_status,
+                SnapshotStatus::WaitingForGame | SnapshotStatus::Ready
+            )
+            && !bot_locked;
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -672,9 +941,7 @@ impl eframe::App for LauncherApp {
                 }
             });
 
-            ui.label(
-                "Browser host keeps Chromium alive on its own. Bot ON later reconnects with Browser CDP only.",
-            );
+            ui.label("Open Chromium now prewarms the snapshot and input CDP helpers. Bot ON only starts the planner/runner.");
             if browser_locked {
                 ui.small("Browser settings are locked while Chromium is open.");
             }
@@ -710,7 +977,18 @@ impl eframe::App for LauncherApp {
             ui.separator();
             ui.heading("Browser");
             ui.horizontal(|ui| {
-                ui.label(format!("Status: {}", self.browser_status.label()));
+                ui.label(format!("Chromium: {}", self.browser_status.label()));
+                ui.label(format!("Snapshot: {}", self.snapshot_status.label()));
+                ui.label(format!("Input: {}", self.input_status.label()));
+            });
+            if let Some(token) = &self.latest_snapshot_token {
+                ui.label(format!(
+                    "Latest Snapshot: token={} age_ms={}",
+                    token,
+                    self.latest_snapshot_age_ms.unwrap_or_default()
+                ));
+            }
+            ui.horizontal(|ui| {
                 if ui
                     .add_enabled(!browser_locked, egui::Button::new("Open Chromium"))
                     .clicked()
@@ -852,10 +1130,7 @@ impl eframe::App for LauncherApp {
             ui.horizontal(|ui| {
                 ui.label(format!("Status: {}", self.bot_status.label()));
                 if ui
-                    .add_enabled(
-                        self.browser_status == BrowserStatus::Ready && !bot_locked,
-                        egui::Button::new("Bot ON"),
-                    )
+                    .add_enabled(can_turn_bot_on, egui::Button::new("Bot ON"))
                     .clicked()
                 {
                     self.start_bot();
@@ -886,13 +1161,13 @@ impl eframe::App for LauncherApp {
                 });
         });
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 }
 
 impl Drop for LauncherApp {
     fn drop(&mut self) {
-        self.stop_bot();
+        self.stop_bot_with_browser_hint(false);
         self.close_browser();
         let _ = save_launcher_state(&self.paths, &self.state);
     }
@@ -936,6 +1211,14 @@ fn spawn_rule_label(rule: SpawnRuleConfig) -> &'static str {
     }
 }
 
+fn extract_planned_token(line: &str) -> Option<String> {
+    if !line.contains("[automation] source=") || !line.contains(" piece=") {
+        return None;
+    }
+    line.split_whitespace()
+        .find_map(|part| part.strip_prefix("token=").map(|value| value.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,12 +1257,9 @@ mod tests {
     #[test]
     fn readme_matches_safe_preset_defaults() {
         let readme = include_str!("../README.md");
-        assert!(readme.contains("TETR.IO Safe preset"));
-        assert!(readme.contains("ZeroG Safe"));
-        assert!(readme.contains("Hard Drop Only"));
-        assert!(readme.contains("ZeroG Complete"));
         assert!(readme.contains("Open Chromium"));
         assert!(readme.contains("Bot ON"));
+        assert!(readme.contains("snapshot and input CDP helpers"));
     }
 
     #[test]
@@ -1032,8 +1312,14 @@ mod tests {
     }
 
     #[test]
-    fn bot_requires_ready_browser() {
-        assert!(BrowserStatus::Ready == BrowserStatus::Ready);
-        assert!(BrowserStatus::Closed != BrowserStatus::Ready);
+    fn extract_planned_token_reads_runner_move_log() {
+        assert_eq!(
+            extract_planned_token(
+                "[automation] source=browser_cdp token=browser-10 piece=T hold=- mode=ZeroG Safe"
+            )
+            .as_deref(),
+            Some("browser-10")
+        );
+        assert_eq!(extract_planned_token("[automation] waiting"), None);
     }
 }

@@ -117,6 +117,16 @@ impl JsonFileScanner {
             pending_seen_count: 0,
         }
     }
+
+    pub fn with_last_token(
+        path: PathBuf,
+        min_snapshot_age: Duration,
+        last_token: Option<String>,
+    ) -> Self {
+        let mut scanner = Self::new(path, min_snapshot_age);
+        scanner.last_token = last_token;
+        scanner
+    }
 }
 
 impl SnapshotScanner for JsonFileScanner {

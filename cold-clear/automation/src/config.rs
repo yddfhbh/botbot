@@ -110,7 +110,7 @@ impl Default for BrowserCdpConfig {
             probe_page_state: true,
             use_ribbon_websocket: true,
             use_seed_simulation_fallback: true,
-            bootstrap_timeout_ms: 2500,
+            bootstrap_timeout_ms: 500,
         }
     }
 }

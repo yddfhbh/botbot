@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -60,6 +61,18 @@ struct ActionDelayProfile {
 pub trait InputBackend {
     fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()>;
     fn release_all_keys(&mut self) -> Result<()>;
+}
+
+pub type SharedBrowserCdpInputBackend = Arc<Mutex<BrowserCdpInputBackend>>;
+
+impl<T: InputBackend + ?Sized> InputBackend for Box<T> {
+    fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()> {
+        (**self).tap(action, duration)
+    }
+
+    fn release_all_keys(&mut self) -> Result<()> {
+        (**self).release_all_keys()
+    }
 }
 
 pub fn create_input_backend(
@@ -668,6 +681,7 @@ pub struct BrowserCdpInputBackend {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_command_id: u64,
+    exited: bool,
 }
 
 impl BrowserCdpInputBackend {
@@ -708,12 +722,50 @@ impl BrowserCdpInputBackend {
             .stdout
             .take()
             .context("browser input helper stdout was not available")?;
-        Ok(Self {
+        let mut backend = Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
             next_command_id: 1,
-        })
+            exited: false,
+        };
+        backend.wait_for_ready(Duration::from_secs(1))?;
+        Ok(backend)
+    }
+
+    pub fn shared(
+        paths: &AppPaths,
+        config: &AutomationConfig,
+    ) -> Result<SharedBrowserCdpInputBackend> {
+        Ok(Arc::new(Mutex::new(Self::new(paths, config)?)))
+    }
+
+    pub fn from_shared(inner: SharedBrowserCdpInputBackend) -> SharedBrowserCdpInputBackendHandle {
+        SharedBrowserCdpInputBackendHandle { inner }
+    }
+
+    pub fn is_running(&mut self) -> Result<bool> {
+        if self.exited {
+            return Ok(false);
+        }
+        if self.child.try_wait()?.is_some() {
+            self.exited = true;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    pub fn shutdown(&mut self) -> Result<()> {
+        if self.exited {
+            return Ok(());
+        }
+        let _ = self.stdin.write_all(br#"{"type":"quit"}"#);
+        let _ = self.stdin.write_all(b"\n");
+        let _ = self.stdin.flush();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.exited = true;
+        Ok(())
     }
 
     fn command_name_for(action: GameAction) -> &'static str {
@@ -746,6 +798,38 @@ impl BrowserCdpInputBackend {
             .flush()
             .context("failed to flush browser input helper")?;
         self.wait_for_command_response(id, command_type)
+    }
+
+    fn wait_for_ready(&mut self, _timeout: Duration) -> Result<()> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = self
+                .stdout
+                .read_line(&mut line)
+                .context("failed to read browser input helper ready response")?;
+            if read == 0 {
+                bail!("browser input helper exited before sending ready response");
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let response: BrowserInputHelperResponse =
+                serde_json::from_str(trimmed).with_context(|| {
+                    format!("failed to parse browser input helper ready response: {trimmed}")
+                })?;
+            if response.r#type.as_deref() != Some("ready") {
+                continue;
+            }
+            if response.ok {
+                return Ok(());
+            }
+            bail!(
+                "browser input helper failed to become ready: {}",
+                response.error.unwrap_or_else(|| "unknown error".to_owned())
+            );
+        }
     }
 
     fn wait_for_command_response(&mut self, id: u64, command_type: &'static str) -> Result<()> {
@@ -794,11 +878,7 @@ impl BrowserCdpInputBackend {
 
 impl Drop for BrowserCdpInputBackend {
     fn drop(&mut self) {
-        let _ = self.stdin.write_all(br#"{"type":"quit"}"#);
-        let _ = self.stdin.write_all(b"\n");
-        let _ = self.stdin.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.shutdown();
     }
 }
 
@@ -819,6 +899,28 @@ impl InputBackend for BrowserCdpInputBackend {
         self.send_command("releaseAll", |id| {
             format!(r#"{{"id":{},"type":"releaseAll"}}"#, id)
         })
+    }
+}
+
+pub struct SharedBrowserCdpInputBackendHandle {
+    inner: SharedBrowserCdpInputBackend,
+}
+
+impl InputBackend for SharedBrowserCdpInputBackendHandle {
+    fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()> {
+        let mut backend = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shared browser input backend lock poisoned"))?;
+        backend.tap(action, duration)
+    }
+
+    fn release_all_keys(&mut self) -> Result<()> {
+        let mut backend = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shared browser input backend lock poisoned"))?;
+        backend.release_all_keys()
     }
 }
 

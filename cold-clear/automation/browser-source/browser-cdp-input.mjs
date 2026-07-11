@@ -1,11 +1,14 @@
-import { spawn } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import readline from "node:readline";
+import { pathToFileURL } from "node:url";
 
-const DEFAULT_URL = "https://tetr.io/";
-const DEFAULT_PORT = 9222;
+import {
+  DEFAULT_PORT,
+  DEFAULT_URL,
+  isCdpOpen,
+  launchChromium,
+  shutdownChromium,
+  waitForCdpReady
+} from "./chromium-launch.mjs";
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -16,15 +19,18 @@ async function main() {
   const chromePath = process.env.CHROME_PATH || "";
 
   let browserProcess = null;
+  let ownsChromium = false;
   if (!connectOnly) {
     const alreadyOpen = await isCdpOpen(port);
     if (!alreadyOpen) {
       browserProcess = launchChromium({ port, url, chromePath });
+      ownsChromium = true;
     }
   }
 
-  await waitForCdp(port);
+  await waitForCdpReady(port);
   let cdp = await connectToTarget({ port, url, targetHint });
+  writeResponse({ type: "ready", ok: true });
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -44,7 +50,9 @@ async function main() {
 
     if (message.type === "quit") {
       await cdp.close().catch(() => undefined);
-      browserProcess?.kill();
+      if (ownsChromium && browserProcess) {
+        await shutdownChromium(browserProcess);
+      }
       process.exit(0);
       return;
     }
@@ -100,6 +108,9 @@ async function main() {
 
   process.on("SIGINT", async () => {
     await cdp.close().catch(() => undefined);
+    if (ownsChromium && browserProcess) {
+      await shutdownChromium(browserProcess);
+    }
     process.exit(0);
   });
 }
@@ -221,66 +232,6 @@ function parseArgs(argv) {
 function numberArg(value, fallback) {
   const parsed = Number.parseInt(value ?? `${fallback}`, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-function launchChromium({ port, url, chromePath }) {
-  const executable = chromePath || findChromiumExecutable();
-  if (!executable) {
-    throw new Error("Could not find Chrome/Edge. Set CHROME_PATH to the browser executable.");
-  }
-  const profileDir = path.join(os.tmpdir(), `botbot-tetrio-input-${port}`);
-  mkdirSync(profileDir, { recursive: true });
-  return spawn(
-    executable,
-    [
-      `--remote-debugging-port=${port}`,
-      "--remote-allow-origins=*",
-      `--user-data-dir=${profileDir}`,
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-background-timer-throttling",
-      "--disable-renderer-backgrounding",
-      "--disable-backgrounding-occluded-windows",
-      "--disable-features=Translate,CalculateNativeWinOcclusion",
-      url
-    ],
-    {
-      detached: false,
-      stdio: ["ignore", "ignore", "ignore"]
-    }
-  );
-}
-
-function findChromiumExecutable() {
-  const localAppData = process.env.LOCALAPPDATA;
-  const programFiles = process.env.ProgramFiles;
-  const programFilesX86 = process.env["ProgramFiles(x86)"];
-  const candidates = [
-    programFiles && path.join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
-    programFilesX86 && path.join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
-    localAppData && path.join(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
-    programFiles && path.join(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
-    programFilesX86 && path.join(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe")
-  ].filter(Boolean);
-  return candidates.find((candidate) => existsSync(candidate)) ?? null;
-}
-
-async function isCdpOpen(port) {
-  try {
-    const response = await fetch(`http://127.0.0.1:${port}/json/version`);
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
-async function waitForCdp(port) {
-  const deadline = Date.now() + 15000;
-  while (Date.now() < deadline) {
-    if (await isCdpOpen(port)) return;
-    await sleep(250);
-  }
-  throw new Error(`Chrome DevTools endpoint did not open on port ${port}`);
 }
 
 async function findOrCreateTarget({ port, url, targetHint }) {
@@ -414,7 +365,12 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 }
 
-main().catch((error) => {
-  console.error("[input:cdp] fatal:", error?.message ?? error);
-  process.exit(1);
-});
+const isDirectRun =
+  Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isDirectRun) {
+  main().catch((error) => {
+    console.error("[input:cdp] fatal:", error?.message ?? error);
+    process.exit(1);
+  });
+}

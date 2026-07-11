@@ -62,7 +62,7 @@ Running without arguments opens the launcher window. From there you can:
 - use the split Browser/Bot launcher
 - edit Browser CDP connection fields such as Chrome path, port, URL, target hint, and ribbon/seed fallbacks
 - edit dry-run, target PPS, timings, movement mode, and spawn rule
-- click `Open Chromium`, log into TETR.IO, and prepare the solo/custom room yourself
+- click `Open Chromium` to prewarm the snapshot and input CDP helpers, then log into TETR.IO and prepare the solo/custom room yourself
 - click `Bot ON` to attach the existing Browser CDP helper without launching a second Chromium
 - click `Bot OFF` to stop automation immediately while keeping Chromium open
 - click `Close Chromium` when you want the launcher-owned browser host to shut the window down
@@ -165,8 +165,8 @@ current/queue state that has stayed stable for two frames before starting the ne
 
 Browser CDP mode now has two layers:
 
-- `Open Chromium` starts a lightweight browser host that only launches Chromium and keeps the CDP port alive
-- `Bot ON` starts the snapshot helper in `connect_only` mode so it reuses that Chromium instead of launching another one
+- `Open Chromium` starts a lightweight browser host, prewarms the snapshot and input CDP helpers, and keeps the CDP port alive
+- `Bot ON` reuses the already-connected snapshot and input helpers instead of launching another Chromium or reconnecting CDP from scratch
 
 The snapshot helper probes TETR.IO page state first, optionally watches the ribbon WebSocket for seed/options,
 and can fall back to seed-based 7-bag reconstruction before falling all the way back to the screen scanner.

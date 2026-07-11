@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::config::{AutomationConfig, BrowserCdpConfig, SnapshotProviderConfig};
 use crate::paths::AppPaths;
@@ -25,6 +26,7 @@ pub fn emit_log(logger: &SharedLogger, line: impl Into<String>) {
 pub struct ProviderProcess {
     child: Child,
     log_threads: Vec<JoinHandle<()>>,
+    exited: bool,
 }
 
 pub struct ChromiumHostProcess {
@@ -47,7 +49,7 @@ impl ProviderProcess {
                 Ok(Some(process))
             }
             SnapshotProviderConfig::BrowserCdp => {
-                match spawn_browser_provider(paths, config, logger.clone()) {
+                match spawn_browser_provider(paths, config, logger.clone(), true) {
                     Ok(process) => Ok(Some(process)),
                     Err(err) => {
                         emit_log(
@@ -65,11 +67,37 @@ impl ProviderProcess {
     }
 
     pub fn stop(&mut self) {
+        if self.exited {
+            return;
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.exited = true;
         for handle in self.log_threads.drain(..) {
             let _ = handle.join();
         }
+    }
+
+    pub fn start_prewarmed(
+        paths: &AppPaths,
+        config: &AutomationConfig,
+        logger: SharedLogger,
+    ) -> Result<Self> {
+        spawn_browser_provider(paths, config, logger, false)
+    }
+
+    pub fn is_running(&mut self) -> Result<bool> {
+        if self.exited {
+            return Ok(false);
+        }
+        if self.child.try_wait()?.is_some() {
+            self.exited = true;
+            for handle in self.log_threads.drain(..) {
+                let _ = handle.join();
+            }
+            return Ok(false);
+        }
+        Ok(true)
     }
 }
 
@@ -269,6 +297,7 @@ fn spawn_browser_provider(
     paths: &AppPaths,
     config: &AutomationConfig,
     logger: SharedLogger,
+    wait_for_snapshot: bool,
 ) -> Result<ProviderProcess> {
     let script = &paths.browser_snapshot_script_path;
     let snapshot_path = config.snapshot_path.clone();
@@ -308,14 +337,32 @@ fn spawn_browser_provider(
             script.display()
         )
     })?;
-
-    let log_threads =
-        take_process_logs(&mut child, "[browser] ", "[browser][err] ", logger.clone());
-    wait_for_launch_health(
+    let stdout = child
+        .stdout
+        .take()
+        .context("browser snapshot helper stdout was not available")?;
+    let mut stdout_reader = BufReader::new(stdout);
+    wait_for_helper_ready(
         &mut child,
-        Duration::from_millis(config.browser.bootstrap_timeout_ms),
-        &snapshot_path,
+        &mut stdout_reader,
+        Duration::from_millis(config.browser.bootstrap_timeout_ms.max(300)),
+        "browser snapshot helper",
     )?;
+    let mut log_threads = vec![spawn_log_reader_thread(
+        "[browser] ",
+        stdout_reader,
+        logger.clone(),
+    )];
+    if let Some(stderr) = child.stderr.take() {
+        log_threads.push(spawn_log_thread("[browser][err] ", stderr, logger.clone()));
+    }
+    if wait_for_snapshot {
+        wait_for_launch_health(
+            &mut child,
+            Duration::from_millis(config.browser.bootstrap_timeout_ms),
+            &snapshot_path,
+        )?;
+    }
     emit_log(
         &logger,
         format!(
@@ -323,7 +370,11 @@ fn spawn_browser_provider(
             config.browser.target_hint, config.browser.connect_only
         ),
     );
-    Ok(ProviderProcess { child, log_threads })
+    Ok(ProviderProcess {
+        child,
+        log_threads,
+        exited: false,
+    })
 }
 
 fn spawn_scanner_provider(
@@ -354,7 +405,11 @@ fn spawn_scanner_provider(
         &logger,
         format!("[scanner] launched with {}", scanner_config.display()),
     );
-    Ok(ProviderProcess { child, log_threads })
+    Ok(ProviderProcess {
+        child,
+        log_threads,
+        exited: false,
+    })
 }
 
 fn wait_for_launch_health(
@@ -429,6 +484,101 @@ fn take_process_logs(
         threads.push(spawn_log_thread(stderr_prefix, stderr, logger));
     }
     threads
+}
+
+fn wait_for_helper_ready<R>(
+    child: &mut Child,
+    stdout_reader: &mut BufReader<R>,
+    timeout: Duration,
+    helper_name: &str,
+) -> Result<()>
+where
+    R: std::io::Read,
+{
+    let deadline = Instant::now() + timeout;
+    let mut line = String::new();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("{helper_name} exited early with status {status}");
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "{helper_name} did not report ready within {}ms",
+                timeout.as_millis()
+            );
+        }
+
+        line.clear();
+        match stdout_reader.read_line(&mut line) {
+            Ok(0) => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if helper_ready_message(trimmed) {
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                anyhow::bail!("failed to read {helper_name} ready response: {err}");
+            }
+        }
+    }
+}
+
+fn helper_ready_message(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    value
+        .get("type")
+        .and_then(|value| value.as_str())
+        .map(|value| value == "ready")
+        .unwrap_or(false)
+        && value
+            .get("ok")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+}
+
+fn spawn_log_reader_thread<R>(
+    prefix: &'static str,
+    reader: BufReader<R>,
+    logger: SharedLogger,
+) -> JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = reader;
+        let mut buffer = Vec::new();
+        loop {
+            buffer.clear();
+            match reader.read_until(b'\n', &mut buffer) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buffer)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_string();
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if line.starts_with(prefix.trim_end()) {
+                        emit_log(&logger, line);
+                    } else {
+                        emit_log(&logger, format!("{prefix}{line}"));
+                    }
+                }
+                Err(err) => {
+                    emit_log(&logger, format!("{prefix}read error: {err}"));
+                    break;
+                }
+            }
+        }
+    })
 }
 
 fn spawn_log_thread<R>(prefix: &'static str, reader: R, logger: SharedLogger) -> JoinHandle<()>
