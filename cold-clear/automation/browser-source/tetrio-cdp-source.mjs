@@ -135,6 +135,21 @@ export function shouldResetDiscoveryOnExecutionContextsCleared(probeState) {
   return Boolean(probeState?.gameCaptured || probeState?.lastCaptureSource);
 }
 
+export function isLikelyGamePage({
+  href = "",
+  pathname = "",
+  hash = "",
+  pageTitle = "",
+  bodyClass = "",
+  largeCanvasCount = 0
+} = {}) {
+  const text = [href, pathname, hash, pageTitle, bodyClass].join(" ").toLowerCase();
+  if (/(play|solo|custom|room|league|match|game|blitz|40l|zen|replay|sandbox)/.test(text)) {
+    return true;
+  }
+  return Number(largeCanvasCount) >= 2;
+}
+
 async function clearCachedGameHandle(cdp) {
   await safeRuntimeEvaluate(
     cdp,
@@ -793,8 +808,10 @@ async function readTetrioState(cdp, options) {
   let state = rawState.ok ? snapshotFromRaw(rawState) : buildNoGameFailure(rawState, options);
   options.probeState.lastKnownPlaying = Boolean(state?.playing);
   let probeStatus = "skipped";
+  const likelyGamePage = rawState?.pageHints?.likelyGamePage !== false;
 
   const shouldCapture = options.probePageState &&
+    likelyGamePage &&
     options.probeState.probeAttempts < 1 &&
     options.probeState.startupDirectScanAttempts >= 3 &&
     shouldAttemptDebuggerProbe({
@@ -845,6 +862,7 @@ async function readTetrioState(cdp, options) {
   const retainedLogs = (state.logs ?? []).filter((line) => !line.startsWith("[browser] reject reason="));
   state.logs = [
     ...retainedLogs,
+    `[browser] pageHints likelyGamePage=${Boolean(rawState?.pageHints?.likelyGamePage)} canvasCount=${rawState?.pageHints?.canvasCount ?? 0} largeCanvasCount=${rawState?.pageHints?.largeCanvasCount ?? 0} hash=${rawState?.pageHints?.hash || "-"}`,
     `[browser] discovery gameCaptured=${options.probeState.gameCaptured} directAttempts=${options.probeState.startupDirectScanAttempts} directDisabledReason=${rawState?.scanReason ?? "none"} probeMode=${options.debuggerProbeMode} probePageState=${options.probePageState} probeStatus=${probeStatus}`,
     `[browser] reject reason=${rejectReason} scan=${rawState?.scanMode ?? "disabled"} attempted=${Boolean(rawState?.scanAttempted)} probe=${probeStatus}`
   ];
@@ -865,6 +883,7 @@ function buildNoGameFailure(rawState, options) {
         url: options.targetUrl
       },
       lastReason: rawState?.reason ?? "page probe returned empty",
+      pageHints: rawState?.pageHints ?? null,
       windowKeys: rawState?.windowKeys ?? [],
       directCandidatePaths: rawState?.directCandidatePaths ?? [],
       gameSearchStats: rawState?.gameSearchStats ?? null
@@ -913,6 +932,35 @@ export function captureTetrioExportExpression({
       }
       return null;
     };
+    const canvasElements = (() => {
+      try {
+        return Array.from(document.querySelectorAll("canvas")).slice(0, 8);
+      } catch {
+        return [];
+      }
+    })();
+    const largeCanvasCount = canvasElements.filter((canvas) => {
+      const width = Math.max(Number(canvas?.width) || 0, Number(canvas?.clientWidth) || 0);
+      const height = Math.max(Number(canvas?.height) || 0, Number(canvas?.clientHeight) || 0);
+      return width >= 240 && height >= 180;
+    }).length;
+    const bodyClass =
+      typeof document.body?.className === "string" ? document.body.className.slice(0, 120) : "";
+    const pathText = [location.href, location.pathname, location.hash, document.title, bodyClass]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    const likelyGamePage =
+      /(play|solo|custom|room|league|match|game|blitz|40l|zen|replay|sandbox)/.test(pathText) ||
+      largeCanvasCount >= 2;
+    const pageHints = {
+      likelyGamePage,
+      pathname: location.pathname,
+      hash: location.hash,
+      bodyClass,
+      canvasCount: canvasElements.length,
+      largeCanvasCount
+    };
     const directCandidates = [
       ["window.__fusionTetrioGame", window.__fusionTetrioGame],
       ["window.tetrioGame", window.tetrioGame],
@@ -938,6 +986,7 @@ export function captureTetrioExportExpression({
           exported,
           boardState,
           pageHints: {
+            ...pageHints,
             gameIsPlaying: typeof game.isPlaying === "function" ? Boolean(game.isPlaying()) : null,
             gameIsStarted: typeof game.isStarted === "function" ? Boolean(game.isStarted()) : null
           }
@@ -954,7 +1003,8 @@ export function captureTetrioExportExpression({
           cacheInvalidated: true,
           reason: error?.message || "cached TETR.IO game object became invalid",
           href: location.href,
-          pageTitle: document.title
+          pageTitle: document.title,
+          pageHints
         };
       }
     }
@@ -972,7 +1022,7 @@ export function captureTetrioExportExpression({
           break;
         }
       }
-      if (!located) {
+      if (!located && likelyGamePage) {
         let names = [];
         try {
           names = Object.getOwnPropertyNames(window).slice(0, startupWindowPropertyLimit);
@@ -995,10 +1045,15 @@ export function captureTetrioExportExpression({
         quick: false,
         scanMode: allowStartupDirectScan ? "startup_direct" : "disabled",
         scanAttempted: allowStartupDirectScan,
-        scanReason: allowStartupDirectScan ? "no_game" : directDisabledReason,
+        scanReason: allowStartupDirectScan
+          ? likelyGamePage
+            ? "no_game"
+            : "not_game_page"
+          : directDisabledReason,
         reason: "TETR.IO game instance not captured yet",
         href: location.href,
-        pageTitle: document.title
+        pageTitle: document.title,
+        pageHints
       };
     }
 
@@ -1017,6 +1072,7 @@ export function captureTetrioExportExpression({
       exported,
       boardState,
       pageHints: {
+        ...pageHints,
         gameIsPlaying: typeof game.isPlaying === "function" ? Boolean(game.isPlaying()) : null,
         gameIsStarted: typeof game.isStarted === "function" ? Boolean(game.isStarted()) : null
       }

@@ -7,6 +7,7 @@ import {
   computeEffectiveStatePollMs,
   formatStateEvalPerfLog,
   isMainFrameDocumentNavigation,
+  isLikelyGamePage,
   isTopFrameNavigation,
   resetDiscoveryState,
   shouldResetDiscoveryOnExecutionContextsCleared,
@@ -27,13 +28,23 @@ function createMockGame() {
   };
 }
 
-function runCaptureExpression(windowOverrides, options = {}) {
+function runCaptureExpression(windowOverrides, options = {}, contextOverrides = {}) {
   const windowObject = { ...windowOverrides };
   windowObject.window = windowObject;
   const context = {
     window: windowObject,
-    document: { title: "TETR.IO" },
-    location: { href: "https://tetr.io/" }
+    document: {
+      title: "TETR.IO",
+      querySelectorAll: () => [],
+      body: { className: "" },
+      ...contextOverrides.document
+    },
+    location: {
+      href: "https://tetr.io/",
+      pathname: "/",
+      hash: "",
+      ...contextOverrides.location
+    }
   };
   const result = vm.runInNewContext(captureTetrioExportExpression(options), context);
   return { result, windowObject };
@@ -159,12 +170,62 @@ test("startup direct scan finds top-level window property game", () => {
     {
       hiddenFusionSlot: mockGame
     },
-    { allowStartupDirectScan: true }
+    { allowStartupDirectScan: true },
+    {
+      location: {
+        href: "https://tetr.io/#solo",
+        hash: "#solo"
+      }
+    }
   );
 
   assert.equal(result.ok, true);
   assert.equal(result.captureSource, "window.hiddenFusionSlot");
   assert.equal(windowObject.__fusionTetrioGame, mockGame);
+});
+
+test("likely game page heuristic stays false on the root home page", () => {
+  assert.equal(
+    isLikelyGamePage({
+      href: "https://tetr.io/",
+      pathname: "/",
+      hash: "",
+      pageTitle: "TETR.IO",
+      bodyClass: "",
+      largeCanvasCount: 0
+    }),
+    false
+  );
+});
+
+test("likely game page heuristic turns true for solo routes", () => {
+  assert.equal(
+    isLikelyGamePage({
+      href: "https://tetr.io/#solo",
+      pathname: "/",
+      hash: "#solo",
+      pageTitle: "TETR.IO",
+      bodyClass: "",
+      largeCanvasCount: 0
+    }),
+    true
+  );
+});
+
+test("root home page skips expensive top-level discovery", () => {
+  const mockGame = createMockGame();
+  const { result, windowObject } = runCaptureExpression(
+    {
+      hiddenFusionSlot: mockGame
+    },
+    { allowStartupDirectScan: true }
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.scanMode, "startup_direct");
+  assert.equal(result.scanReason, "not_game_page");
+  assert.equal(result.pageHints.likelyGamePage, false);
+  assert.equal(windowObject.__fusionTetrioGame, undefined);
 });
 
 test("captured game uses quick path on later polls", () => {
