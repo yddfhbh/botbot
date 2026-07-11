@@ -27,7 +27,7 @@ This is the recommended default for VS work in this repo.
 Use this for solo/custom solo and Browser CDP debugging.
 
 - reads direct page state through CDP
-- can use manual debugger capture when the game object is not exposed yet
+- uses a startup-only debugger capture to grab the game object once without re-probing during play
 - stays separate from the VS seed path
 
 ### File Debug
@@ -112,7 +112,7 @@ These values come from `automation/live-snapshot.json`.
 
 ## Browser CDP Notes
 
-- `Debugger probe mode=manual` or `disabled` is preferred.
+- `Debugger probe mode=startup_only` is the recommended solo default.
 - `Browser CDP Direct` is a solo/debug path, not the default VS path.
 - If direct-state capture fails in VS, switch to `WebSocket Seed`; do not work around it by reviving scanner fallbacks.
 

@@ -194,7 +194,7 @@ impl LauncherState {
         self.input_backend = InputBackendConfig::BrowserCdp;
         self.browser = BrowserCdpConfig::default();
         self.browser.probe_page_state = true;
-        self.browser.debugger_probe_mode = DebuggerProbeMode::Manual;
+        self.browser.debugger_probe_mode = DebuggerProbeMode::StartupOnly;
         self.browser.state_poll_ms = 40;
         self.browser.use_ribbon_websocket = false;
         self.browser.ribbon_decode_mode = RibbonDecodeMode::Off;
@@ -1387,7 +1387,10 @@ mod tests {
         assert_eq!(state.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
         assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
         assert!(state.browser.probe_page_state);
-        assert_eq!(state.browser.debugger_probe_mode, DebuggerProbeMode::Manual);
+        assert_eq!(
+            state.browser.debugger_probe_mode,
+            DebuggerProbeMode::StartupOnly
+        );
         assert_eq!(state.browser.ribbon_decode_mode, RibbonDecodeMode::Off);
         assert!(!state.browser.use_ribbon_websocket);
         assert!(!state.browser.use_seed_simulation_fallback);
@@ -1504,12 +1507,10 @@ mod tests {
     fn launcher_state_is_example_only() {
         let example: LauncherState =
             serde_json::from_str(include_str!("../launcher-state.example.json")).unwrap();
+        let gitignore = include_str!("../../.gitignore");
 
         assert_eq!(example.preset, ModePreset::SoloBrowserCdpKnownGood);
-        assert!(
-            !std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/launcher-state.json"))
-                .exists()
-        );
+        assert!(gitignore.contains("automation/launcher-state.json"));
     }
 
     #[test]
