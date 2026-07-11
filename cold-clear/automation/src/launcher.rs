@@ -1232,7 +1232,7 @@ fn play_style_label(style: PlayStyleConfig) -> &'static str {
 fn play_style_description(style: PlayStyleConfig) -> &'static str {
     match style {
         PlayStyleConfig::Normal => "현재 기본 설정으로 플레이합니다.",
-        PlayStyleConfig::Speed => "스핀과 복잡한 입력을 줄이고 빠른 배치를 우선합니다.",
+        PlayStyleConfig::Speed => "테트리스 중심의 Sprint 40L 빌드를 우선합니다.",
     }
 }
 

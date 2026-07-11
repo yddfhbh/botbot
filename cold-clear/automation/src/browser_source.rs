@@ -237,6 +237,10 @@ pub struct BrowserSnapshotWire {
     #[serde(default)]
     #[serde(alias = "pieceCounter")]
     pub piece_counter: u32,
+    #[serde(default)]
+    #[serde(alias = "linesCleared")]
+    #[serde(alias = "lines")]
+    pub lines_cleared: Option<u32>,
     pub token: String,
     #[serde(default = "default_true")]
     pub playing: bool,
@@ -271,6 +275,7 @@ impl BrowserSnapshotWire {
             b2b: self.b2b,
             incoming: self.incoming,
             piece_counter: Some(self.piece_counter),
+            lines_cleared: self.lines_cleared,
             playing: self.playing,
             countdown: self.countdown,
             active: match (self.active_x, self.active_rotation) {
@@ -644,6 +649,7 @@ mod tests {
             combo: 3,
             incoming: 2,
             piece_counter: 27,
+            lines_cleared: Some(16),
             token: "browser-27".to_owned(),
             playing: true,
             countdown: false,
@@ -661,6 +667,7 @@ mod tests {
         );
         assert_eq!(snapshot.hold, Some(PieceToken::I));
         assert_eq!(snapshot.piece_counter, Some(27));
+        assert_eq!(snapshot.lines_cleared, Some(16));
         assert_eq!(
             snapshot.active,
             Some(ActivePieceState {

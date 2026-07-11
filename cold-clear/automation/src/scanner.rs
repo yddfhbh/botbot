@@ -28,6 +28,8 @@ pub struct GameSnapshot {
     pub incoming: u32,
     #[serde(default)]
     pub piece_counter: Option<u32>,
+    #[serde(default)]
+    pub lines_cleared: Option<u32>,
     #[serde(default = "default_true")]
     pub playing: bool,
     #[serde(default)]
@@ -52,6 +54,16 @@ impl GameSnapshot {
 
     pub fn hold_piece(&self) -> Option<Piece> {
         self.hold.map(Into::into)
+    }
+
+    pub fn board(&self) -> Result<libtetris::Board> {
+        Ok(libtetris::Board::new_with_state(
+            self.field_array()?,
+            enumset::EnumSet::all(),
+            self.hold_piece(),
+            self.b2b,
+            self.combo,
+        ))
     }
 }
 
@@ -335,6 +347,7 @@ mod tests {
             b2b: false,
             incoming: 0,
             piece_counter: Some(4),
+            lines_cleared: None,
             playing: true,
             countdown: false,
             active: None,
@@ -369,6 +382,7 @@ mod tests {
             b2b: false,
             incoming: 0,
             piece_counter: Some(0),
+            lines_cleared: None,
             playing: true,
             countdown: false,
             active: None,
@@ -398,6 +412,7 @@ mod tests {
         assert_eq!(snapshot.source, "browser_cdp");
         assert_eq!(snapshot.queue[0], PieceToken::T);
         assert_eq!(snapshot.piece_counter, Some(123));
+        assert_eq!(snapshot.lines_cleared, None);
     }
 
     #[test]

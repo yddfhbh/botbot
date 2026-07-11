@@ -16,6 +16,7 @@ use libtetris::*;
 #[cfg(target_arch = "wasm32")]
 pub use web::Interface;
 
+pub use crate::dag::MoveCandidate;
 pub use crate::modes::normal::{BotState, ThinkResult, Thinker};
 pub use crate::modes::pcloop::PcPriority;
 

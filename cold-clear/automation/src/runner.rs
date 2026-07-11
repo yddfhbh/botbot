@@ -7,11 +7,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use cold_clear::evaluation::Standard;
+use cold_clear::evaluation::{Evaluator, Standard, StandardReward, StandardValue};
 use cold_clear::{Info, Interface};
 use libtetris::{
-    find_moves, Board, FallingPiece, Move, MovementMode, Piece, PieceMovement, Placement,
-    RotationState, SpawnRule,
+    find_moves, Board, FallingPiece, LockResult, Move, MovementMode, Piece, PieceMovement,
+    Placement, PlacementKind, RotationState, SpawnRule,
 };
 
 use crate::config::{
@@ -25,6 +25,52 @@ use crate::driver::{
 use crate::scanner::{
     read_snapshot_file, GameSnapshot, PieceToken, RotationToken, SnapshotScanner,
 };
+use crate::sprint::{
+    register_lock_result, sprint_40l_weights, sprint_context, update_state_for_snapshot,
+    Sprint40lEvaluator, SprintContext, SprintPhase, SprintState,
+};
+
+#[derive(Clone, Debug)]
+enum PlannerEvaluator {
+    Normal(Standard),
+    Sprint(Sprint40lEvaluator),
+}
+
+impl Evaluator for PlannerEvaluator {
+    type Value = StandardValue;
+    type Reward = StandardReward;
+
+    fn name(&self) -> String {
+        match self {
+            Self::Normal(weights) => weights.name(),
+            Self::Sprint(evaluator) => evaluator.name(),
+        }
+    }
+
+    fn evaluate(
+        &self,
+        lock: &LockResult,
+        board: &Board,
+        move_time: u32,
+        placed: Piece,
+    ) -> (Self::Value, Self::Reward) {
+        match self {
+            Self::Normal(weights) => weights.evaluate(lock, board, move_time, placed),
+            Self::Sprint(evaluator) => evaluator.evaluate(lock, board, move_time, placed),
+        }
+    }
+
+    fn pick_move(
+        &self,
+        candidates: Vec<cold_clear::MoveCandidate<Self::Value>>,
+        incoming: u32,
+    ) -> cold_clear::MoveCandidate<Self::Value> {
+        match self {
+            Self::Normal(weights) => weights.pick_move(candidates, incoming),
+            Self::Sprint(evaluator) => evaluator.pick_move(candidates, incoming),
+        }
+    }
+}
 
 #[allow(dead_code)]
 pub fn run_loop<S: SnapshotScanner, D: InputBackend + ?Sized>(
@@ -83,6 +129,7 @@ where
         hard_drop_interval: Duration::from_millis(config.hard_drop_interval_ms),
     };
     let mut buffered_snapshot = None;
+    let mut sprint_state = SprintState::default();
 
     loop {
         if stop.load(AtomicOrdering::Relaxed) {
@@ -95,6 +142,9 @@ where
         };
         match snapshot_option {
             Some(snapshot) => {
+                if config.play_style == crate::config::PlayStyleConfig::Speed {
+                    update_state_for_snapshot(&mut sprint_state, &snapshot);
+                }
                 if let (Some(current), Some(previous)) =
                     (snapshot.piece_counter, last_piece_counter)
                 {
@@ -110,7 +160,7 @@ where
                     thread::sleep(poll_delay);
                     continue;
                 }
-                match prepare_execution(config, &snapshot, &mut log)? {
+                match prepare_execution(config, &snapshot, &sprint_state, &mut log)? {
                     Some(prepared) => {
                         emit_move_logs(config, &snapshot, &prepared, &mut log);
                         execute_plan_until_hard_drop(
@@ -151,6 +201,12 @@ where
                                     last_hard_drop_started_at = Some(hard_drop_started_at);
                                     if snapshot.piece_counter.is_some() {
                                         last_piece_counter = snapshot.piece_counter;
+                                    }
+                                    if config.play_style == crate::config::PlayStyleConfig::Speed {
+                                        register_lock_result(
+                                            &mut sprint_state,
+                                            &prepared.planned_lock,
+                                        );
                                     }
                                 }
                                 HardDropDecision::Retry(retry_snapshot) => {
@@ -466,11 +522,14 @@ fn sleep_with_stop(stop: &AtomicBool, duration: Duration) -> bool {
 #[derive(Clone, Debug)]
 struct PreparedExecution {
     planned_move: Move,
+    planned_piece: Piece,
+    planned_lock: LockResult,
     planner_info: Info,
     planner_elapsed_ms: u128,
     movement_mode_used: MovementModeConfig,
     spawn_rule_used: SpawnRuleConfig,
     fallback_from: Option<MovementModeConfig>,
+    sprint_context: Option<SprintContext>,
     execution_plan: ExecutionPlan,
     route_selection: RouteSelection,
 }
@@ -556,6 +615,7 @@ struct CandidateRoute {
 fn prepare_execution<F>(
     config: &AutomationConfig,
     snapshot: &GameSnapshot,
+    sprint_state: &SprintState,
     log: &mut F,
 ) -> Result<Option<PreparedExecution>>
 where
@@ -563,7 +623,7 @@ where
 {
     let planner_started_at = Instant::now();
     let Some((planned_move, planner_info)) =
-        plan_move_for_mode(config, snapshot, config.bot.movement_mode)?
+        plan_move_for_mode(config, snapshot, config.bot.movement_mode, sprint_state)?
     else {
         log(format!(
             "[automation] source={} token={} planner produced no move for mode={}; waiting for fresher snapshot",
@@ -573,14 +633,19 @@ where
         ));
         return Ok(None);
     };
+    let planned_outcome = simulate_planned_lock(snapshot, &planned_move)?;
+    let sprint_context = sprint_context_for_config(config, snapshot, sprint_state);
     match build_execution_plan(config, snapshot, &planned_move, config.bot.movement_mode) {
         Ok(result) => Ok(Some(PreparedExecution {
             planned_move,
+            planned_piece: planned_outcome.placed_piece,
+            planned_lock: planned_outcome.lock,
             planner_info,
             planner_elapsed_ms: planner_started_at.elapsed().as_millis(),
             movement_mode_used: config.bot.movement_mode,
             spawn_rule_used: config.bot.spawn_rule,
             fallback_from: None,
+            sprint_context,
             execution_plan: result.execution_plan,
             route_selection: result.route_selection,
         })),
@@ -623,7 +688,7 @@ where
             ));
             let fallback_started_at = Instant::now();
             let Some((fallback_move, fallback_info)) =
-                plan_move_for_mode(config, snapshot, fallback_mode)?
+                plan_move_for_mode(config, snapshot, fallback_mode, sprint_state)?
             else {
                 log(format!(
                     "[automation] source={} token={} planner produced no move for fallback mode={}; waiting for fresher snapshot",
@@ -633,14 +698,18 @@ where
                 ));
                 return Ok(None);
             };
+            let fallback_outcome = simulate_planned_lock(snapshot, &fallback_move)?;
             match build_execution_plan(config, snapshot, &fallback_move, fallback_mode) {
                 Ok(result) => Ok(Some(PreparedExecution {
                     planned_move: fallback_move,
+                    planned_piece: fallback_outcome.placed_piece,
+                    planned_lock: fallback_outcome.lock,
                     planner_info: fallback_info,
                     planner_elapsed_ms: fallback_started_at.elapsed().as_millis(),
                     movement_mode_used: fallback_mode,
                     spawn_rule_used: config.bot.spawn_rule,
                     fallback_from: Some(config.bot.movement_mode),
+                    sprint_context,
                     execution_plan: result.execution_plan,
                     route_selection: result.route_selection,
                 })),
@@ -740,6 +809,62 @@ fn emit_move_logs<F>(
             .as_deref()
             .unwrap_or("none")
     ));
+    if let Some(context) = &prepared.sprint_context {
+        log(format!(
+            "[style] speed objective=sprint40l phase={} lines={} remaining={}",
+            sprint_phase_label(context.phase),
+            context.lines_cleared,
+            context.remaining_lines
+        ));
+        log(format!(
+            "[style] board well_col={} clean_depth={} tetris_ready={} max_height={} cavities={}",
+            context.board_features.best_well_column,
+            context.board_features.clean_well_depth,
+            context.board_features.tetris_ready,
+            context.board_features.max_height,
+            context.board_features.cavity_cells
+        ));
+        log(format!(
+            "[style] planned_clear={} route_cost={}",
+            prepared.planned_lock.cleared_lines.len(),
+            prepared.route_selection.estimated_input_cost
+        ));
+        if context.phase == SprintPhase::Recovery {
+            log(format!(
+                "[style] sprint phase=recovery reason={} max_height={}",
+                sprint_recovery_reason(&context.board_features),
+                context.board_features.max_height
+            ));
+        }
+        if context.phase == SprintPhase::Finish
+            && prepared.planned_lock.placement_kind != PlacementKind::Clear4
+            && prepared.planned_lock.placement_kind.is_clear()
+        {
+            log(format!(
+                "[style] sprint phase=finish remaining={} allowing_non_tetris_clear=true",
+                context.remaining_lines
+            ));
+        }
+        if prepared.planned_lock.placement_kind == PlacementKind::Clear4 {
+            let remaining = context
+                .remaining_lines
+                .saturating_sub(prepared.planned_lock.cleared_lines.len() as u32);
+            log(format!(
+                "[style] sprint tetris remaining={} well_col={}",
+                remaining, context.board_features.best_well_column
+            ));
+        }
+        if snapshot.queue.first() == Some(&PieceToken::I) && prepared.planned_move.hold {
+            log("[style] sprint I decision=hold reason=well_not_ready".to_owned());
+        } else if prepared.planned_piece == Piece::I
+            && prepared.planned_lock.placement_kind == PlacementKind::Clear4
+        {
+            log(format!(
+                "[style] sprint I decision=tetris well_column={}",
+                context.board_features.best_well_column
+            ));
+        }
+    }
     if config.route_profile == RouteProfileConfig::Speed {
         if prepared.route_selection.used_spin_fallback {
             log(format!(
@@ -810,8 +935,9 @@ fn rotation_token_from_state(rotation: RotationState) -> RotationToken {
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn plan_move(config: &AutomationConfig, snapshot: &GameSnapshot) -> Result<(Move, &'static str)> {
+    let sprint_state = SprintState::default();
     let movement_mode = config.bot.movement_mode;
-    let (planned_move, _) = plan_move_for_mode(config, snapshot, movement_mode)?
+    let (planned_move, _) = plan_move_for_mode(config, snapshot, movement_mode, &sprint_state)?
         .context("bot failed to produce a move for the current snapshot")?;
     Ok((planned_move, movement_mode_label(movement_mode)))
 }
@@ -820,6 +946,7 @@ fn plan_move_for_mode(
     config: &AutomationConfig,
     snapshot: &GameSnapshot,
     movement_mode: MovementModeConfig,
+    sprint_state: &SprintState,
 ) -> Result<Option<(Move, Info)>> {
     let queue = snapshot.queue_pieces();
     if queue.is_empty() {
@@ -837,6 +964,7 @@ fn plan_move_for_mode(
         board.add_next_piece(piece);
     }
 
+    let evaluator = planner_evaluator(config, snapshot, sprint_state);
     let interface = Interface::launch(
         board,
         cold_clear::Options {
@@ -852,7 +980,7 @@ fn plan_move_for_mode(
             max_nodes: config.bot.max_nodes,
             threads: config.bot.threads,
         },
-        evaluation_weights_for_profile(config.evaluation_profile),
+        evaluator,
         Option::<Arc<cold_clear::Book>>::None,
     );
     interface.suggest_next_move(snapshot.incoming);
@@ -873,21 +1001,91 @@ fn format_planner_info(info: &Info) -> String {
     }
 }
 
-fn evaluation_weights_for_profile(profile: EvaluationProfileConfig) -> Standard {
+fn evaluation_weights_for_profile(
+    profile: EvaluationProfileConfig,
+    snapshot: &GameSnapshot,
+    sprint_state: &SprintState,
+) -> Standard {
     match profile {
         EvaluationProfileConfig::Normal => Standard::default(),
+        EvaluationProfileConfig::Speed => sprint_40l_weights(snapshot, sprint_state),
+    }
+}
+
+fn planner_evaluator(
+    config: &AutomationConfig,
+    snapshot: &GameSnapshot,
+    sprint_state: &SprintState,
+) -> PlannerEvaluator {
+    match config.evaluation_profile {
+        EvaluationProfileConfig::Normal => PlannerEvaluator::Normal(
+            evaluation_weights_for_profile(config.evaluation_profile, snapshot, sprint_state),
+        ),
         EvaluationProfileConfig::Speed => {
-            let mut weights = Standard::default();
-            weights.tslot = [0, 0, 0, 0];
-            weights.tspin1 = weights.clear1;
-            weights.tspin2 = weights.clear2;
-            weights.tspin3 = weights.clear3;
-            weights.mini_tspin1 = weights.clear1;
-            weights.mini_tspin2 = weights.clear2;
-            weights.wasted_t = 0;
-            weights.move_time = -12;
-            weights
+            PlannerEvaluator::Sprint(Sprint40lEvaluator::new(snapshot, sprint_state))
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PlannedLockOutcome {
+    placed_piece: Piece,
+    lock: LockResult,
+}
+
+fn simulate_planned_lock(
+    snapshot: &GameSnapshot,
+    planned_move: &Move,
+) -> Result<PlannedLockOutcome> {
+    let mut board = board_from_snapshot(snapshot)?;
+    for piece in snapshot.queue_pieces() {
+        board.add_next_piece(piece);
+    }
+    let queued_piece = board
+        .advance_queue()
+        .context("snapshot queue must include the active piece for lock simulation")?;
+    let placed_piece = if planned_move.hold {
+        board.hold(queued_piece).unwrap_or_else(|| {
+            board
+                .advance_queue()
+                .expect("hold-first move requires at least one preview piece for lock simulation")
+        })
+    } else {
+        queued_piece
+    };
+    let lock = board.lock_piece(planned_move.expected_location);
+    Ok(PlannedLockOutcome { placed_piece, lock })
+}
+
+fn sprint_context_for_config(
+    config: &AutomationConfig,
+    snapshot: &GameSnapshot,
+    sprint_state: &SprintState,
+) -> Option<SprintContext> {
+    if config.play_style == crate::config::PlayStyleConfig::Speed {
+        Some(sprint_context(snapshot, sprint_state))
+    } else {
+        None
+    }
+}
+
+fn sprint_phase_label(phase: SprintPhase) -> &'static str {
+    match phase {
+        SprintPhase::Build => "build",
+        SprintPhase::Finish => "finish",
+        SprintPhase::Recovery => "recovery",
+    }
+}
+
+fn sprint_recovery_reason(features: &crate::sprint::SprintBoardFeatures) -> &'static str {
+    if features.cavity_cells > 0 {
+        "cavity"
+    } else if features.blocked_well_cells > 0 {
+        "blocked_well"
+    } else if features.max_height >= 14 {
+        "height"
+    } else {
+        "unstable_stack"
     }
 }
 
@@ -1558,10 +1756,11 @@ impl PieceToken {
 mod tests {
     use super::*;
     use crate::config::{
-        AutomationConfig, EvaluationProfileConfig, MovementModeConfig, RouteProfileConfig,
+        AutomationConfig, EvaluationProfileConfig, MovementModeConfig, PlayStyleConfig,
+        RouteProfileConfig,
     };
     use crate::scanner::PieceToken;
-    use libtetris::{PieceState, RotationState, TspinStatus};
+    use libtetris::{PieceState, RotationState, Statistics, TspinStatus};
     use std::sync::atomic::AtomicU32;
 
     #[test]
@@ -1576,6 +1775,7 @@ mod tests {
             b2b: false,
             incoming: 0,
             piece_counter: None,
+            lines_cleared: None,
             playing: true,
             countdown: false,
             active: None,
@@ -1596,6 +1796,7 @@ mod tests {
             b2b: false,
             incoming: 0,
             piece_counter: None,
+            lines_cleared: None,
             playing: true,
             countdown: false,
             active: None,
@@ -1616,6 +1817,7 @@ mod tests {
             b2b: false,
             incoming: 0,
             piece_counter: None,
+            lines_cleared: None,
             playing: true,
             countdown: false,
             active: None,
@@ -1657,6 +1859,7 @@ mod tests {
             b2b: false,
             incoming: 0,
             piece_counter: None,
+            lines_cleared: None,
             playing: true,
             countdown: false,
             active: None,
@@ -1829,20 +2032,36 @@ mod tests {
 
     #[test]
     fn speed_profile_uses_requested_weight_overrides() {
-        let weights = evaluation_weights_for_profile(EvaluationProfileConfig::Speed);
-        let defaults = Standard::default();
+        let snapshot = GameSnapshot {
+            source: "test".to_owned(),
+            token: "browser-1-0".to_owned(),
+            field: vec![[false; 10]; 40],
+            queue: vec![PieceToken::I, PieceToken::O, PieceToken::T],
+            hold: None,
+            combo: 0,
+            b2b: false,
+            incoming: 0,
+            piece_counter: Some(0),
+            lines_cleared: Some(0),
+            playing: true,
+            countdown: false,
+            active: None,
+        };
+        let weights = evaluation_weights_for_profile(
+            EvaluationProfileConfig::Speed,
+            &snapshot,
+            &SprintState::default(),
+        );
 
         assert_eq!(weights.tslot, [0, 0, 0, 0]);
-        assert_eq!(weights.tspin1, defaults.clear1);
-        assert_eq!(weights.tspin2, defaults.clear2);
-        assert_eq!(weights.tspin3, defaults.clear3);
-        assert_eq!(weights.mini_tspin1, defaults.clear1);
-        assert_eq!(weights.mini_tspin2, defaults.clear2);
+        assert_eq!(weights.clear1, -500);
+        assert_eq!(weights.clear2, -350);
+        assert_eq!(weights.clear3, -200);
+        assert_eq!(weights.clear4, 1300);
         assert_eq!(weights.wasted_t, 0);
-        assert_eq!(weights.move_time, -12);
-        assert_eq!(weights.clear4, defaults.clear4);
-        assert_eq!(weights.b2b_clear, defaults.b2b_clear);
-        assert_eq!(weights.combo_garbage, defaults.combo_garbage);
+        assert_eq!(weights.move_time, -10);
+        assert_eq!(weights.b2b_clear, 50);
+        assert_eq!(weights.combo_garbage, 0);
     }
 
     #[test]
@@ -1947,6 +2166,7 @@ mod tests {
             b2b: false,
             incoming: 0,
             piece_counter: Some(12),
+            lines_cleared: None,
             playing: true,
             countdown: false,
             active: None,
@@ -1970,6 +2190,7 @@ mod tests {
             b2b: false,
             incoming: 0,
             piece_counter: Some(3),
+            lines_cleared: None,
             playing: false,
             countdown: false,
             active: None,
@@ -2029,5 +2250,246 @@ mod tests {
             pps_wait_duration(Some(Duration::from_millis(500)), Duration::from_millis(750)),
             None
         );
+    }
+
+    #[derive(Default)]
+    struct BenchmarkAggregate {
+        completed: usize,
+        topouts: usize,
+        total_pieces: u64,
+        tetrises: u64,
+        non_tetris_clears: u64,
+        clear_events: u64,
+        estimated_input_cost: u64,
+        rotation_count: u64,
+    }
+
+    impl BenchmarkAggregate {
+        fn update(&mut self, result: &SimulationResult) {
+            self.completed += usize::from(result.completed);
+            self.topouts += usize::from(result.topout);
+            self.total_pieces += result.statistics.pieces;
+            self.tetrises += result.statistics.tetrises;
+            self.non_tetris_clears +=
+                result.statistics.singles + result.statistics.doubles + result.statistics.triples;
+            self.clear_events += result.statistics.singles
+                + result.statistics.doubles
+                + result.statistics.triples
+                + result.statistics.tetrises;
+            self.estimated_input_cost += result.estimated_input_cost;
+            self.rotation_count += result.rotation_count;
+        }
+    }
+
+    struct SimulationResult {
+        completed: bool,
+        topout: bool,
+        statistics: Statistics,
+        estimated_input_cost: u64,
+        rotation_count: u64,
+    }
+
+    fn speed_config() -> AutomationConfig {
+        let mut config = AutomationConfig::default();
+        config.play_style = PlayStyleConfig::Speed;
+        config.evaluation_profile = EvaluationProfileConfig::Speed;
+        config.route_profile = RouteProfileConfig::Speed;
+        config
+    }
+
+    fn piece_to_token(piece: Piece) -> PieceToken {
+        match piece {
+            Piece::I => PieceToken::I,
+            Piece::O => PieceToken::O,
+            Piece::T => PieceToken::T,
+            Piece::L => PieceToken::L,
+            Piece::J => PieceToken::J,
+            Piece::S => PieceToken::S,
+            Piece::Z => PieceToken::Z,
+        }
+    }
+
+    fn next_seed_value(seed: &mut u64) -> u32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (*seed >> 32) as u32
+    }
+
+    fn next_bag(seed: &mut u64) -> [Piece; 7] {
+        let mut bag = [
+            Piece::I,
+            Piece::O,
+            Piece::T,
+            Piece::L,
+            Piece::J,
+            Piece::S,
+            Piece::Z,
+        ];
+        for index in (1..bag.len()).rev() {
+            let swap_index = (next_seed_value(seed) as usize) % (index + 1);
+            bag.swap(index, swap_index);
+        }
+        bag
+    }
+
+    fn fill_queue(board: &mut Board, seed: &mut u64, min_len: usize) {
+        while board.next_queue().count() < min_len {
+            for piece in next_bag(seed) {
+                board.add_next_piece(piece);
+            }
+        }
+    }
+
+    fn snapshot_from_board(
+        board: &Board,
+        piece_counter: u32,
+        lines_cleared: u32,
+        epoch: u64,
+    ) -> GameSnapshot {
+        GameSnapshot {
+            source: "benchmark".to_owned(),
+            token: format!("browser-{epoch}-{piece_counter}"),
+            field: board.get_field().into_iter().collect(),
+            queue: board.next_queue().take(6).map(piece_to_token).collect(),
+            hold: board.hold_piece.map(piece_to_token),
+            combo: board.combo,
+            b2b: board.b2b_bonus,
+            incoming: 0,
+            piece_counter: Some(piece_counter),
+            lines_cleared: Some(lines_cleared),
+            playing: true,
+            countdown: false,
+            active: None,
+        }
+    }
+
+    fn apply_planned_move(board: &mut Board, planned_move: &Move) -> LockResult {
+        let next = board
+            .advance_queue()
+            .expect("benchmark queue should not be empty");
+        if planned_move.hold {
+            board
+                .hold(next)
+                .unwrap_or_else(|| board.advance_queue().expect("hold move needs preview"));
+        }
+        board.lock_piece(planned_move.expected_location)
+    }
+
+    fn simulate_seed(config: &AutomationConfig, seed: u64) -> SimulationResult {
+        let mut board = Board::new();
+        let mut rng = seed.max(1);
+        let mut sprint_state = SprintState::default();
+        let mut piece_counter = 0u32;
+        let mut lines_cleared = 0u32;
+        let mut statistics = Statistics::default();
+        let mut estimated_input_cost = 0u64;
+        let mut rotation_count = 0u64;
+
+        fill_queue(&mut board, &mut rng, 8);
+
+        while lines_cleared < 40 && piece_counter < 200 {
+            fill_queue(&mut board, &mut rng, 8);
+            let snapshot = snapshot_from_board(&board, piece_counter, lines_cleared, 1);
+            if config.play_style == PlayStyleConfig::Speed {
+                update_state_for_snapshot(&mut sprint_state, &snapshot);
+            }
+            let prepared = match prepare_execution(config, &snapshot, &sprint_state, &mut |_| {}) {
+                Ok(Some(prepared)) => prepared,
+                Ok(None) | Err(_) => {
+                    return SimulationResult {
+                        completed: false,
+                        topout: true,
+                        statistics,
+                        estimated_input_cost,
+                        rotation_count,
+                    };
+                }
+            };
+            estimated_input_cost += prepared.route_selection.estimated_input_cost as u64;
+            rotation_count += prepared.route_selection.rotation_count as u64;
+
+            let lock = apply_planned_move(&mut board, &prepared.planned_move);
+            statistics.update(&lock);
+            lines_cleared = lines_cleared.saturating_add(lock.cleared_lines.len() as u32);
+            piece_counter += 1;
+            if config.play_style == PlayStyleConfig::Speed {
+                register_lock_result(&mut sprint_state, &lock);
+            }
+            if lock.locked_out {
+                return SimulationResult {
+                    completed: false,
+                    topout: true,
+                    statistics,
+                    estimated_input_cost,
+                    rotation_count,
+                };
+            }
+        }
+
+        SimulationResult {
+            completed: lines_cleared >= 40,
+            topout: false,
+            statistics,
+            estimated_input_cost,
+            rotation_count,
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn sprint_40l_benchmark() {
+        let normal = AutomationConfig::default();
+        let speed = speed_config();
+        let seeds = std::env::var("AUTOMATION_SPRINT_BENCH_SEEDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(20);
+        let mut normal_stats = BenchmarkAggregate::default();
+        let mut speed_stats = BenchmarkAggregate::default();
+
+        for seed in 1..=seeds {
+            normal_stats.update(&simulate_seed(&normal, seed));
+            speed_stats.update(&simulate_seed(&speed, seed));
+        }
+
+        println!("Sprint benchmark, {seeds} seeds");
+        println!(
+            "normal completion rate: {}/{}",
+            normal_stats.completed, seeds
+        );
+        println!(
+            "normal average tetrises: {:.2}",
+            normal_stats.tetrises as f64 / seeds as f64
+        );
+        println!(
+            "normal average clear events: {:.2}",
+            normal_stats.clear_events as f64 / seeds as f64
+        );
+        println!("speed completion rate: {}/{}", speed_stats.completed, seeds);
+        println!(
+            "speed average pieces: {:.2}",
+            speed_stats.total_pieces as f64 / seeds as f64
+        );
+        println!(
+            "speed average tetrises: {:.2}",
+            speed_stats.tetrises as f64 / seeds as f64
+        );
+        println!(
+            "speed average non-tetris clears: {:.2}",
+            speed_stats.non_tetris_clears as f64 / seeds as f64
+        );
+        println!(
+            "speed average clear events: {:.2}",
+            speed_stats.clear_events as f64 / seeds as f64
+        );
+        println!(
+            "speed average estimated input cost: {:.2}",
+            speed_stats.estimated_input_cost as f64 / seeds as f64
+        );
+        println!(
+            "speed average rotations: {:.2}",
+            speed_stats.rotation_count as f64 / seeds as f64
+        );
+        println!("speed topouts: {}", speed_stats.topouts);
     }
 }

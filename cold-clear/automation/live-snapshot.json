@@ -3,8 +3,8 @@
   "source": "browser_cdp",
   "field": [
     [
-      false,
       true,
+      false,
       true,
       true,
       true,
@@ -15,8 +15,8 @@
       true
     ],
     [
-      false,
       true,
+      false,
       true,
       true,
       true,
@@ -27,8 +27,8 @@
       true
     ],
     [
-      false,
       true,
+      false,
       true,
       true,
       true,
@@ -39,8 +39,8 @@
       true
     ],
     [
-      false,
       true,
+      false,
       true,
       true,
       true,
@@ -51,8 +51,8 @@
       true
     ],
     [
-      false,
       true,
+      false,
       true,
       true,
       true,
@@ -63,48 +63,48 @@
       true
     ],
     [
+      true,
       false,
       true,
       true,
       true,
       true,
+      false,
       true,
       true,
+      true
+    ],
+    [
+      false,
+      false,
       true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ],
+    [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
       true,
       false
     ],
     [
       false,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      false,
-      false
-    ],
-    [
-      false,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      false,
-      false,
-      false
-    ],
-    [
       false,
       false,
       false,
       false,
-      true,
-      true,
+      false,
       false,
       false,
       false,
@@ -483,29 +483,29 @@
       false
     ]
   ],
-  "current": "I",
-  "hold": "S",
+  "current": "T",
+  "hold": "J",
   "queue": [
-    "T",
     "O",
-    "L",
-    "S",
-    "O",
-    "J",
-    "I",
-    "L",
     "Z",
+    "L",
     "T",
+    "J",
+    "T",
+    "Z",
     "I",
-    "T"
+    "J",
+    "L",
+    "O",
+    "S"
   ],
   "b2b": false,
   "combo": 0,
   "incoming": 0,
-  "pieceCounter": 107,
-  "token": "browser-107",
+  "pieceCounter": 0,
+  "token": "browser-1-0",
   "playing": true,
   "countdown": false,
-  "activeX": 1,
-  "activeY": 18
+  "activeX": 4,
+  "activeY": 26
 }

@@ -153,9 +153,10 @@ fn emit_startup_logs(logger: &SharedLogger, config: &AutomationConfig) {
         ),
     );
     if config.play_style == crate::config::PlayStyleConfig::Speed {
+        emit_log(logger, "[style] speed objective=sprint40l".to_owned());
         emit_log(
             logger,
-            "[bot] speed priorities=non_spin,short_input,no_softdrop".to_owned(),
+            "[style] priorities=tetris,clean_well,low_pieces,short_route".to_owned(),
         );
     }
 }

@@ -977,6 +977,16 @@ export function tetrioStateExpression() {
       state.pieceCounter,
       state.piececount
     ) ?? -1));
+    const linesClearedRaw = numberFrom(
+      stats.lines,
+      stats.linesCleared,
+      stats.lines_cleared,
+      state?.stats?.lines,
+      state?.stats?.linesCleared,
+      state?.stats?.lines_cleared
+    );
+    const linesCleared =
+      linesClearedRaw === null ? null : Math.max(0, Math.floor(linesClearedRaw));
     if (!current || pieceCounter < 0) {
       return { ok: false, ready: false, reason: "TETR.IO current piece or piece counter is not available" };
     }
@@ -1028,6 +1038,7 @@ export function tetrioStateExpression() {
       combo: Math.max(0, numberFrom(stats.combo, state.combo, 0) ?? 0),
       incoming: Math.max(0, numberFrom(stats.impendingdamage, state.incoming, 0) ?? 0),
       pieceCounter,
+      linesCleared: linesCleared ?? undefined,
       playing,
       countdown,
       activeX,

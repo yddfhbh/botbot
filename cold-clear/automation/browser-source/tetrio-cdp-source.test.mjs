@@ -53,6 +53,7 @@ function createGame({
   hold = "i",
   queue = ["o", "s", "z"],
   pieceCounter = 0,
+  linesCleared = undefined,
   board = createBoard()
 } = {}) {
   return {
@@ -65,6 +66,7 @@ function createGame({
           queue,
           stats: {
             piecesplaced: pieceCounter,
+            lines: linesCleared,
             combo: 0,
             b2b: 0,
             impendingdamage: 0
@@ -198,8 +200,23 @@ test("tetrioStateExpression keeps existing field and piece extraction behavior",
   assert.equal(result.hold, "j");
   assert.deepEqual(result.queue, ["s", "z", "i"]);
   assert.equal(result.pieceCounter, 3);
+  assert.equal(result.linesCleared, undefined);
   assert.equal(result.field[0][0], true);
   assert.equal(window.__fusionTetrioGame, game);
+});
+
+test("tetrioStateExpression extracts optional lines cleared stats", () => {
+  const game = createGame({
+    current: "i",
+    linesCleared: 24
+  });
+
+  const { result } = evaluateInWindow(tetrioStateExpression(), {
+    __fusionTetrioGame: game
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.linesCleared, 24);
 });
 
 test("ended cached game is not selected again when a fresh game is available", () => {
