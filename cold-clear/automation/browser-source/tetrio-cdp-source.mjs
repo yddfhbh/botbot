@@ -101,6 +101,12 @@ async function main() {
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
   await cdp.send("Page.enable").catch(() => undefined);
   await cdp.send("Runtime.enable").catch(() => undefined);
+
+  process.stdout.write(
+    `${JSON.stringify({ type: "ready", ok: true, target: target.title || target.url, port })}\n`
+  );
+  console.log(`[browser] connected to ${target.title || target.url} on port ${port}`);
+
   let dddWsObserverCleanup = null;
   try {
     const { installDddWsObserver } =
@@ -124,11 +130,6 @@ async function main() {
   await safeRuntimeEvaluate(cdp, {
     expression: "window.focus(); document.body && document.body.focus && document.body.focus(); true"
   }).catch(() => undefined);
-
-  process.stdout.write(
-    `${JSON.stringify({ type: "ready", ok: true, target: target.title || target.url, port })}\n`
-  );
-  console.log(`[browser] connected to ${target.title || target.url} on port ${port}`);
 
   const network = createTetrioNetworkState();
   if (useRibbonWebsocket) {

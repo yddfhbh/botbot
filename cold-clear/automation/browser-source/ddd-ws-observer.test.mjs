@@ -302,12 +302,14 @@ test("DDD WebSocket observer is installed by default", () => {
 
   const pageEnableIndex = source.indexOf('cdp.send("Page.enable")');
   const runtimeEnableIndex = source.indexOf('cdp.send("Runtime.enable")');
+  const readyIndex = source.indexOf("process.stdout.write(");
   const observerIndex = source.indexOf('await import("./ddd-ws-observer.mjs")');
   const bringToFrontIndex = source.indexOf('cdp.send("Page.bringToFront")');
 
   assert.ok(pageEnableIndex >= 0);
   assert.ok(runtimeEnableIndex > pageEnableIndex);
-  assert.ok(observerIndex > runtimeEnableIndex);
+  assert.ok(readyIndex > runtimeEnableIndex);
+  assert.ok(observerIndex > readyIndex);
   assert.ok(bringToFrontIndex > observerIndex);
 });
 
