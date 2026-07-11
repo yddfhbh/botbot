@@ -18,7 +18,7 @@
   },
   "always_on_top": false,
   "dry_run": false,
-  "play_style": "speed",
+  "play_style": "normal",
   "poll_interval_ms": 4,
   "pps_unlimited": true,
   "target_pps": 3.0,
