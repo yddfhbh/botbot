@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -473,8 +473,7 @@ function launchChromium({ port, url, chromePath }) {
   if (!executable) {
     throw new Error("Could not find Chrome/Edge. Set CHROME_PATH to the browser executable.");
   }
-  const profileDir = path.join(os.tmpdir(), `botbot-tetrio-cdp-${port}`);
-  mkdirSync(profileDir, { recursive: true });
+  const profileDir = createFreshChromiumProfileDir(port);
   return spawn(
     executable,
     [
@@ -487,13 +486,18 @@ function launchChromium({ port, url, chromePath }) {
       "--disable-renderer-backgrounding",
       "--disable-backgrounding-occluded-windows",
       "--disable-features=Translate,CalculateNativeWinOcclusion",
-      url
+      "about:blank"
     ],
     {
       detached: false,
       stdio: ["ignore", "ignore", "ignore"]
     }
   );
+}
+
+function createFreshChromiumProfileDir(port) {
+  const prefix = path.join(os.tmpdir(), `botbot-tetrio-cdp-${port}-`);
+  return mkdtempSync(prefix);
 }
 
 function findChromiumExecutable() {
@@ -531,23 +535,28 @@ async function waitForCdp(port) {
 async function findOrCreateTarget({ port, url, targetHint }) {
   const list = await fetchJson(`http://127.0.0.1:${port}/json/list`);
   const pages = list.filter((item) => item.type === "page");
+  const existing = selectExistingTarget(pages, url, targetHint);
+  if (existing?.webSocketDebuggerUrl) return existing;
+  return await fetchJson(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, {
+    method: "PUT"
+  });
+}
+
+export function selectExistingTarget(pages, url, targetHint) {
   const hinted = pages.find(
     (item) =>
       item.url?.toLowerCase().includes(targetHint.toLowerCase()) ||
       item.title?.toLowerCase().includes(targetHint.toLowerCase())
   );
+  if (hinted) return hinted;
   const matchingUrl = pages.find((item) => item.url === url);
-  const matchingHost = pages.find((item) => {
+  if (matchingUrl) return matchingUrl;
+  return pages.find((item) => {
     try {
       return new URL(item.url).host === new URL(url).host;
     } catch {
       return false;
     }
-  });
-  const existing = hinted ?? matchingUrl ?? matchingHost ?? pages[0];
-  if (existing?.webSocketDebuggerUrl) return existing;
-  return await fetchJson(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, {
-    method: "PUT"
   });
 }
 

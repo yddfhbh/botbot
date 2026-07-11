@@ -15,6 +15,7 @@ import {
   readTetrioState,
   resetDiscoveryState,
   resetProbeRetryState,
+  selectExistingTarget,
   shouldResetDiscoveryOnExecutionContextsCleared,
   shouldAttemptClosureProbe,
   shouldAttemptDebuggerProbe,
@@ -348,6 +349,46 @@ test("likely game page heuristic turns true for solo routes", () => {
     }),
     true
   );
+});
+
+test("target selection does not fall back to unrelated about:blank pages", () => {
+  const selected = selectExistingTarget(
+    [
+      {
+        type: "page",
+        title: "New Tab",
+        url: "about:blank",
+        webSocketDebuggerUrl: "ws://blank"
+      }
+    ],
+    "https://tetr.io/",
+    "TETR.IO"
+  );
+
+  assert.equal(selected, undefined);
+});
+
+test("target selection prefers explicit tetrio matches", () => {
+  const selected = selectExistingTarget(
+    [
+      {
+        type: "page",
+        title: "New Tab",
+        url: "about:blank",
+        webSocketDebuggerUrl: "ws://blank"
+      },
+      {
+        type: "page",
+        title: "TETR.IO",
+        url: "https://tetr.io/",
+        webSocketDebuggerUrl: "ws://tetrio"
+      }
+    ],
+    "https://tetr.io/",
+    "TETR.IO"
+  );
+
+  assert.equal(selected?.webSocketDebuggerUrl, "ws://tetrio");
 });
 
 test("root home page skips expensive top-level discovery", () => {
