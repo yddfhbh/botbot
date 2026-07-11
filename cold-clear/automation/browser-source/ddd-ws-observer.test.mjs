@@ -1,6 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync
+} from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import {
   decodeGameOptionsCandidates,
@@ -54,6 +62,50 @@ class FakeCdp {
     }
     for (const handler of [...listeners]) {
       handler(params);
+    }
+  }
+}
+
+function makeTempTraceFile(name = "ws-live-candidates.jsonl") {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ddd-ws-observer-"));
+  return {
+    dir,
+    filePath: path.join(dir, name)
+  };
+}
+
+function cleanupTempDir(dir) {
+  rmSync(dir, { recursive: true, force: true });
+}
+
+function readJsonLines(filePath) {
+  if (!existsSync(filePath)) {
+    return [];
+  }
+
+  const content = readFileSync(filePath, "utf8").trim();
+  if (!content) {
+    return [];
+  }
+
+  return content.split("\n").map((line) => JSON.parse(line));
+}
+
+async function withTraceEnv(value, run) {
+  const previous = process.env.FUSION_DDD_WS_TRACE;
+  if (value === undefined) {
+    delete process.env.FUSION_DDD_WS_TRACE;
+  } else {
+    process.env.FUSION_DDD_WS_TRACE = value;
+  }
+
+  try {
+    await run();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.FUSION_DDD_WS_TRACE;
+    } else {
+      process.env.FUSION_DDD_WS_TRACE = previous;
     }
   }
 }
@@ -284,6 +336,449 @@ test("observer stays inactive when msgpack unpack is unavailable", async () => {
   assert.equal(cdp.sent.length, 0);
   assert.equal(cdp.listeners.size, 0);
   cleanup();
+});
+
+test("trace file is not created when trace env is absent", async () => {
+  const cdp = new FakeCdp();
+  const { dir, filePath } = makeTempTraceFile();
+
+  try {
+    await withTraceEnv(undefined, async () => {
+      const cleanup = await installDddWsObserver(cdp, {
+        unpack: () => {
+          throw new Error("unused");
+        },
+        log: () => {},
+        traceFilePath: filePath
+      });
+
+      cdp.emit("Network.webSocketFrameReceived", {
+        response: {
+          opcode: 1,
+          payloadData: JSON.stringify({
+            username: "HEBI_",
+            options: { seed: 11, bagtype: "7-bag", gameid: "2718" }
+          })
+        }
+      });
+
+      cleanup();
+    });
+
+    assert.equal(existsSync(filePath), false);
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("trace=1 starts JSONL recording and keeps options capture logs unchanged", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const { dir, filePath } = makeTempTraceFile();
+
+  try {
+    await withTraceEnv("1", async () => {
+      const cleanup = await installDddWsObserver(cdp, {
+        unpack: () => {
+          throw new Error("unused");
+        },
+        log: (line) => logs.push(line),
+        traceFilePath: filePath
+      });
+
+      cdp.emit("Network.webSocketCreated", {
+        requestId: "req-trace-1",
+        url: "wss://spool.tetr.io/socket?token=secret"
+      });
+      cdp.emit("Network.webSocketFrameReceived", {
+        requestId: "req-trace-1",
+        response: {
+          opcode: 1,
+          payloadData: JSON.stringify({
+            username: "HEBI_",
+            options: { seed: 12, bagtype: "7-bag", nextcount: 5, gameid: "2718" }
+          })
+        }
+      });
+
+      cleanup();
+    });
+
+    assert.equal(existsSync(filePath), true);
+    assert.ok(
+      logs.some((line) => line === "[ws-observer] game options captured")
+    );
+    assert.ok(
+      logs.some((line) => line.startsWith("[ws-trace] recording "))
+    );
+    assert.ok(
+      logs.some((line) => line.startsWith("[ws-trace] records="))
+    );
+    assert.equal(readJsonLines(filePath).length > 0, true);
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("trace records options path and parent context", async () => {
+  const cdp = new FakeCdp();
+  const { dir, filePath } = makeTempTraceFile();
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: () => {
+        throw new Error("unused");
+      },
+      log: () => {},
+      traceEnabled: true,
+      traceFilePath: filePath
+    });
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      requestId: "req-path",
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify({
+          data: {
+            players: [
+              {
+                username: "HEBI_",
+                userid: "user-1",
+                local: true,
+                options: {
+                  seed: "171149873",
+                  bagtype: "7-bag",
+                  gameid: "2718"
+                }
+              }
+            ]
+          }
+        })
+      }
+    });
+
+    cleanup();
+
+    const optionsRecord = readJsonLines(filePath).find(
+      (entry) => entry.kind === "options"
+    );
+    assert.ok(optionsRecord);
+    assert.equal(optionsRecord.path, "root.data.players[0].options");
+    assert.deepEqual(optionsRecord.context, {
+      username: "HEBI_",
+      userid: "user-1",
+      gameid: "2718",
+      local: true
+    });
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("trace stores board candidates as summary only", async () => {
+  const cdp = new FakeCdp();
+  const { dir, filePath } = makeTempTraceFile();
+  const board = Array.from({ length: 20 }, (_, row) =>
+    Array.from({ length: 10 }, (_, col) => (row === 19 && col < 4 ? 1 : 0))
+  );
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: () => {
+        throw new Error("unused");
+      },
+      log: () => {},
+      traceEnabled: true,
+      traceFilePath: filePath
+    });
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify({ board })
+      }
+    });
+
+    cleanup();
+
+    const boardRecord = readJsonLines(filePath).find(
+      (entry) => entry.kind === "board"
+    );
+    assert.ok(boardRecord);
+    assert.deepEqual(boardRecord.summary, {
+      boardRows: 20,
+      boardWidth: 10,
+      filledCells: 4
+    });
+    assert.equal("board" in boardRecord, false);
+    assert.equal("field" in boardRecord, false);
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("trace limits queue samples to 12 items", async () => {
+  const cdp = new FakeCdp();
+  const { dir, filePath } = makeTempTraceFile();
+  const queue = Array.from({ length: 20 }, (_, index) => `P${index}`);
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: () => {
+        throw new Error("unused");
+      },
+      log: () => {},
+      traceEnabled: true,
+      traceFilePath: filePath
+    });
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify({
+          current: "T",
+          hold: "I",
+          queue
+        })
+      }
+    });
+
+    cleanup();
+
+    const pieceRecord = readJsonLines(filePath).find(
+      (entry) => entry.kind === "piece"
+    );
+    assert.ok(pieceRecord);
+    assert.equal(pieceRecord.summary.queueLength, 20);
+    assert.equal(pieceRecord.summary.queueSample.length, 12);
+    assert.deepEqual(pieceRecord.summary.queueSample, queue.slice(0, 12));
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("trace stores at most three replay event samples", async () => {
+  const cdp = new FakeCdp();
+  const { dir, filePath } = makeTempTraceFile();
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: () => {
+        throw new Error("unused");
+      },
+      log: () => {},
+      traceEnabled: true,
+      traceFilePath: filePath
+    });
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify({
+          replay: {
+            events: [
+              { frame: 14, type: "keydown", data: { key: "Left" } },
+              { frame: 15, type: "rotate", data: { key: "CW" } },
+              { frame: 16, type: "drop", data: { key: "HD" } },
+              { frame: 17, type: "spawn", data: { key: "T" } }
+            ]
+          }
+        })
+      }
+    });
+
+    cleanup();
+
+    const replayRecord = readJsonLines(filePath).find(
+      (entry) => entry.kind === "replay"
+    );
+    assert.ok(replayRecord);
+    assert.equal(replayRecord.summary.eventCount, 4);
+    assert.equal(replayRecord.summary.eventSamples.length, 3);
+    assert.deepEqual(replayRecord.summary.eventSamples[0], {
+      keys: ["data", "frame", "type"],
+      frame: 14,
+      type: "keydown",
+      dataKeys: ["key"]
+    });
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("trace redacts sensitive subtrees and never records raw payload data", async () => {
+  const cdp = new FakeCdp();
+  const { dir, filePath } = makeTempTraceFile();
+  const secretPayload = JSON.stringify({
+    username: "visible-user",
+    token: {
+      options: {
+        seed: "should-not-leak",
+        bagtype: "7-bag"
+      }
+    },
+    signature: "sig-secret",
+    replay: {
+      events: [
+        {
+          frame: 1,
+          type: "keydown",
+          data: {
+            key: "Left",
+            authorization: "auth-secret"
+          }
+        }
+      ]
+    }
+  });
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: () => {
+        throw new Error("unused");
+      },
+      log: () => {},
+      traceEnabled: true,
+      traceFilePath: filePath
+    });
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      requestId: "req-sensitive",
+      response: {
+        opcode: 1,
+        payloadData: secretPayload
+      }
+    });
+
+    cleanup();
+
+    const recorded = readFileSync(filePath, "utf8");
+    assert.doesNotMatch(recorded, /should-not-leak/);
+    assert.doesNotMatch(recorded, /sig-secret/);
+    assert.doesNotMatch(recorded, /auth-secret/);
+    assert.doesNotMatch(recorded, /payloadData/);
+    assert.doesNotMatch(recorded, /"token"/);
+    assert.doesNotMatch(recorded, /"signature"/);
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("trace caps duplicate signatures at three records", async () => {
+  const cdp = new FakeCdp();
+  const { dir, filePath } = makeTempTraceFile();
+  const payload = JSON.stringify({
+    username: "HEBI_",
+    index: 0
+  });
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: () => {
+        throw new Error("unused");
+      },
+      log: () => {},
+      traceEnabled: true,
+      traceFilePath: filePath
+    });
+
+    for (let index = 0; index < 5; index += 1) {
+      cdp.emit("Network.webSocketFrameReceived", {
+        response: {
+          opcode: 1,
+          payloadData: payload
+        }
+      });
+    }
+
+    cleanup();
+
+    assert.equal(readJsonLines(filePath).length, 3);
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("trace stops after 500 records without exceeding the file limit", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const { dir, filePath } = makeTempTraceFile();
+  const payload = JSON.stringify({
+    items: Array.from({ length: 700 }, (_, index) => ({
+      username: `user-${index}`,
+      index
+    }))
+  });
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: () => {
+        throw new Error("unused");
+      },
+      log: (line) => logs.push(line),
+      traceEnabled: true,
+      traceFilePath: filePath
+    });
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      response: {
+        opcode: 1,
+        payloadData: payload
+      }
+    });
+
+    cleanup();
+
+    const records = readJsonLines(filePath);
+    assert.equal(records.length, 500);
+    assert.equal(
+      logs.filter((line) => line === "[ws-trace] limit reached; recording stopped")
+        .length,
+      1
+    );
+    assert.ok(statSync(filePath).size <= 5 * 1024 * 1024);
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("trace initialization errors do not stop the observer", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ddd-ws-observer-bad-"));
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: () => {
+        throw new Error("unused");
+      },
+      log: (line) => logs.push(line),
+      traceEnabled: true,
+      traceFilePath: dir
+    });
+
+    assert.doesNotThrow(() => {
+      cdp.emit("Network.webSocketFrameReceived", {
+        response: {
+          opcode: 1,
+          payloadData: JSON.stringify({
+            options: { seed: 13, bagtype: "7-bag", gameid: "g-13" }
+          })
+        }
+      });
+    });
+
+    cleanup();
+
+    assert.ok(
+      logs.some((line) =>
+        line.startsWith("[ws-trace] disabled after initialization error: ")
+      )
+    );
+    assert.ok(logs.includes("[ws-observer] game options captured"));
+  } finally {
+    cleanupTempDir(dir);
+  }
 });
 
 test("DDD WebSocket observer is installed by default", () => {

@@ -1,6 +1,13 @@
+import { appendFileSync, mkdirSync, rmSync } from "node:fs";
+import path from "node:path";
+
 const MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
 const MAX_DEPTH = 12;
 const MAX_VISITED_OBJECTS = 5000;
+const MAX_TRACE_RECORDS = 500;
+const MAX_TRACE_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_TRACE_RECORD_BYTES = 32 * 1024;
+const DEFAULT_TRACE_FILE_PATH = path.join("automation", "ws-live-candidates.jsonl");
 const SENSITIVE_KEYS = new Set([
   "token",
   "auth",
@@ -9,7 +16,10 @@ const SENSITIVE_KEYS = new Set([
   "session",
   "jwt",
   "password",
-  "secret"
+  "secret",
+  "signature",
+  "endpoint",
+  "handling"
 ]);
 const ALLOWED_OPTION_KEYS = [
   "seed",
@@ -33,8 +43,101 @@ const ALLOWED_OPTION_KEYS = [
   "display_next",
   "display_hold"
 ];
+const IDENTITY_KEYS = new Set([
+  "gameid",
+  "game_id",
+  "id",
+  "userid",
+  "user_id",
+  "username",
+  "name",
+  "players",
+  "player",
+  "slot",
+  "index"
+]);
+const BOARD_KEYS = new Set(["board", "field"]);
+const PIECE_KEYS = new Set([
+  "falling",
+  "active",
+  "current",
+  "piece",
+  "hold",
+  "held",
+  "queue",
+  "bag",
+  "next",
+  "preview",
+  "pieces"
+]);
+const REPLAY_KEYS = new Set([
+  "replay",
+  "events",
+  "frames",
+  "frame",
+  "ige",
+  "data",
+  "key",
+  "keys",
+  "inputs",
+  "interaction",
+  "lock",
+  "spawn"
+]);
+const GARBAGE_KEYS = new Set([
+  "garbage",
+  "garbagequeue",
+  "incoming",
+  "targets",
+  "target",
+  "attack",
+  "damage",
+  "gameover",
+  "gameoverreason",
+  "winner",
+  "victims"
+]);
+const CONTEXT_KEYS = [
+  "username",
+  "name",
+  "userid",
+  "gameid",
+  "slot",
+  "index",
+  "local",
+  "self",
+  "me",
+  "opponent",
+  "type",
+  "role"
+];
+const TRACE_FIRST_LOG_KINDS = new Set(["identity", "board", "replay", "garbage"]);
+const TRACE_SUMMARY_SCALAR_KEYS = [
+  "seed",
+  "gameid",
+  "username",
+  "name",
+  "userid",
+  "piece",
+  "current",
+  "hold",
+  "held",
+  "incoming",
+  "frame",
+  "id",
+  "slot",
+  "index"
+];
 
-export async function installDddWsObserver(cdp, { unpack, log }) {
+export async function installDddWsObserver(
+  cdp,
+  {
+    unpack,
+    log,
+    traceEnabled = process.env.FUSION_DDD_WS_TRACE === "1",
+    traceFilePath = DEFAULT_TRACE_FILE_PATH
+  } = {}
+) {
   if (typeof unpack !== "function") {
     log?.("[ws-observer] msgpackr unavailable; observer inactive");
     return () => {};
@@ -46,8 +149,20 @@ export async function installDddWsObserver(cdp, { unpack, log }) {
     framesReceived: 0,
     binaryFramesReceived: 0,
     decodeAttempts: 0,
-    optionsCaptured: 0
+    optionsCaptured: 0,
+    trace: null
   };
+  if (traceEnabled) {
+    try {
+      observerState.trace = createTraceRecorder(traceFilePath, log);
+    } catch (error) {
+      log?.(
+        `[ws-trace] disabled after initialization error: ${
+          error?.message ?? String(error)
+        }`
+      );
+    }
+  }
 
   await cdp.send("Network.enable").catch(() => undefined);
 
@@ -86,17 +201,14 @@ export async function installDddWsObserver(cdp, { unpack, log }) {
         if (payload.length === 0 || payload.length > MAX_PAYLOAD_BYTES) {
           return;
         }
-        const candidates = decodeGameOptionsCandidates(payload, unpack);
+        const decodedRoots = collectDecodedRoots(payload, unpack);
+        const candidates = collectOptionCandidates(decodedRoots);
         observerState.decodeAttempts += decodeAttemptCount(payload);
         for (const chunk of split87Frame(payload)) {
           observerState.decodeAttempts += decodeAttemptCount(chunk);
         }
-        logCapturedCandidates(
-          candidates,
-          event?.requestId,
-          observerState,
-          log
-        );
+        logCapturedCandidates(candidates, event?.requestId, observerState, log);
+        traceDecodedRoots(decodedRoots, event, observerState, log);
         return;
       }
 
@@ -113,13 +225,10 @@ export async function installDddWsObserver(cdp, { unpack, log }) {
         if (!parsed || typeof parsed !== "object") {
           return;
         }
-        const candidates = decodeGameOptionsCandidates(parsed, unpack);
-        logCapturedCandidates(
-          candidates,
-          event?.requestId,
-          observerState,
-          log
-        );
+        const decodedRoots = collectDecodedRoots(parsed, unpack);
+        const candidates = collectOptionCandidates(decodedRoots);
+        logCapturedCandidates(candidates, event?.requestId, observerState, log);
+        traceDecodedRoots(decodedRoots, event, observerState, log);
       }
     } catch {}
   });
@@ -129,6 +238,7 @@ export async function installDddWsObserver(cdp, { unpack, log }) {
     offClosed();
     offReceived();
     observerState.requestUrls.clear();
+    finalizeTrace(observerState, log);
   };
 }
 
@@ -187,25 +297,7 @@ export function tryUnpackAtOffsets(buffer, unpack) {
 }
 
 export function decodeGameOptionsCandidates(payload, unpack) {
-  const candidates = [];
-
-  if (Buffer.isBuffer(payload)) {
-    for (const chunk of split87Frame(payload)) {
-      collectDecodedCandidates(candidates, tryUnpackAtOffsets(chunk, unpack));
-    }
-    collectDecodedCandidates(candidates, tryUnpackAtOffsets(payload, unpack));
-    return candidates;
-  }
-
-  if (payload && typeof payload === "object") {
-    const match = findGameOptions(payload);
-    const sanitized = sanitizeGameOptions(match);
-    if (sanitized) {
-      candidates.push(sanitized);
-    }
-  }
-
-  return candidates;
+  return collectOptionCandidates(collectDecodedRoots(payload, unpack));
 }
 
 export function findGameOptions(root) {
@@ -423,4 +515,586 @@ function decodeAttemptCount(buffer) {
     return 0;
   }
   return Math.min(24, buffer.length - 1) + 1;
+}
+
+function collectDecodedRoots(payload, unpack) {
+  if (Buffer.isBuffer(payload)) {
+    const roots = [];
+    for (const chunk of split87Frame(payload)) {
+      roots.push(...tryUnpackAtOffsets(chunk, unpack));
+    }
+    roots.push(...tryUnpackAtOffsets(payload, unpack));
+    return roots;
+  }
+
+  if (payload && typeof payload === "object") {
+    return [payload];
+  }
+
+  return [];
+}
+
+function collectOptionCandidates(decodedRoots) {
+  const candidates = [];
+  collectDecodedCandidates(candidates, decodedRoots);
+  return candidates;
+}
+
+function createTraceRecorder(traceFilePath, log) {
+  const filePath = path.resolve(traceFilePath);
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  rmSync(filePath, { force: true });
+  log?.(`[ws-trace] recording ${traceFilePath.replace(/\\/g, "/")}`);
+  return {
+    filePath,
+    displayPath: traceFilePath.replace(/\\/g, "/"),
+    records: 0,
+    fileBytes: 0,
+    stopped: false,
+    stopLogged: false,
+    signatureCounts: new Map(),
+    firstKindsLogged: new Set(),
+    kindCounts: {
+      options: 0,
+      identity: 0,
+      board: 0,
+      piece: 0,
+      replay: 0,
+      garbage: 0,
+      mixed: 0
+    }
+  };
+}
+
+function traceDecodedRoots(decodedRoots, event, observerState, log) {
+  const trace = observerState.trace;
+  if (!trace || trace.stopped) {
+    return;
+  }
+
+  for (const root of decodedRoots) {
+    try {
+      const candidates = collectTraceCandidates(root);
+      for (const candidate of candidates) {
+        maybeRecordTraceCandidate(candidate, event, observerState, log);
+      }
+    } catch {}
+  }
+}
+
+function collectTraceCandidates(root) {
+  const candidates = [];
+  const seen = new WeakSet();
+  const counters = {
+    visitedObjects: 0
+  };
+
+  walkTraceCandidates(root, "root", [], seen, counters, candidates, 0);
+  return candidates;
+}
+
+function walkTraceCandidates(
+  value,
+  pathLabel,
+  ancestors,
+  seen,
+  counters,
+  candidates,
+  depth
+) {
+  if (!value || typeof value !== "object") {
+    return;
+  }
+  if (depth > MAX_DEPTH || counters.visitedObjects >= MAX_VISITED_OBJECTS) {
+    return;
+  }
+  if (seen.has(value)) {
+    return;
+  }
+
+  seen.add(value);
+  counters.visitedObjects += 1;
+
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      walkTraceCandidates(
+        value[index],
+        `${pathLabel}[${index}]`,
+        ancestors,
+        seen,
+        counters,
+        candidates,
+        depth + 1
+      );
+    }
+    return;
+  }
+
+  const lineage = [{ value, path: pathLabel }, ...ancestors];
+  candidates.push(...buildTraceEntriesForObject(value, pathLabel, lineage));
+
+  const nextAncestors = lineage.slice(0, 4);
+  for (const key of Object.keys(value)) {
+    if (isSensitiveKey(key)) {
+      continue;
+    }
+    let nextValue;
+    try {
+      nextValue = value[key];
+    } catch {
+      continue;
+    }
+    walkTraceCandidates(
+      nextValue,
+      `${pathLabel}.${key}`,
+      nextAncestors,
+      seen,
+      counters,
+      candidates,
+      depth + 1
+    );
+  }
+}
+
+function buildTraceEntriesForObject(value, pathLabel, lineage) {
+  const entries = [];
+  const safeKeys = Object.keys(value).filter((key) => !isSensitiveKey(key));
+  const keySet = new Set(safeKeys.map((key) => key.toLowerCase()));
+
+  if (hasSeedAndBagtype(value)) {
+    entries.push(buildOptionTraceRecord(value, pathLabel, lineage));
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(value, "options") &&
+    hasSeedAndBagtype(value.options)
+  ) {
+    entries.push(
+      buildOptionTraceRecord(
+        mergeAllowedOptionShape(value, value.options),
+        `${pathLabel}.options`,
+        [{ value: value.options, path: `${pathLabel}.options` }, ...lineage]
+      )
+    );
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(value, "setoptions") &&
+    hasSeedAndBagtype(value.setoptions)
+  ) {
+    entries.push(
+      buildOptionTraceRecord(
+        mergeAllowedOptionShape(value, value.setoptions),
+        `${pathLabel}.setoptions`,
+        [{ value: value.setoptions, path: `${pathLabel}.setoptions` }, ...lineage]
+      )
+    );
+  }
+
+  const kind = classifyTraceKind(keySet);
+  if (kind) {
+    entries.push(buildTraceRecord(kind, value, pathLabel, safeKeys, lineage));
+  }
+
+  return entries;
+}
+
+function buildOptionTraceRecord(options, pathLabel, lineage) {
+  const sanitized = sanitizeGameOptions(options);
+  if (!sanitized) {
+    return null;
+  }
+
+  return {
+    kind: "options",
+    path: pathLabel,
+    keys: Object.keys(sanitized).sort(),
+    context: extractTraceContext(lineage),
+    summary: summarizeTraceObject(sanitized),
+    ...sanitized
+  };
+}
+
+function buildTraceRecord(kind, value, pathLabel, safeKeys, lineage) {
+  return {
+    kind,
+    path: pathLabel,
+    keys: safeKeys.sort(),
+    context: extractTraceContext(lineage),
+    summary: summarizeTraceObject(value)
+  };
+}
+
+function classifyTraceKind(keySet) {
+  const matchedKinds = [];
+  if (matchesAnyKeySet(keySet, IDENTITY_KEYS)) {
+    matchedKinds.push("identity");
+  }
+  if (matchesAnyKeySet(keySet, BOARD_KEYS)) {
+    matchedKinds.push("board");
+  }
+  if (matchesAnyKeySet(keySet, PIECE_KEYS)) {
+    matchedKinds.push("piece");
+  }
+  if (matchesAnyKeySet(keySet, REPLAY_KEYS)) {
+    matchedKinds.push("replay");
+  }
+  if (matchesAnyKeySet(keySet, GARBAGE_KEYS)) {
+    matchedKinds.push("garbage");
+  }
+
+  if (matchedKinds.length === 0) {
+    return null;
+  }
+  if (matchedKinds.length === 1) {
+    return matchedKinds[0];
+  }
+  return "mixed";
+}
+
+function matchesAnyKeySet(source, expected) {
+  for (const key of expected) {
+    if (source.has(key)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function extractTraceContext(lineage) {
+  const context = {};
+  for (const entry of lineage.slice(0, 4)) {
+    const source = entry?.value;
+    if (!source || typeof source !== "object" || Array.isArray(source)) {
+      continue;
+    }
+    for (const key of CONTEXT_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(context, key)) {
+        continue;
+      }
+      if (!Object.prototype.hasOwnProperty.call(source, key)) {
+        continue;
+      }
+      const scalar = sanitizeTraceScalar(source[key]);
+      if (scalar !== undefined) {
+        context[key] = scalar;
+      }
+    }
+  }
+  return context;
+}
+
+function summarizeTraceObject(value) {
+  const summary = {};
+
+  if (!value || typeof value !== "object") {
+    return summary;
+  }
+
+  for (const key of TRACE_SUMMARY_SCALAR_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(value, key) || isSensitiveKey(key)) {
+      continue;
+    }
+    const scalar = sanitizeTraceScalar(value[key]);
+    if (scalar !== undefined) {
+      summary[key] = scalar;
+    }
+  }
+
+  const playerArray = findDirectArray(value, ["players"]);
+  if (playerArray) {
+    summary.playerCount = playerArray.length;
+  }
+
+  const boardInfo = findBoardSummary(value);
+  if (boardInfo) {
+    Object.assign(summary, boardInfo);
+  }
+
+  const queueInfo = findQueueSummary(value);
+  if (queueInfo) {
+    Object.assign(summary, queueInfo);
+  }
+
+  const replayInfo = findReplaySummary(value);
+  if (replayInfo) {
+    Object.assign(summary, replayInfo);
+  }
+
+  return summary;
+}
+
+function findBoardSummary(value) {
+  const board = findFirstOwnObject(value, ["board", "field"]);
+  if (!Array.isArray(board) || board.length < 20 || board.length > 40) {
+    return null;
+  }
+
+  const row = board.find((entry) => Array.isArray(entry));
+  if (!row || row.length < 8 || row.length > 12) {
+    return null;
+  }
+
+  let filledCells = 0;
+  for (const currentRow of board) {
+    if (!Array.isArray(currentRow)) {
+      continue;
+    }
+    for (const cell of currentRow) {
+      if (cell) {
+        filledCells += 1;
+      }
+    }
+  }
+
+  return {
+    boardRows: board.length,
+    boardWidth: row.length,
+    filledCells
+  };
+}
+
+function findQueueSummary(value) {
+  const queue = findDirectArray(value, ["queue", "bag", "next", "preview", "pieces"]);
+  if (!queue) {
+    return null;
+  }
+
+  const sample = queue
+    .slice(0, 12)
+    .map((entry) => sanitizeTraceScalar(entry))
+    .filter((entry) => entry !== undefined);
+
+  return {
+    queueLength: queue.length,
+    queueSample: sample
+  };
+}
+
+function findReplaySummary(value) {
+  const eventContainer = findEventContainer(value);
+  if (!eventContainer) {
+    return null;
+  }
+
+  const { label, events } = eventContainer;
+  const summary = {
+    [label === "frames" ? "frameCount" : "eventCount"]: events.length,
+    eventSamples: events.slice(0, 3).map(summarizeReplayEvent)
+  };
+
+  return summary;
+}
+
+function findEventContainer(value) {
+  const directEvents = findDirectArray(value, ["events", "frames"]);
+  if (directEvents) {
+    return {
+      label: Object.prototype.hasOwnProperty.call(value, "frames") ? "frames" : "events",
+      events: directEvents
+    };
+  }
+
+  for (const key of ["replay", "data"]) {
+    if (!Object.prototype.hasOwnProperty.call(value, key) || isSensitiveKey(key)) {
+      continue;
+    }
+    const nested = value[key];
+    if (!nested || typeof nested !== "object") {
+      continue;
+    }
+    const nestedEvents = findDirectArray(nested, ["events", "frames"]);
+    if (nestedEvents) {
+      return {
+        label: Object.prototype.hasOwnProperty.call(nested, "frames") ? "frames" : "events",
+        events: nestedEvents
+      };
+    }
+  }
+
+  return null;
+}
+
+function summarizeReplayEvent(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    return {};
+  }
+
+  const sample = {
+    keys: Object.keys(event).filter((key) => !isSensitiveKey(key)).sort()
+  };
+
+  const frame = sanitizeTraceScalar(event.frame);
+  if (frame !== undefined) {
+    sample.frame = frame;
+  }
+  const type = sanitizeTraceScalar(event.type);
+  if (type !== undefined) {
+    sample.type = type;
+  }
+  const id = sanitizeTraceScalar(event.id);
+  if (id !== undefined) {
+    sample.id = id;
+  }
+  if (event.data && typeof event.data === "object" && !Array.isArray(event.data)) {
+    sample.dataKeys = Object.keys(event.data)
+      .filter((key) => !isSensitiveKey(key))
+      .sort();
+  }
+
+  return sample;
+}
+
+function maybeRecordTraceCandidate(candidate, event, observerState, log) {
+  if (!candidate) {
+    return;
+  }
+
+  const trace = observerState.trace;
+  if (!trace || trace.stopped) {
+    return;
+  }
+
+  const record = {
+    timestamp: Date.now(),
+    urlHost: resolveTraceUrlHost(event?.requestId, observerState),
+    requestId: event?.requestId ?? null,
+    opcode: event?.response?.opcode ?? null,
+    ...candidate
+  };
+  if (Object.keys(record.context ?? {}).length === 0) {
+    delete record.context;
+  }
+  if (Object.keys(record.summary ?? {}).length === 0) {
+    delete record.summary;
+  }
+
+  const signature = buildTraceSignature(record);
+  const seenCount = trace.signatureCounts.get(signature) ?? 0;
+  if (seenCount >= 3) {
+    return;
+  }
+
+  const serialized = JSON.stringify(record);
+  const serializedBytes = Buffer.byteLength(serialized);
+  if (serializedBytes > MAX_TRACE_RECORD_BYTES) {
+    return;
+  }
+
+  if (
+    trace.records >= MAX_TRACE_RECORDS ||
+    trace.fileBytes + serializedBytes + 1 > MAX_TRACE_FILE_BYTES
+  ) {
+    stopTraceRecording(trace, log);
+    return;
+  }
+
+  try {
+    appendFileSync(trace.filePath, `${serialized}\n`);
+  } catch {
+    stopTraceRecording(trace, log);
+    return;
+  }
+
+  trace.signatureCounts.set(signature, seenCount + 1);
+  trace.records += 1;
+  trace.fileBytes += serializedBytes + 1;
+  trace.kindCounts[record.kind] = (trace.kindCounts[record.kind] ?? 0) + 1;
+
+  if (
+    TRACE_FIRST_LOG_KINDS.has(record.kind) &&
+    !trace.firstKindsLogged.has(record.kind)
+  ) {
+    trace.firstKindsLogged.add(record.kind);
+    log?.(`[ws-trace] first ${record.kind} candidate`);
+  }
+}
+
+function buildTraceSignature(record) {
+  const keys = Array.isArray(record.keys) ? [...record.keys].sort().join(",") : "";
+  const summary = record.summary ?? {};
+  const context = record.context ?? {};
+  const firstEventType =
+    Array.isArray(summary.eventSamples) && summary.eventSamples[0]
+      ? summary.eventSamples[0].type ?? ""
+      : "";
+
+  return [
+    record.urlHost ?? "",
+    record.kind ?? "",
+    record.path ?? "",
+    keys,
+    record.gameid ?? summary.gameid ?? context.gameid ?? "",
+    context.username ?? summary.username ?? context.name ?? summary.name ?? "",
+    record.seed ?? summary.seed ?? "",
+    summary.boardRows ?? "",
+    summary.queueLength ?? "",
+    firstEventType,
+    summary.current ?? summary.piece ?? "",
+    summary.hold ?? summary.held ?? "",
+    summary.frame ?? "",
+    summary.incoming ?? "",
+    summary.filledCells ?? ""
+  ].join("|");
+}
+
+function resolveTraceUrlHost(requestId, observerState) {
+  if (!requestId || !observerState.requestUrls.has(requestId)) {
+    return "unknown";
+  }
+  return safeUrlHost(observerState.requestUrls.get(requestId));
+}
+
+function sanitizeTraceScalar(value) {
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function findDirectArray(value, keys) {
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(value, key) || isSensitiveKey(key)) {
+      continue;
+    }
+    const candidate = value[key];
+    if (Array.isArray(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function findFirstOwnObject(value, keys) {
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(value, key) || isSensitiveKey(key)) {
+      continue;
+    }
+    return value[key];
+  }
+  return null;
+}
+
+function stopTraceRecording(trace, log) {
+  if (trace.stopLogged) {
+    trace.stopped = true;
+    return;
+  }
+  trace.stopped = true;
+  trace.stopLogged = true;
+  log?.("[ws-trace] limit reached; recording stopped");
+}
+
+function finalizeTrace(observerState, log) {
+  const trace = observerState.trace;
+  if (!trace) {
+    return;
+  }
+  log?.(
+    `[ws-trace] records=${trace.records} options=${trace.kindCounts.options ?? 0} identity=${trace.kindCounts.identity ?? 0} board=${trace.kindCounts.board ?? 0} replay=${trace.kindCounts.replay ?? 0} garbage=${trace.kindCounts.garbage ?? 0}`
+  );
 }
