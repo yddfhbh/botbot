@@ -9,6 +9,7 @@ import {
   isMainFrameDocumentNavigation,
   isTopFrameNavigation,
   resetDiscoveryState,
+  shouldResetDiscoveryOnExecutionContextsCleared,
   shouldAttemptDebuggerProbe,
   shouldAttemptStartupDirectScan,
   startupDirectScanDisabledReason,
@@ -279,6 +280,30 @@ test("document navigation only resets for the main frame once known", () => {
     false
   );
   assert.equal(isMainFrameDocumentNavigation({}, null), true);
+});
+
+test("execution context clears only reset captured discovery state", () => {
+  assert.equal(
+    shouldResetDiscoveryOnExecutionContextsCleared({
+      gameCaptured: false,
+      lastCaptureSource: null
+    }),
+    false
+  );
+  assert.equal(
+    shouldResetDiscoveryOnExecutionContextsCleared({
+      gameCaptured: true,
+      lastCaptureSource: null
+    }),
+    true
+  );
+  assert.equal(
+    shouldResetDiscoveryOnExecutionContextsCleared({
+      gameCaptured: false,
+      lastCaptureSource: "window.game"
+    }),
+    true
+  );
 });
 
 test("state perf logs show quick, startup scan, and disabled modes", () => {

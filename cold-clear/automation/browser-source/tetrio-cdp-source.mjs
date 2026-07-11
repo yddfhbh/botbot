@@ -131,6 +131,10 @@ export function isMainFrameDocumentNavigation(event, mainFrameId) {
   return event?.frameId === mainFrameId;
 }
 
+export function shouldResetDiscoveryOnExecutionContextsCleared(probeState) {
+  return Boolean(probeState?.gameCaptured || probeState?.lastCaptureSource);
+}
+
 async function clearCachedGameHandle(cdp) {
   await safeRuntimeEvaluate(
     cdp,
@@ -175,7 +179,12 @@ function attachDiscoveryLifecycleHooks(cdp, probeState) {
     }
     reset("navigated_within_document");
   });
-  cdp.on("Runtime.executionContextsCleared", () => reset("execution_contexts_cleared"));
+  cdp.on("Runtime.executionContextsCleared", () => {
+    if (!shouldResetDiscoveryOnExecutionContextsCleared(probeState)) {
+      return;
+    }
+    reset("execution_contexts_cleared");
+  });
 }
 
 async function main() {
