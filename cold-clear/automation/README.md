@@ -22,7 +22,7 @@ Use this for private/custom `1v1` rooms.
 
 This is the recommended default for VS work in this repo.
 
-### Solo Browser CDP
+### Solo Browser CDP - Known Good
 
 Use this for solo/custom solo and Browser CDP debugging.
 
@@ -43,6 +43,14 @@ Use this for fixture/replay/debug work.
 cargo run -p automation -- automation/config.example.json
 ```
 
+`config.example.json` is the real-input `Solo Browser CDP - Known Good` profile.
+
+If you want logging only with no real input:
+
+```powershell
+cargo run -p automation -- automation/config.dry-run.example.json
+```
+
 VS/private room example:
 
 ```powershell
@@ -61,7 +69,7 @@ File debug example:
 cargo run -p automation -- --snapshot-provider file
 ```
 
-`dry_run: true` leaves input untouched and only logs planned actions.
+`dry_run: true` leaves input untouched and logs that input is being skipped.
 
 ## Launcher
 
@@ -72,14 +80,14 @@ cargo run -p automation
 The launcher exposes four modes:
 
 - `VS WebSocket Seed`
-- `Solo Browser CDP`
+- `Solo Browser CDP - Known Good`
 - `File Debug`
 - `Custom`
 
 Recommended usage:
 
 1. Pick `VS WebSocket Seed` for private/custom `1v1` rooms.
-2. Pick `Solo Browser CDP` for solo/custom solo.
+2. Pick `Solo Browser CDP - Known Good` for solo/custom solo.
 3. Leave `Scan Code` and `Virtual Key` as fallback input backends only when `Browser CDP` input is not usable.
 
 When `WebSocket Seed` is selected, the launcher shows:

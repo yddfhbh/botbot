@@ -74,7 +74,10 @@ async function main() {
   const url = args.url ?? DEFAULT_URL;
   const port = numberArg(args.port, DEFAULT_PORT);
   const targetHint = args.target ?? "TETR.IO";
-  const pollMs = computeEffectiveStatePollMs(args.pollMs, args.minPollMs);
+  const pollMs = computeEffectiveStatePollMs(
+    args.statePollMs ?? args.pollMs,
+    args.minStatePollMs ?? args.minPollMs
+  );
   const connectOnly = args.connectOnly === "1";
   const chromePath = process.env.CHROME_PATH || "";
   const debuggerProbeMode = normalizeDebuggerProbeMode(args.debuggerProbeMode ?? "startup_only");

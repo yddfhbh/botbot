@@ -126,65 +126,26 @@ async function main() {
       }
 
       if (message.type === "tap") {
-        const spec = KEY_MAP[message.key];
-        if (!spec) {
-          writeResponse({
-            ok: false,
-            id: message.id ?? null,
-            type: "tap",
-            error: `unknown key: ${message.key ?? ""}`
-          });
-          return;
-        }
-        cdp = await ensureConnected(cdp, { port, url, targetHint });
-        const durationMs = numberArg(message.durationMs, 55);
-        let focus = null;
-        if (focusController.shouldFocusForTap(message.key)) {
-          focus = await ensureFocused(cdp, lastFocus);
-          lastFocus = focus;
-          logInput(
-            `focus mode=${focusMode} activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred} cached=${focus.cached}`
-          );
-        }
-        await dispatchWithReconnect(cdp, spec, "keyDown", { port, url, targetHint }, (nextCdp) => {
-          cdp = nextCdp;
-          focusController.noteReconnect();
-          lastFocus = {
-            at: 0,
-            activeBefore: "UNKNOWN",
-            activeAfter: "UNKNOWN",
-            blurred: false,
-            cached: false
-          };
+        const result = await handleTapMessage(message, {
+          cdp,
+          port,
+          url,
+          targetHint,
+          focusMode,
+          focusController,
+          pressedKeys,
+          lastFocus,
+          setCdp(nextCdp) {
+            cdp = nextCdp;
+          },
+          setLastFocus(nextFocus) {
+            lastFocus = nextFocus;
+          }
         });
-        pressedKeys.add(message.key);
-        logInput(`dispatch keyDown key=${message.key}`);
-        await sleep(durationMs);
-        await dispatchWithReconnect(cdp, spec, "keyUp", { port, url, targetHint }, (nextCdp) => {
-          cdp = nextCdp;
-          focusController.noteReconnect();
-          lastFocus = {
-            at: 0,
-            activeBefore: "UNKNOWN",
-            activeAfter: "UNKNOWN",
-            blurred: false,
-            cached: false
-          };
-        });
-        pressedKeys.delete(message.key);
-        focusController.afterTap(message.key);
-        logInput(`dispatch keyUp key=${message.key}`);
-        logInput(`tap key=${message.key} durationMs=${durationMs} focusMode=${focusMode}`);
-        writeResponse({
-          ok: true,
-          id: message.id ?? null,
-          type: "tap",
-          key: message.key,
-          durationMs,
-          focus
-        });
+        writeResponse(result);
       }
     } catch (error) {
+      logInput(`error type=${message.type ?? "unknown"} message=${error?.message ?? error}`);
       writeResponse({
         ok: false,
         id: message.id ?? null,
@@ -210,6 +171,118 @@ const KEY_MAP = {
   rotate180: keySpec("a", "KeyA", 65, "a"),
   hold: keySpec("c", "KeyC", 67, "c")
 };
+
+function helperKeyLabel(key) {
+  switch (key) {
+    case "moveLeft":
+      return "left";
+    case "moveRight":
+      return "right";
+    case "softDrop":
+      return "soft_drop";
+    case "hardDrop":
+      return "hard_drop";
+    case "rotateCW":
+      return "rotate_cw";
+    case "rotateCCW":
+      return "rotate_ccw";
+    case "rotate180":
+      return "rotate_180";
+    case "hold":
+      return "hold";
+    default:
+      return key ?? "unknown";
+  }
+}
+
+function dispatchKeyLabel(spec) {
+  if (!spec) return "Unknown";
+  if (spec.code === "Space") return "Space";
+  return spec.key === " " ? "Space" : spec.key;
+}
+
+function resetFocusState() {
+  return {
+    at: 0,
+    activeBefore: "UNKNOWN",
+    activeAfter: "UNKNOWN",
+    blurred: false,
+    cached: false
+  };
+}
+
+export async function handleTapMessage(message, context) {
+  const spec = KEY_MAP[message.key];
+  const keyLabel = helperKeyLabel(message.key);
+  const durationMs = numberArg(message.durationMs, 55);
+
+  logInput(`received tap key=${keyLabel} duration=${durationMs}`);
+  if (!spec) {
+    logInput(`unknown key key=${message.key ?? ""}`);
+    return {
+      ok: false,
+      id: message.id ?? null,
+      type: "tap",
+      error: `unknown key: ${message.key ?? ""}`
+    };
+  }
+
+  let cdp = await ensureConnected(context.cdp, {
+    port: context.port,
+    url: context.url,
+    targetHint: context.targetHint
+  });
+  context.setCdp?.(cdp);
+
+  let focus = null;
+  if (context.focusController.shouldFocusForTap(message.key)) {
+    focus = await ensureFocused(cdp, context.lastFocus);
+    context.setLastFocus?.(focus);
+    logInput(
+      `focus mode=${context.focusMode} activeBefore=${focus.activeBefore} activeAfter=${focus.activeAfter} blurred=${focus.blurred} cached=${focus.cached}`
+    );
+  }
+
+  await dispatchWithReconnect(
+    cdp,
+    spec,
+    "keyDown",
+    { port: context.port, url: context.url, targetHint: context.targetHint },
+    (nextCdp) => {
+      cdp = nextCdp;
+      context.setCdp?.(nextCdp);
+      context.focusController.noteReconnect();
+      context.setLastFocus?.(resetFocusState());
+    }
+  );
+  context.pressedKeys.add(message.key);
+  logInput(`dispatch keyDown key=${dispatchKeyLabel(spec)}`);
+  await sleep(durationMs);
+  await dispatchWithReconnect(
+    cdp,
+    spec,
+    "keyUp",
+    { port: context.port, url: context.url, targetHint: context.targetHint },
+    (nextCdp) => {
+      cdp = nextCdp;
+      context.setCdp?.(nextCdp);
+      context.focusController.noteReconnect();
+      context.setLastFocus?.(resetFocusState());
+    }
+  );
+  context.pressedKeys.delete(message.key);
+  context.focusController.afterTap(message.key);
+  logInput(`dispatch keyUp key=${dispatchKeyLabel(spec)}`);
+  logInput(`ok tap key=${keyLabel}`);
+  return {
+    ok: true,
+    id: message.id ?? null,
+    type: "tap",
+    key: message.key,
+    durationMs,
+    focus
+  };
+}
 
 function keySpec(key, code, windowsVirtualKeyCode, text = "") {
   return {

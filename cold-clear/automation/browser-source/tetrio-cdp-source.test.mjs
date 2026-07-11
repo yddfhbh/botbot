@@ -37,6 +37,21 @@ test("startup_only stops probing after the game object is captured", () => {
   );
 });
 
+test("manual mode never auto probes while playing", () => {
+  assert.equal(
+    shouldAttemptDebuggerProbe({
+      mode: "manual",
+      needsProbe: true,
+      gameCaptured: false,
+      playing: true,
+      lastKnownPlaying: true,
+      now: 20_000,
+      lastAttemptAt: 0
+    }),
+    false
+  );
+});
+
 test("ribbon until_seed stops deep decode after seed capture", () => {
   assert.equal(
     shouldDecodeRibbonFrame({

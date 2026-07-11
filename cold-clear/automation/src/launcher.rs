@@ -24,8 +24,8 @@ use crate::runtime::run_automation;
 enum ModePreset {
     #[serde(alias = "VsLeft1080p")]
     VsWebsocketSeed,
-    #[serde(alias = "Solo1080p")]
-    SoloBrowserCdp,
+    #[serde(alias = "SoloBrowserCdp", alias = "Solo1080p")]
+    SoloBrowserCdpKnownGood,
     FileDebug,
     Custom,
 }
@@ -33,7 +33,7 @@ enum ModePreset {
 impl ModePreset {
     fn label(self) -> &'static str {
         match self {
-            ModePreset::SoloBrowserCdp => "Solo Browser CDP",
+            ModePreset::SoloBrowserCdpKnownGood => "Solo Browser CDP - Known Good",
             ModePreset::VsWebsocketSeed => "VS WebSocket Seed",
             ModePreset::FileDebug => "File Debug",
             ModePreset::Custom => "Custom",
@@ -73,32 +73,30 @@ struct LauncherState {
 impl Default for LauncherState {
     fn default() -> Self {
         Self {
-            preset: ModePreset::VsWebsocketSeed,
+            preset: ModePreset::SoloBrowserCdpKnownGood,
             snapshot_path: "automation/live-snapshot.json".to_owned(),
-            snapshot_provider: SnapshotProviderConfig::WebsocketSeed,
+            snapshot_provider: SnapshotProviderConfig::BrowserCdp,
             browser: BrowserCdpConfig {
-                probe_page_state: false,
-                debugger_probe_mode: DebuggerProbeMode::Disabled,
-                use_ribbon_websocket: true,
+                ribbon_decode_mode: RibbonDecodeMode::Off,
                 ..BrowserCdpConfig::default()
             },
             always_on_top: false,
-            dry_run: true,
-            poll_interval_ms: 20,
+            dry_run: false,
+            poll_interval_ms: 30,
             perf_log_enabled: true,
             input_backend: InputBackendConfig::BrowserCdp,
-            target_pps: 1.2,
+            target_pps: 0.0,
             tap_duration_ms: 60,
             movement_tap_duration_ms: 20,
             rotate_tap_duration_ms: 30,
             hold_tap_duration_ms: 30,
             hard_drop_tap_duration_ms: 40,
             soft_drop_tap_duration_ms: 20,
-            movement_interval_ms: 20,
-            rotation_interval_ms: 30,
-            piece_interval_ms: 60,
-            hard_drop_interval_ms: 40,
-            min_snapshot_age_ms: 30,
+            movement_interval_ms: 10,
+            rotation_interval_ms: 10,
+            piece_interval_ms: 40,
+            hard_drop_interval_ms: 10,
+            min_snapshot_age_ms: 20,
             bot: BotConfig::default(),
             handling: HandlingConfig::default(),
             keys: KeyBindings::default(),
@@ -156,14 +154,53 @@ impl LauncherState {
         self.handling.ihs_mode = BufferModeConfig::Off;
     }
 
+    fn apply_solo_known_good_runtime_defaults(&mut self) {
+        self.target_pps = 0.0;
+        self.dry_run = false;
+        self.tap_duration_ms = 60;
+        self.poll_interval_ms = 30;
+        self.perf_log_enabled = true;
+        self.movement_tap_duration_ms = 20;
+        self.rotate_tap_duration_ms = 30;
+        self.hold_tap_duration_ms = 30;
+        self.hard_drop_tap_duration_ms = 40;
+        self.soft_drop_tap_duration_ms = 20;
+        self.movement_interval_ms = 10;
+        self.rotation_interval_ms = 10;
+        self.piece_interval_ms = 40;
+        self.hard_drop_interval_ms = 10;
+        self.min_snapshot_age_ms = 20;
+        self.bot.threads = 1;
+        self.bot.min_nodes = 0;
+        self.bot.max_nodes = 100_000;
+        self.bot.use_hold = true;
+        self.bot.speculate = false;
+        self.bot.movement_mode = MovementModeConfig::ZeroGSafe;
+        self.bot.spawn_rule = SpawnRuleConfig::Row19Or20;
+        self.handling.soft_drop_mode = SoftDropModeConfig::Infinite;
+        self.handling.allow_post_softdrop_actions = true;
+        self.handling.allow_post_softdrop_horizontal = false;
+        self.handling.release_after_each_action = false;
+        self.handling.action_settle_ms = 0;
+        self.handling.prevent_accidental_hard_drops = true;
+        self.handling.cancel_das_on_direction_change = true;
+        self.handling.prefer_soft_drop_over_movement = false;
+        self.handling.irs_mode = BufferModeConfig::Off;
+        self.handling.ihs_mode = BufferModeConfig::Off;
+    }
+
     fn apply_solo_browser_cdp_preset(&mut self) {
         self.snapshot_provider = SnapshotProviderConfig::BrowserCdp;
         self.input_backend = InputBackendConfig::BrowserCdp;
         self.browser = BrowserCdpConfig::default();
+        self.browser.probe_page_state = true;
         self.browser.debugger_probe_mode = DebuggerProbeMode::Manual;
+        self.browser.state_poll_ms = 40;
         self.browser.use_ribbon_websocket = false;
+        self.browser.ribbon_decode_mode = RibbonDecodeMode::Off;
         self.browser.use_seed_simulation_fallback = false;
-        self.apply_shared_runtime_defaults();
+        self.browser.input_focus_mode = InputFocusMode::PerPlan;
+        self.apply_solo_known_good_runtime_defaults();
     }
 
     fn apply_vs_websocket_seed_preset(&mut self) {
@@ -193,7 +230,7 @@ impl LauncherState {
 
     fn apply_active_preset(&mut self) {
         match self.preset {
-            ModePreset::SoloBrowserCdp => self.apply_solo_browser_cdp_preset(),
+            ModePreset::SoloBrowserCdpKnownGood => self.apply_solo_browser_cdp_preset(),
             ModePreset::VsWebsocketSeed => self.apply_vs_websocket_seed_preset(),
             ModePreset::FileDebug => self.apply_file_debug_preset(),
             ModePreset::Custom => {}
@@ -688,13 +725,13 @@ impl eframe::App for LauncherApp {
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
                             &mut self.state.preset,
-                            ModePreset::VsWebsocketSeed,
-                            ModePreset::VsWebsocketSeed.label(),
+                            ModePreset::SoloBrowserCdpKnownGood,
+                            ModePreset::SoloBrowserCdpKnownGood.label(),
                         );
                         ui.selectable_value(
                             &mut self.state.preset,
-                            ModePreset::SoloBrowserCdp,
-                            ModePreset::SoloBrowserCdp.label(),
+                            ModePreset::VsWebsocketSeed,
+                            ModePreset::VsWebsocketSeed.label(),
                         );
                         ui.selectable_value(
                             &mut self.state.preset,
@@ -1331,30 +1368,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_launcher_state_prefers_vs_websocket_seed() {
+    fn default_launcher_state_prefers_solo_browser_cdp_known_good() {
         let state = LauncherState::default();
 
-        assert_eq!(state.preset, ModePreset::VsWebsocketSeed);
-        assert_eq!(
-            state.snapshot_provider,
-            SnapshotProviderConfig::WebsocketSeed
-        );
+        assert_eq!(state.preset, ModePreset::SoloBrowserCdpKnownGood);
+        assert_eq!(state.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
         assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
-        assert!(state.browser.use_ribbon_websocket);
+        assert!(!state.dry_run);
+        assert_eq!(state.target_pps, 0.0);
     }
 
     #[test]
     fn solo_browser_cdp_preset_uses_browser_cdp_input() {
         let mut state = LauncherState::default();
-        state.preset = ModePreset::SoloBrowserCdp;
+        state.preset = ModePreset::SoloBrowserCdpKnownGood;
         state.apply_preset();
 
         assert_eq!(state.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
         assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
         assert!(state.browser.probe_page_state);
         assert_eq!(state.browser.debugger_probe_mode, DebuggerProbeMode::Manual);
+        assert_eq!(state.browser.ribbon_decode_mode, RibbonDecodeMode::Off);
         assert!(!state.browser.use_ribbon_websocket);
         assert!(!state.browser.use_seed_simulation_fallback);
+        assert!(!state.dry_run);
     }
 
     #[test]
@@ -1396,37 +1433,41 @@ mod tests {
     #[test]
     fn legacy_mode_names_deserialize_into_new_presets() {
         let solo: LauncherState = serde_json::from_str(r#"{"preset":"Solo1080p"}"#).unwrap();
+        let solo_new: LauncherState =
+            serde_json::from_str(r#"{"preset":"SoloBrowserCdp"}"#).unwrap();
         let vs: LauncherState = serde_json::from_str(r#"{"preset":"VsLeft1080p"}"#).unwrap();
 
-        assert_eq!(solo.preset, ModePreset::SoloBrowserCdp);
+        assert_eq!(solo.preset, ModePreset::SoloBrowserCdpKnownGood);
+        assert_eq!(solo_new.preset, ModePreset::SoloBrowserCdpKnownGood);
         assert_eq!(vs.preset, ModePreset::VsWebsocketSeed);
     }
 
     #[test]
     fn runtime_defaults_stay_synced_across_presets() {
         let mut state = LauncherState::default();
-        state.preset = ModePreset::SoloBrowserCdp;
+        state.preset = ModePreset::SoloBrowserCdpKnownGood;
         state.apply_preset();
 
         assert_eq!(state.bot.movement_mode, MovementModeConfig::ZeroGSafe);
         assert_eq!(state.bot.spawn_rule, SpawnRuleConfig::Row19Or20);
-        assert_eq!(state.target_pps, 1.2);
+        assert_eq!(state.target_pps, 0.0);
         assert_eq!(state.tap_duration_ms, 60);
-        assert_eq!(state.poll_interval_ms, 20);
+        assert_eq!(state.poll_interval_ms, 30);
         assert_eq!(state.movement_tap_duration_ms, 20);
         assert_eq!(state.rotate_tap_duration_ms, 30);
         assert_eq!(state.hold_tap_duration_ms, 30);
         assert_eq!(state.hard_drop_tap_duration_ms, 40);
         assert_eq!(state.soft_drop_tap_duration_ms, 20);
-        assert_eq!(state.movement_interval_ms, 20);
-        assert_eq!(state.rotation_interval_ms, 30);
-        assert_eq!(state.piece_interval_ms, 60);
-        assert_eq!(state.hard_drop_interval_ms, 40);
-        assert_eq!(state.min_snapshot_age_ms, 30);
+        assert_eq!(state.movement_interval_ms, 10);
+        assert_eq!(state.rotation_interval_ms, 10);
+        assert_eq!(state.piece_interval_ms, 40);
+        assert_eq!(state.hard_drop_interval_ms, 10);
+        assert_eq!(state.min_snapshot_age_ms, 20);
         assert_eq!(state.bot.threads, 1);
         assert_eq!(state.bot.min_nodes, 0);
         assert_eq!(state.bot.max_nodes, 100_000);
         assert_eq!(state.browser.state_poll_ms, 40);
+        assert_eq!(state.browser.ribbon_decode_mode, RibbonDecodeMode::Off);
         assert!(state.perf_log_enabled);
         assert!(state.handling.allow_post_softdrop_actions);
         assert!(!state.handling.allow_post_softdrop_horizontal);
@@ -1441,6 +1482,7 @@ mod tests {
         let readme = include_str!("../README.md");
         assert!(readme.contains("VS WebSocket Seed"));
         assert!(readme.contains("Legacy Screen Scanner"));
+        assert!(readme.contains("Solo Browser CDP - Known Good"));
         assert!(readme.contains("WebSocket Seed"));
         assert!(readme.contains("Do not work on scanner unless explicitly requested."));
         assert!(!readme.contains("2P Left 1080p"));
@@ -1449,9 +1491,31 @@ mod tests {
     }
 
     #[test]
+    fn config_example_is_known_good_browser_cdp_config() {
+        let config: AutomationConfig =
+            serde_json::from_str(include_str!("../config.example.json")).unwrap();
+
+        assert_eq!(config.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
+        assert_eq!(config.input_backend, InputBackendConfig::BrowserCdp);
+        assert!(!config.dry_run);
+    }
+
+    #[test]
+    fn launcher_state_is_example_only() {
+        let example: LauncherState =
+            serde_json::from_str(include_str!("../launcher-state.example.json")).unwrap();
+
+        assert_eq!(example.preset, ModePreset::SoloBrowserCdpKnownGood);
+        assert!(
+            !std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/launcher-state.json"))
+                .exists()
+        );
+    }
+
+    #[test]
     fn migrate_legacy_defaults_upgrades_previous_safe_profile() {
         let mut state = LauncherState {
-            preset: ModePreset::SoloBrowserCdp,
+            preset: ModePreset::SoloBrowserCdpKnownGood,
             dry_run: false,
             poll_interval_ms: 4,
             target_pps: 0.0,
@@ -1475,16 +1539,16 @@ mod tests {
 
         state.migrate_legacy_defaults();
 
-        assert_eq!(state.poll_interval_ms, 20);
+        assert_eq!(state.poll_interval_ms, 30);
         assert_eq!(state.movement_tap_duration_ms, 20);
         assert_eq!(state.rotate_tap_duration_ms, 30);
         assert_eq!(state.hold_tap_duration_ms, 30);
         assert_eq!(state.hard_drop_tap_duration_ms, 40);
-        assert_eq!(state.movement_interval_ms, 20);
-        assert_eq!(state.rotation_interval_ms, 30);
-        assert_eq!(state.piece_interval_ms, 60);
-        assert_eq!(state.hard_drop_interval_ms, 40);
-        assert_eq!(state.min_snapshot_age_ms, 30);
+        assert_eq!(state.movement_interval_ms, 10);
+        assert_eq!(state.rotation_interval_ms, 10);
+        assert_eq!(state.piece_interval_ms, 40);
+        assert_eq!(state.hard_drop_interval_ms, 10);
+        assert_eq!(state.min_snapshot_age_ms, 20);
         assert_eq!(state.bot.threads, 1);
         assert_eq!(state.bot.min_nodes, 0);
         assert_eq!(state.bot.max_nodes, 100_000);

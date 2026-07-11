@@ -217,9 +217,9 @@ fn build_browser_provider_args(config: &AutomationConfig, snapshot_path: &PathBu
         config.browser.url.clone(),
         "--target".to_owned(),
         config.browser.target_hint.clone(),
-        "--poll-ms".to_owned(),
+        "--state-poll-ms".to_owned(),
         config.browser.state_poll_ms.to_string(),
-        "--min-poll-ms".to_owned(),
+        "--min-state-poll-ms".to_owned(),
         config.browser.min_state_poll_ms.to_string(),
         "--probe-page-state".to_owned(),
         bool_flag(config.browser.probe_page_state).to_owned(),
@@ -430,6 +430,8 @@ mod tests {
         assert!(joined.contains("--player-user-id user-123"));
         assert!(joined.contains("--dump-state-on-fail 1"));
         assert!(joined.contains("--dump-state-path automation/debug/tetrio-state-dump.json"));
+        assert!(joined.contains("--state-poll-ms 40"));
+        assert!(joined.contains("--min-state-poll-ms 16"));
     }
 
     #[test]

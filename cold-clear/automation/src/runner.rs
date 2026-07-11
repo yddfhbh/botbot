@@ -128,7 +128,80 @@ where
                 }
                 match prepare_execution(config, &snapshot, &mut log)? {
                     Some(prepared) => {
+                        let current_piece = snapshot
+                            .queue
+                            .first()
+                            .map(|piece| piece.label())
+                            .unwrap_or("?");
+                        let preview_queue = snapshot
+                            .queue
+                            .iter()
+                            .skip(1)
+                            .map(|piece| piece.label())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let plan_actions = full_plan_actions(&prepared.execution_plan);
+                        log(format!(
+                            "[runner] snapshot token={} current={} queue={} playing={} countdown={}",
+                            snapshot.token,
+                            current_piece,
+                            preview_queue,
+                            snapshot.playing,
+                            snapshot.countdown
+                        ));
+                        log(format!(
+                            "[runner] plan actions={:?} hold={}",
+                            plan_actions, prepared.execution_plan.hold
+                        ));
+                        log(format!(
+                            "[runner] input backend={} dry_run={}",
+                            input_backend_label(config),
+                            config.dry_run
+                        ));
                         emit_move_logs(config, &snapshot, &prepared, &mut log);
+                        if config.dry_run {
+                            log("[runner] dry_run=true, skipping real input".to_owned());
+                            record_execution_perf(
+                                &mut perf,
+                                prepared.planner_elapsed_ms,
+                                0,
+                                loop_started_at.elapsed().as_millis(),
+                            );
+                            maybe_log_execution_perf(
+                                config,
+                                &mut log,
+                                poll_metrics.read_ms + poll_metrics.parse_ms,
+                                prepared.planner_elapsed_ms,
+                                0,
+                                loop_started_at.elapsed().as_millis(),
+                            );
+                            maybe_flush_perf(config, &mut perf, &mut log);
+                            thread::sleep(poll_delay);
+                            continue;
+                        }
+                        if plan_actions.is_empty() {
+                            log(format!(
+                                "[runner] no executable actions, reason={}",
+                                empty_plan_reason(&prepared.execution_plan)
+                            ));
+                            record_execution_perf(
+                                &mut perf,
+                                prepared.planner_elapsed_ms,
+                                0,
+                                loop_started_at.elapsed().as_millis(),
+                            );
+                            maybe_log_execution_perf(
+                                config,
+                                &mut log,
+                                poll_metrics.read_ms + poll_metrics.parse_ms,
+                                prepared.planner_elapsed_ms,
+                                0,
+                                loop_started_at.elapsed().as_millis(),
+                            );
+                            maybe_flush_perf(config, &mut perf, &mut log);
+                            thread::sleep(poll_delay);
+                            continue;
+                        }
                         let input_started_at = Instant::now();
                         execute_plan_until_hard_drop(
                             driver,
@@ -919,6 +992,32 @@ fn route_actions_with_hard_drop(plan: &ExecutionPlan) -> Vec<GameAction> {
     actions
 }
 
+fn full_plan_actions(plan: &ExecutionPlan) -> Vec<GameAction> {
+    let mut actions = Vec::new();
+    if plan.hold {
+        actions.push(GameAction::Hold);
+    }
+    actions.extend(route_actions_with_hard_drop(plan));
+    actions
+}
+
+fn empty_plan_reason(plan: &ExecutionPlan) -> String {
+    format!(
+        "hold={} movement_actions={} hard_drop={}",
+        plan.hold,
+        plan.movement_actions.len(),
+        plan.hard_drop
+    )
+}
+
+fn input_backend_label(config: &AutomationConfig) -> &'static str {
+    match config.input_backend {
+        crate::config::InputBackendConfig::BrowserCdp => "browser_cdp",
+        crate::config::InputBackendConfig::ScanCode => "scan_code",
+        crate::config::InputBackendConfig::VirtualKey => "virtual_key",
+    }
+}
+
 fn queue_labels(queue: &[PieceToken]) -> String {
     queue
         .iter()
@@ -1535,9 +1634,45 @@ impl PieceToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AutomationConfig, MovementModeConfig};
+    use crate::config::{AutomationConfig, InputBackendConfig, MovementModeConfig};
+    use crate::driver::InputBackend;
     use crate::scanner::PieceToken;
     use libtetris::{PieceState, RotationState, TspinStatus};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct SingleSnapshotScanner {
+        snapshot: Option<GameSnapshot>,
+    }
+
+    impl SnapshotScanner for SingleSnapshotScanner {
+        fn next_snapshot(&mut self) -> Result<Option<GameSnapshot>> {
+            Ok(self.snapshot.take())
+        }
+    }
+
+    #[derive(Default)]
+    struct StoppingBackend {
+        taps: Vec<GameAction>,
+        stop: Option<Arc<AtomicBool>>,
+    }
+
+    impl InputBackend for StoppingBackend {
+        fn tap(&mut self, action: GameAction, _: Duration) -> Result<()> {
+            self.taps.push(action);
+            if action == GameAction::HardDrop {
+                if let Some(stop) = &self.stop {
+                    stop.store(true, AtomicOrdering::Relaxed);
+                }
+            }
+            Ok(())
+        }
+
+        fn release_all_keys(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn plan_move_requires_queue() {
@@ -1898,5 +2033,53 @@ mod tests {
         assert_eq!(perf.processed_snapshots, 1);
         assert_eq!(perf.same_token_skips, 1);
         assert_eq!(perf.duplicate_skips, 1);
+    }
+
+    #[test]
+    fn run_loop_calls_input_backend_when_dry_run_is_false() {
+        let snapshot = GameSnapshot {
+            source: "test".to_owned(),
+            token: "runner-1".to_owned(),
+            field: vec![[false; 10]; 40],
+            queue: vec![PieceToken::I, PieceToken::O, PieceToken::T, PieceToken::L],
+            hold: None,
+            combo: 0,
+            b2b: false,
+            incoming: 0,
+            piece_counter: Some(1),
+            playing: true,
+            countdown: false,
+            active: None,
+        };
+        let mut scanner = SingleSnapshotScanner {
+            snapshot: Some(snapshot),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut backend = StoppingBackend {
+            taps: Vec::new(),
+            stop: Some(stop.clone()),
+        };
+        let live_target_pps = AtomicU32::new(0.0f32.to_bits());
+        let mut config = AutomationConfig::default();
+        config.dry_run = false;
+        config.perf_log_enabled = false;
+        config.input_backend = InputBackendConfig::BrowserCdp;
+        config.bot.movement_mode = MovementModeConfig::HardDropOnly;
+        config.poll_interval_ms = 1;
+        config.piece_interval_ms = 0;
+        config.hard_drop_interval_ms = 0;
+
+        run_loop_until(
+            &config,
+            &mut scanner,
+            &mut backend,
+            &live_target_pps,
+            stop.as_ref(),
+            |_| {},
+        )
+        .unwrap();
+
+        assert!(!backend.taps.is_empty());
+        assert!(backend.taps.contains(&GameAction::HardDrop));
     }
 }

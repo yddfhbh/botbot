@@ -781,43 +781,7 @@ impl BrowserCdpInputBackend {
     }
 
     fn wait_for_command_response(&mut self, id: u64, command_type: &'static str) -> Result<()> {
-        loop {
-            match self.response_rx.recv_timeout(Duration::from_millis(2000)) {
-                Ok(line) => match parse_helper_response_line(&line, command_type, id)? {
-                    ParsedHelperResponse::Ignore => continue,
-                    ParsedHelperResponse::Ok => return Ok(()),
-                    ParsedHelperResponse::Err(message) => {
-                        emit_input_log(
-                            &self.logger,
-                            format!(
-                                "[input] command={} id={} ok=false error={}",
-                                command_type, id, message
-                            ),
-                        );
-                        bail!(
-                            "browser input helper rejected {} command id={}: {}",
-                            command_type,
-                            id,
-                            message
-                        );
-                    }
-                },
-                Err(RecvTimeoutError::Timeout) => {
-                    bail!(
-                        "browser input helper timed out waiting for {} command id={}",
-                        command_type,
-                        id
-                    );
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    bail!(
-                        "browser input helper closed before acknowledging {} command id={}",
-                        command_type,
-                        id
-                    );
-                }
-            }
-        }
+        wait_for_helper_response(&self.response_rx, &self.logger, id, command_type)
     }
 }
 
@@ -912,6 +876,51 @@ fn parse_helper_response_line(
     Ok(ParsedHelperResponse::Err(
         response.error.unwrap_or_else(|| "unknown error".to_owned()),
     ))
+}
+
+fn wait_for_helper_response(
+    response_rx: &Receiver<String>,
+    logger: &Option<InputHelperLogger>,
+    id: u64,
+    command_type: &'static str,
+) -> Result<()> {
+    loop {
+        match response_rx.recv_timeout(Duration::from_millis(2000)) {
+            Ok(line) => match parse_helper_response_line(&line, command_type, id)? {
+                ParsedHelperResponse::Ignore => continue,
+                ParsedHelperResponse::Ok => return Ok(()),
+                ParsedHelperResponse::Err(message) => {
+                    emit_input_log(
+                        logger,
+                        format!(
+                            "[input] command={} id={} ok=false error={}",
+                            command_type, id, message
+                        ),
+                    );
+                    bail!(
+                        "browser input helper rejected {} command id={}: {}",
+                        command_type,
+                        id,
+                        message
+                    );
+                }
+            },
+            Err(RecvTimeoutError::Timeout) => {
+                bail!(
+                    "browser input helper timed out waiting for {} command id={}",
+                    command_type,
+                    id
+                );
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!(
+                    "browser input helper closed before acknowledging {} command id={}",
+                    command_type,
+                    id
+                );
+            }
+        }
+    }
 }
 
 fn emit_input_log(logger: &Option<InputHelperLogger>, line: impl Into<String>) {
@@ -1233,6 +1242,16 @@ mod tests {
             parse_helper_response_line(r#"{"ok":true,"id":9,"type":"tap"}"#, "tap", 7).unwrap();
 
         assert!(matches!(parsed, ParsedHelperResponse::Ignore));
+    }
+
+    #[test]
+    fn wait_for_helper_response_surfaces_helper_failures() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(r#"{"ok":false,"id":7,"type":"tap","error":"focus failed"}"#.to_owned())
+            .unwrap();
+
+        let error = wait_for_helper_response(&rx, &None, 7, "tap").unwrap_err();
+        assert!(error.to_string().contains("focus failed"));
     }
 }
 
