@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use config::AutomationConfig;
+use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 use launcher::{launcher_viewport, LauncherApp};
 use paths::AppPaths;
 use runtime::run_automation;
@@ -65,9 +66,49 @@ fn launch_gui(paths: AppPaths) -> Result<()> {
     eframe::run_native(
         "Cold Clear Launcher",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(LauncherApp::new(paths.clone())))),
+        Box::new(move |cc| {
+            configure_launcher_fonts(&cc.egui_ctx);
+            Ok(Box::new(LauncherApp::new(paths.clone())))
+        }),
     )
     .map_err(|err| anyhow::anyhow!("failed to launch GUI: {err}"))
+}
+
+fn configure_launcher_fonts(ctx: &egui::Context) {
+    let Some(font_bytes) = load_korean_font_bytes() else {
+        return;
+    };
+
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "launcher_korean".to_owned(),
+        FontData::from_owned(font_bytes).into(),
+    );
+
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, "launcher_korean".to_owned());
+    }
+
+    ctx.set_fonts(fonts);
+}
+
+fn load_korean_font_bytes() -> Option<Vec<u8>> {
+    let candidates = [
+        r"C:\Windows\Fonts\malgun.ttf",
+        r"C:\Windows\Fonts\malgunsl.ttf",
+        r"C:\Windows\Fonts\gulim.ttc",
+        r"C:\Windows\Fonts\batang.ttc",
+    ];
+    for path in candidates {
+        if let Ok(bytes) = fs::read(path) {
+            return Some(bytes);
+        }
+    }
+    None
 }
 
 fn apply_cli_overrides(config: &mut AutomationConfig, args: &[String]) -> Result<()> {
