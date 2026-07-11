@@ -30,6 +30,7 @@ use crate::sprint::{
     register_lock_result, sprint_40l_weights, sprint_context, update_state_for_snapshot,
     Sprint40lEvaluator, SprintContext, SprintPhase, SprintState,
 };
+use crate::vs_sim::VsSimulationController;
 
 #[derive(Clone, Debug)]
 enum PlannerEvaluator {
@@ -132,6 +133,7 @@ where
     let mut buffered_snapshot: Option<ObservedSnapshot> = None;
     let mut sprint_state = SprintState::default();
     let mut perf_window = RollingPerfWindow::default();
+    let mut vs_sim_controller = VsSimulationController::new(&config.snapshot_path);
 
     loop {
         if stop.load(AtomicOrdering::Relaxed) {
@@ -140,14 +142,14 @@ where
         let snapshot_option = if let Some(snapshot) = buffered_snapshot.take() {
             Some(snapshot)
         } else {
-            scanner.next_snapshot()?.map(|snapshot| ObservedSnapshot {
-                age: scanner.latest_snapshot_age(),
-                snapshot,
-            })
+            next_observed_snapshot(scanner, &mut vs_sim_controller, &mut log)?
         };
         match snapshot_option {
             Some(observed_snapshot) => {
                 let ObservedSnapshot { snapshot, age } = observed_snapshot;
+                if snapshot.source != "browser_ws_sim" {
+                    vs_sim_controller.observe_browser_snapshot(&snapshot, &mut log);
+                }
                 if config.play_style == crate::config::PlayStyleConfig::Speed {
                     update_state_for_snapshot(&mut sprint_state, &snapshot);
                 }
@@ -168,23 +170,50 @@ where
                     Some(prepared) => {
                         emit_move_logs(config, &snapshot, &prepared, &mut log);
                         let input_started_at = Instant::now();
-                        execute_plan_until_hard_drop(
+                        if let Err(error) = execute_plan_until_hard_drop(
                             driver,
                             &prepared.execution_plan,
                             &config.handling,
                             execution_timings,
                             |line| log(line),
-                        )
-                        .context("failed to execute bot move")?;
+                        ) {
+                            if snapshot.source == "browser_ws_sim" {
+                                vs_sim_controller.invalidate_current_round(
+                                    "input error before hard drop",
+                                    &mut log,
+                                );
+                                log(format!(
+                                    "[vs-sim] suppressed input failure before hard drop: {error:#}"
+                                ));
+                                thread::sleep(poll_delay);
+                                continue;
+                            }
+                            return Err(error).context("failed to execute bot move");
+                        }
                         if prepared.execution_plan.hard_drop {
-                            match maybe_finalize_hard_drop(
+                            let hard_drop_decision = match maybe_finalize_hard_drop(
                                 config,
                                 &snapshot,
                                 &prepared,
                                 driver,
                                 execution_timings,
                                 &mut log,
-                            )? {
+                            ) {
+                                Ok(decision) => decision,
+                                Err(error) if snapshot.source == "browser_ws_sim" => {
+                                    vs_sim_controller.invalidate_current_round(
+                                        "input correction failed before hard drop",
+                                        &mut log,
+                                    );
+                                    log(format!(
+                                        "[vs-sim] suppressed pre-hard-drop correction failure: {error:#}"
+                                    ));
+                                    thread::sleep(poll_delay);
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
+                            match hard_drop_decision {
                                 HardDropDecision::Proceed => {
                                     if !wait_for_target_pps(
                                         last_hard_drop_started_at,
@@ -195,14 +224,34 @@ where
                                         return Ok(());
                                     }
                                     let hard_drop_started_at = Instant::now();
-                                    execute_hard_drop_action(
+                                    if let Err(error) = execute_hard_drop_action(
                                         driver,
                                         &prepared.execution_plan.movement_actions,
                                         &config.handling,
                                         execution_timings,
                                         |line| log(line),
-                                    )
-                                    .context("failed to execute hard drop input")?;
+                                    ) {
+                                        if snapshot.source == "browser_ws_sim" {
+                                            vs_sim_controller.invalidate_current_round(
+                                                "hard drop input failed",
+                                                &mut log,
+                                            );
+                                            log(format!(
+                                                "[vs-sim] suppressed hard drop failure: {error:#}"
+                                            ));
+                                            thread::sleep(poll_delay);
+                                            continue;
+                                        }
+                                        return Err(error)
+                                            .context("failed to execute hard drop input");
+                                    }
+                                    if snapshot.source == "browser_ws_sim" {
+                                        vs_sim_controller.commit_hard_drop(
+                                            &snapshot,
+                                            &prepared.planned_move,
+                                            &mut log,
+                                        )?;
+                                    }
                                     last_hard_drop_started_at = Some(hard_drop_started_at);
                                     if snapshot.piece_counter.is_some() {
                                         last_piece_counter = snapshot.piece_counter;
@@ -217,6 +266,7 @@ where
                                     let wait_started_at = Instant::now();
                                     buffered_snapshot = wait_for_next_piece_snapshot(
                                         scanner,
+                                        &mut vs_sim_controller,
                                         &snapshot,
                                         stop,
                                         poll_delay,
@@ -241,6 +291,14 @@ where
                                     }
                                 }
                                 HardDropDecision::Retry(retry_snapshot) => {
+                                    if snapshot.source == "browser_ws_sim" {
+                                        vs_sim_controller.invalidate_current_round(
+                                            "pre-hard-drop verification requested a retry",
+                                            &mut log,
+                                        );
+                                        thread::sleep(poll_delay);
+                                        continue;
+                                    }
                                     buffered_snapshot = Some(retry_snapshot);
                                     thread::sleep(poll_delay);
                                     continue;
@@ -260,8 +318,33 @@ where
     }
 }
 
+fn next_observed_snapshot<S, F>(
+    scanner: &mut S,
+    vs_sim_controller: &mut VsSimulationController,
+    log: &mut F,
+) -> Result<Option<ObservedSnapshot>>
+where
+    S: SnapshotScanner,
+    F: FnMut(String),
+{
+    if let Some(snapshot) = scanner.next_snapshot()? {
+        return Ok(Some(ObservedSnapshot {
+            age: scanner.latest_snapshot_age(),
+            snapshot,
+        }));
+    }
+
+    Ok(vs_sim_controller
+        .next_snapshot(log)?
+        .map(|snapshot| ObservedSnapshot {
+            age: None,
+            snapshot,
+        }))
+}
+
 fn wait_for_next_piece_snapshot<S, F>(
     scanner: &mut S,
+    vs_sim_controller: &mut VsSimulationController,
     previous_snapshot: &GameSnapshot,
     stop: &AtomicBool,
     poll_delay: Duration,
@@ -286,11 +369,11 @@ where
         if stop.load(AtomicOrdering::Relaxed) {
             return Ok(None);
         }
-        match scanner.next_snapshot()? {
+        match next_observed_snapshot(scanner, vs_sim_controller, log)? {
             Some(snapshot) => {
                 let observed_snapshot = ObservedSnapshot {
-                    age: scanner.latest_snapshot_age(),
-                    snapshot,
+                    age: snapshot.age,
+                    snapshot: snapshot.snapshot,
                 };
                 if idle_logged {
                     log(format!(

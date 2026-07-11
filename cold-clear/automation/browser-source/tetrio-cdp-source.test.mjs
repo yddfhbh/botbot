@@ -14,6 +14,7 @@ import {
   isTetrioGameEndedState,
   pausedFrameExposureExpression,
   resolvePollMs,
+  resolveUseSeedSimulationFallback,
   resetSnapshotTracking,
   shouldAdvanceGameEpoch,
   shouldHandleEndedGame,
@@ -151,6 +152,22 @@ test("resetSnapshotTracking clears stable signature state", () => {
 test("snapshot helper defaults browser poll to 8ms", () => {
   assert.equal(resolvePollMs({}), 8);
   assert.equal(resolvePollMs({ pollMs: "12" }), 12);
+});
+
+test("VS WebSocket simulation disables browser seed fallback only when enabled", () => {
+  assert.equal(resolveUseSeedSimulationFallback(true, {}), true);
+  assert.equal(
+    resolveUseSeedSimulationFallback(true, { FUSION_VS_WS_SIM: "0" }),
+    true
+  );
+  assert.equal(
+    resolveUseSeedSimulationFallback(true, { FUSION_VS_WS_SIM: "1" }),
+    false
+  );
+  assert.equal(
+    resolveUseSeedSimulationFallback(false, { FUSION_VS_WS_SIM: "1" }),
+    false
+  );
 });
 
 test("snapshot tokens and signatures include the game epoch", () => {

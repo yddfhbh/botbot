@@ -7,6 +7,7 @@ mod runner;
 mod runtime;
 mod scanner;
 mod sprint;
+mod vs_sim;
 
 use std::fs;
 use std::path::PathBuf;

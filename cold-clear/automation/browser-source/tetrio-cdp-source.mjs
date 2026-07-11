@@ -54,6 +54,13 @@ export function resolvePollMs(args) {
   return numberArg(args.pollMs, 8);
 }
 
+export function resolveUseSeedSimulationFallback(
+  requestedValue,
+  env = process.env
+) {
+  return requestedValue && env?.FUSION_VS_WS_SIM !== "1";
+}
+
 export function isTetrioGameEndedState(state) {
   return Boolean(state?.ok && state.ready === false && state.reason === "TETR.IO game ended");
 }
@@ -84,7 +91,9 @@ async function main() {
   const connectOnly = args.connectOnly === "1";
   const probePageState = args.probePageState !== "0";
   const useRibbonWebsocket = args.useRibbonWebsocket !== "0";
-  const useSeedSimulationFallback = args.useSeedSimulationFallback !== "0";
+  const useSeedSimulationFallback = resolveUseSeedSimulationFallback(
+    args.useSeedSimulationFallback !== "0"
+  );
   const chromePath = process.env.CHROME_PATH || "";
   const msgpack = await loadOptionalMsgpack();
 

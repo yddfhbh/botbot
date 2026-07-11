@@ -1,5 +1,11 @@
 import { appendFileSync, mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
+import {
+  createVsBridgeState,
+  isVsWsSimEnabled,
+  markVsBridgeInactive,
+  updateVsBridgeState
+} from "./vs-ws-bridge.mjs";
 
 const MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
 const MAX_DEPTH = 12;
@@ -8,6 +14,7 @@ const MAX_TRACE_RECORDS = 500;
 const MAX_TRACE_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_TRACE_RECORD_BYTES = 32 * 1024;
 const DEFAULT_TRACE_FILE_PATH = path.join("automation", "ws-live-candidates.jsonl");
+const DEFAULT_VS_BRIDGE_PATH = path.join("automation", "vs-ws-bridge.json");
 const SENSITIVE_KEYS = new Set([
   "token",
   "auth",
@@ -152,7 +159,9 @@ export async function installDddWsObserver(
     unpack,
     log,
     traceEnabled = process.env.FUSION_DDD_WS_TRACE === "1",
-    traceFilePath = DEFAULT_TRACE_FILE_PATH
+    traceFilePath = DEFAULT_TRACE_FILE_PATH,
+    vsSimEnabled = isVsWsSimEnabled(),
+    vsBridgePath = DEFAULT_VS_BRIDGE_PATH
   } = {}
 ) {
   if (typeof unpack !== "function") {
@@ -167,7 +176,8 @@ export async function installDddWsObserver(
     binaryFramesReceived: 0,
     decodeAttempts: 0,
     optionsCaptured: 0,
-    trace: null
+    trace: null,
+    vsBridge: vsSimEnabled ? createVsBridgeState(vsBridgePath, log) : null
   };
   if (traceEnabled) {
     try {
@@ -200,6 +210,7 @@ export async function installDddWsObserver(
       if (event?.requestId) {
         observerState.requestUrls.delete(event.requestId);
       }
+      markVsBridgeInactive(observerState.vsBridge, log);
     } catch {}
   });
 
@@ -225,6 +236,7 @@ export async function installDddWsObserver(
           observerState.decodeAttempts += decodeAttemptCount(chunk);
         }
         logCapturedCandidates(candidates, event?.requestId, observerState, log);
+        updateVsBridgeState(observerState.vsBridge, decodedRoots, log);
         traceDecodedRoots(decodedRoots, event, observerState, log);
         return;
       }
@@ -245,12 +257,14 @@ export async function installDddWsObserver(
         const decodedRoots = collectDecodedRoots(parsed, unpack);
         const candidates = collectOptionCandidates(decodedRoots);
         logCapturedCandidates(candidates, event?.requestId, observerState, log);
+        updateVsBridgeState(observerState.vsBridge, decodedRoots, log);
         traceDecodedRoots(decodedRoots, event, observerState, log);
       }
     } catch {}
   });
 
   return () => {
+    markVsBridgeInactive(observerState.vsBridge, log);
     offCreated();
     offClosed();
     offReceived();
