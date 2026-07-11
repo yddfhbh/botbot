@@ -85,7 +85,6 @@ async function main() {
   const probePageState = args.probePageState !== "0";
   const useRibbonWebsocket = args.useRibbonWebsocket !== "0";
   const useSeedSimulationFallback = args.useSeedSimulationFallback !== "0";
-  const dddWsObserverEnabled = process.env.FUSION_DDD_WS_OBSERVER === "1";
   const chromePath = process.env.CHROME_PATH || "";
   const msgpack = await loadOptionalMsgpack();
 
@@ -102,29 +101,29 @@ async function main() {
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
   await cdp.send("Page.enable").catch(() => undefined);
   await cdp.send("Runtime.enable").catch(() => undefined);
+  let dddWsObserverCleanup = null;
+  try {
+    const { installDddWsObserver } =
+      await import("./ddd-ws-observer.mjs");
+
+    dddWsObserverCleanup = await installDddWsObserver(cdp, {
+      unpack: msgpack?.unpack ?? null,
+      log: message => console.log(message),
+    });
+
+    console.log("[ws-observer] installed");
+  } catch (error) {
+    console.log(
+      `[ws-observer] installation failed: ${
+        error?.message ?? String(error)
+      }`
+    );
+  }
   await cdp.send("Page.bringToFront");
   await installBackgroundInputKeepalive(cdp);
   await safeRuntimeEvaluate(cdp, {
     expression: "window.focus(); document.body && document.body.focus && document.body.focus(); true"
   }).catch(() => undefined);
-  let cleanupDddWsObserver = null;
-  if (dddWsObserverEnabled) {
-    try {
-      const { installDddWsObserver } =
-        await import("./ddd-ws-observer.mjs");
-
-      cleanupDddWsObserver = await installDddWsObserver(cdp, {
-        unpack: msgpack?.unpack ?? null,
-        log: (message) => console.log(message)
-      });
-    } catch (error) {
-      console.log(
-        `[ws-observer] disabled after initialization error: ${
-          error?.message ?? String(error)
-        }`
-      );
-    }
-  }
 
   process.stdout.write(
     `${JSON.stringify({ type: "ready", ok: true, target: target.title || target.url, port })}\n`
@@ -147,7 +146,12 @@ async function main() {
   };
 
   const stop = async () => {
-    cleanupDddWsObserver?.();
+    if (typeof dddWsObserverCleanup === "function") {
+      try {
+        dddWsObserverCleanup();
+      } catch {}
+      dddWsObserverCleanup = null;
+    }
     await cdp.close().catch(() => undefined);
     if (ownsChromium && browserProcess) {
       await shutdownChromium(browserProcess);
