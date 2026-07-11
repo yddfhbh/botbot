@@ -58,7 +58,6 @@ cargo run -p automation
 
 Running without arguments opens the launcher window. From there you can:
 
-- choose `2P Left 1080p`, `Solo 1080p`, or `Custom`
 - use the split Browser/Bot launcher
 - edit Browser CDP connection fields such as Chrome path, port, URL, and target hint
 - keep the Bot UI focused on `Play Style`, `PPS`, and `Bot ON` / `Bot OFF`
@@ -72,7 +71,7 @@ Running without arguments opens the launcher window. From there you can:
 
 ## TETR.IO Safe preset
 
-The built-in live presets now apply a `TETR.IO Safe preset` aimed at personal solo / practice testing.
+The launcher keeps built-in Browser CDP safe defaults aimed at personal solo / practice testing.
 
 - `Snapshot provider`: `Browser CDP`
 - `Input backend`: `Browser CDP`

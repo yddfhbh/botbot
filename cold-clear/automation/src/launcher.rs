@@ -66,16 +66,6 @@ enum ModePreset {
     Custom,
 }
 
-impl ModePreset {
-    fn label(self) -> &'static str {
-        match self {
-            ModePreset::VsLeft1080p => "2P Left 1080p",
-            ModePreset::Solo1080p => "Solo 1080p",
-            ModePreset::Custom => "Custom",
-        }
-    }
-}
-
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum BrowserStatus {
     Closed,
@@ -243,6 +233,18 @@ pub fn launcher_viewport(paths: &AppPaths) -> egui::ViewportBuilder {
 }
 
 impl LauncherState {
+    fn ensure_scanner_config_path(&mut self) {
+        if !self.scanner_config_path.is_empty() {
+            return;
+        }
+
+        self.scanner_config_path = match self.preset {
+            ModePreset::VsLeft1080p => "automation/scan-config.vs-left-1080p.json".to_owned(),
+            ModePreset::Solo1080p => "automation/scan-config.solo-1080p.json".to_owned(),
+            ModePreset::Custom => return,
+        };
+    }
+
     fn apply_tetrio_safe_preset(&mut self) {
         self.pps_unlimited = true;
         self.target_pps = 3.0;
@@ -475,9 +477,7 @@ pub struct LauncherApp {
 impl LauncherApp {
     pub fn new(paths: AppPaths) -> Self {
         let mut state = load_launcher_state(&paths).unwrap_or_default();
-        if state.scanner_config_path.is_empty() {
-            state.apply_preset();
-        }
+        state.ensure_scanner_config_path();
         state.migrate_legacy_defaults();
         let (event_tx, event_rx) = mpsc::channel();
         Self {
@@ -1009,35 +1009,6 @@ impl eframe::App for LauncherApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Mode");
-                let old_preset = self.state.preset;
-                ui.add_enabled_ui(!browser_locked && !bot_locked, |ui| {
-                    egui::ComboBox::from_id_salt("preset")
-                        .selected_text(self.state.preset.label())
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.state.preset,
-                                ModePreset::VsLeft1080p,
-                                ModePreset::VsLeft1080p.label(),
-                            );
-                            ui.selectable_value(
-                                &mut self.state.preset,
-                                ModePreset::Solo1080p,
-                                ModePreset::Solo1080p.label(),
-                            );
-                            ui.selectable_value(
-                                &mut self.state.preset,
-                                ModePreset::Custom,
-                                ModePreset::Custom.label(),
-                            );
-                        });
-                });
-                if self.state.preset != old_preset {
-                    self.state.apply_preset();
-                }
-            });
-
             ui.label("Open Chromium now prewarms the snapshot and input CDP helpers. Bot ON only starts the planner/runner.");
             if browser_locked {
                 ui.small("Browser settings are locked while Chromium is open.");
@@ -1305,6 +1276,7 @@ mod tests {
         assert!(readme.contains("snapshot and input CDP helpers"));
         assert!(readme.contains("Play Style"));
         assert!(readme.contains("Unlimited"));
+        assert!(!readme.contains("choose `2P Left 1080p`, `Solo 1080p`, or `Custom`"));
     }
 
     #[test]
@@ -1418,10 +1390,47 @@ mod tests {
         assert!(BOT_UI_VISIBLE_LABELS.contains(&"PPS"));
         assert!(BOT_UI_VISIBLE_LABELS.contains(&"Bot ON"));
         assert!(BOT_UI_VISIBLE_LABELS.contains(&"Bot OFF"));
+        assert!(!BOT_UI_VISIBLE_LABELS.contains(&"Mode"));
         assert!(!BOT_UI_VISIBLE_LABELS.contains(&"Dry run"));
         assert!(BOT_UI_HIDDEN_LABELS.contains(&"Dry run"));
         assert!(BOT_UI_HIDDEN_LABELS.contains(&"Movement"));
         assert!(BOT_UI_HIDDEN_LABELS.contains(&"Threads"));
+    }
+
+    #[test]
+    fn missing_scanner_path_is_backfilled_without_resetting_hidden_settings() {
+        let mut state = LauncherState {
+            preset: ModePreset::Solo1080p,
+            scanner_config_path: String::new(),
+            movement_tap_duration_ms: 37,
+            rotate_tap_duration_ms: 29,
+            hold_tap_duration_ms: 17,
+            hard_drop_tap_duration_ms: 11,
+            soft_drop_tap_duration_ms: 19,
+            bot: BotConfig {
+                min_nodes: 1234,
+                ..BotConfig::default()
+            },
+            handling: HandlingConfig {
+                action_settle_ms: 9,
+                ..HandlingConfig::default()
+            },
+            ..LauncherState::default()
+        };
+
+        state.ensure_scanner_config_path();
+
+        assert_eq!(
+            state.scanner_config_path,
+            "automation/scan-config.solo-1080p.json"
+        );
+        assert_eq!(state.movement_tap_duration_ms, 37);
+        assert_eq!(state.rotate_tap_duration_ms, 29);
+        assert_eq!(state.hold_tap_duration_ms, 17);
+        assert_eq!(state.hard_drop_tap_duration_ms, 11);
+        assert_eq!(state.soft_drop_tap_duration_ms, 19);
+        assert_eq!(state.bot.min_nodes, 1234);
+        assert_eq!(state.handling.action_settle_ms, 9);
     }
 
     #[test]
