@@ -1,9 +1,0 @@
-/target
-**/*.rs.bk
-playout*
-Cargo.lock
-options.yaml
-replay.dat
-*.ccbook
-*.ccdb
-automation/launcher-state.json

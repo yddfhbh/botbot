@@ -1,8 +1,0 @@
-{
-  "name": "cold-clear-automation-browser-source",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "msgpackr": "^1.11.5"
-  }
-}
