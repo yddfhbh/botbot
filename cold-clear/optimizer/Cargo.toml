@@ -1,0 +1,17 @@
+[package]
+name = "optimizer"
+version = "0.1.0"
+authors = ["MinusKelvin <mark.carlson@minuskelvin.net>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+battle = { path = "../battle" }
+cold-clear = { path = "../bot" }
+libtetris = { path = "../libtetris" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+libflate = "0.1"
+rand = "0.7.0"

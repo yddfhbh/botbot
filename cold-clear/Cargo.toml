@@ -1,0 +1,19 @@
+[workspace]
+
+members = [
+    "automation",
+    "bot",
+    "libtetris",
+    "battle",
+    "cc-client",
+    "opening-book",
+    "c-api",
+    "compare",
+    "optimizer",
+    "opening-book/book-builder",
+    "opening-book/pc-gen",
+    "tbp"
+]
+
+[profile.release]
+lto = true
