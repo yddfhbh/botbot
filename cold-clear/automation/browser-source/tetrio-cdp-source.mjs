@@ -1098,15 +1098,12 @@ export async function readTetrioState(cdp, options) {
 
   if (shouldCapture) {
     probeStatus = "attempted";
-    console.log(
-      `[browser] closure probe attempt=${closureProbeAttempt} timeoutMs=${PROBE_TIMEOUT_MS} breakpoints=${getClosureProbeBreakpoints().map((entry) => entry.label).join(",")}`
-    );
     options.probeState.lastAttemptAt = Date.now();
     options.probeState.probeAttempts += 1;
     if (options.network) {
       options.network.lastPageProbeAt = Date.now();
     }
-    const capture = await captureTetrioGame(cdp, options.perf).catch((error) => ({
+    const capture = await captureTetrioGame(cdp, options.perf, { attempt: closureProbeAttempt }).catch((error) => ({
       ok: false,
       reason: error?.message ?? String(error)
     }));
@@ -1124,7 +1121,7 @@ export async function readTetrioState(cdp, options) {
       state = rawState.ok ? snapshotFromRaw(rawState) : buildNoGameFailure(rawState, options);
     } else if (state.reason) {
       console.log(
-        `[browser] closure probe attempt=${closureProbeAttempt} failed reason=${capture.reason}`
+        `[browser] closure probe failed ai_frames_checked=${capture.aiFramesChecked ?? 0} scope_objects_checked=${capture.scopeObjectsChecked ?? 0} reason=${capture.reason}`
       );
       if (options.probeState.probeAttempts < MAX_PROBE_ATTEMPTS && likelyGamePage && !options.probeState.gameCaptured) {
         console.log(`[browser] closure probe retry in ${PROBE_RETRY_COOLDOWN_MS}ms`);
@@ -1362,11 +1359,25 @@ export function captureTetrioExportExpression({
   })()`;
 }
 
-export async function captureTetrioGame(cdp, perf) {
+export async function captureTetrioGame(cdp, perf, options = {}) {
   const breakpointIds = [];
   let paused = false;
   const startedAt = Date.now();
   const attachedBreakpointLabels = [];
+  let totalAiFramesChecked = 0;
+  let totalScopeObjectsChecked = 0;
+  let totalCallFramesChecked = 0;
+  let cancelReason = null;
+  let cancelResolver = () => undefined;
+  const cancelPromise = new Promise((resolve) => {
+    cancelResolver = resolve;
+  });
+  const removeListeners = [];
+  const cancelProbe = (reason) => {
+    if (cancelReason) return;
+    cancelReason = reason;
+    cancelResolver({ cancelled: true, reason });
+  };
 
   try {
     await cdp.send("Debugger.enable");
@@ -1390,31 +1401,69 @@ export async function captureTetrioGame(cdp, perf) {
         attachedBreakpointLabels.push(breakpointSpec.label);
       }
     }
+    console.log(
+      `[browser] closure probe attempt=${options.attempt ?? "?"} breakpoints_registered=${attachedBreakpointLabels.join(",") || "none"}`
+    );
 
     if (breakpointIds.length === 0) {
       return { ok: false, reason: "TETR.IO probe could not attach function breakpoints" };
     }
 
+    for (const eventName of [
+      "Page.frameNavigated",
+      "Page.navigatedWithinDocument",
+      "Runtime.executionContextsCleared",
+      "Runtime.executionContextDestroyed"
+    ]) {
+      const off = cdp.on?.(eventName, () => cancelProbe(`probe cancelled by ${eventName}`));
+      if (typeof off === "function") {
+        removeListeners.push(off);
+      }
+    }
+
     const deadline = Date.now() + PROBE_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      let event;
-      try {
-        event = await cdp.waitForEvent(
+      const outcome = await Promise.race([
+        cdp.waitForEvent(
           "Debugger.paused",
           () => true,
           Math.max(50, deadline - Date.now())
-        );
-      } catch {
+        )
+          .then((event) => ({ kind: "paused", event }))
+          .catch(() => ({ kind: "timeout" })),
+        cancelPromise
+      ]);
+
+      if (outcome?.cancelled) {
+        return {
+          ok: false,
+          reason: outcome.reason,
+          breakpoints: attachedBreakpointLabels,
+          aiFramesChecked: totalAiFramesChecked,
+          scopeObjectsChecked: totalScopeObjectsChecked,
+          callFramesChecked: totalCallFramesChecked
+        };
+      }
+      if (outcome?.kind !== "paused") {
         break;
       }
+      const event = outcome.event;
 
       paused = true;
+      console.log(`[browser] callframes=${event?.callFrames?.length ?? 0}`);
       const exposed = await exposeTetrioGameFromPausedCallFrames(cdp, event);
+      totalAiFramesChecked += exposed.aiFramesChecked ?? 0;
+      totalScopeObjectsChecked += exposed.scopeObjectsChecked ?? 0;
+      totalCallFramesChecked += exposed.callFramesChecked ?? 0;
+      console.log(`[browser] direct Ai evaluation frames_checked=${exposed.aiFramesChecked ?? 0}`);
       await cdp.send("Debugger.resume").catch(() => undefined);
       paused = false;
       if (exposed.ok) {
         return {
           ...exposed,
+          aiFramesChecked: totalAiFramesChecked,
+          scopeObjectsChecked: totalScopeObjectsChecked,
+          callFramesChecked: totalCallFramesChecked,
           breakpoints: attachedBreakpointLabels
         };
       }
@@ -1423,7 +1472,10 @@ export async function captureTetrioGame(cdp, perf) {
     return {
       ok: false,
       reason: "Ai not visible",
-      breakpoints: attachedBreakpointLabels
+      breakpoints: attachedBreakpointLabels,
+      aiFramesChecked: totalAiFramesChecked,
+      scopeObjectsChecked: totalScopeObjectsChecked,
+      callFramesChecked: totalCallFramesChecked
     };
   } finally {
     const elapsedMs = Date.now() - startedAt;
@@ -1441,6 +1493,9 @@ export async function captureTetrioGame(cdp, perf) {
       objectGroup: "fusion-tetrio-probe"
     }).catch(() => undefined);
     await cdp.send("Debugger.disable").catch(() => undefined);
+    for (const off of removeListeners.splice(0)) {
+      off();
+    }
   }
 }
 
@@ -1466,17 +1521,39 @@ function isMissingExecutionContextError(error) {
 }
 
 export async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent) {
+  let aiFramesChecked = 0;
+  let scopeObjectsChecked = 0;
+  let callFramesChecked = 0;
   for (const callFrame of pausedEvent.callFrames ?? []) {
+    callFramesChecked += 1;
     const aiCapture = await exposeTetrioGameFromAiCallFrame(cdp, callFrame);
+    aiFramesChecked += 1;
     if (aiCapture.ok) {
-      return aiCapture;
+      return {
+        ...aiCapture,
+        aiFramesChecked,
+        scopeObjectsChecked,
+        callFramesChecked
+      };
     }
     const scopeCapture = await exposeTetrioGameFromScopeChain(cdp, callFrame);
+    scopeObjectsChecked += scopeCapture.scopeObjectsChecked ?? 0;
     if (scopeCapture.ok) {
-      return scopeCapture;
+      return {
+        ...scopeCapture,
+        aiFramesChecked,
+        scopeObjectsChecked,
+        callFramesChecked
+      };
     }
   }
-  return { ok: false, reason: "Ai not visible" };
+  return {
+    ok: false,
+    reason: "Ai not visible",
+    aiFramesChecked,
+    scopeObjectsChecked,
+    callFramesChecked
+  };
 }
 
 async function exposeTetrioGameFromAiCallFrame(cdp, callFrame) {
@@ -1491,6 +1568,12 @@ async function exposeTetrioGameFromAiCallFrame(cdp, callFrame) {
           Ai.ejectBoardState instanceof Function
         ) {
           window.__fusionTetrioGame = Ai;
+          window.__fusionTetrioBridge = {
+            ok: true,
+            source: "closure:Ai",
+            at: Date.now(),
+            href: location.href
+          };
           return {
             ok: true,
             source: "closure:Ai",
@@ -1509,6 +1592,7 @@ async function exposeTetrioGameFromAiCallFrame(cdp, callFrame) {
 }
 
 async function exposeTetrioGameFromScopeChain(cdp, callFrame) {
+  let scopeObjectsChecked = 0;
   for (const scope of callFrame.scopeChain ?? []) {
     const objectId = scope?.object?.objectId;
     if (!objectId) {
@@ -1519,11 +1603,15 @@ async function exposeTetrioGameFromScopeChain(cdp, callFrame) {
       objectId,
       `scope:${scope.type ?? "unknown"}`
     );
+    scopeObjectsChecked += captured.objectsChecked ?? 0;
     if (captured.ok) {
-      return captured;
+      return {
+        ...captured,
+        scopeObjectsChecked
+      };
     }
   }
-  return { ok: false };
+  return { ok: false, scopeObjectsChecked };
 }
 
 async function captureTetrioGameFromScopeObject(cdp, objectId, sourceLabel) {
@@ -1537,10 +1625,12 @@ async function captureTetrioGameFromScopeObject(cdp, objectId, sourceLabel) {
         typeof value.ejectState === "function" &&
         typeof value.ejectBoardState === "function";
       const visited = new WeakSet();
+      let objectsChecked = 0;
       const scanObject = (root, path, depth = 0) => {
         if (!root || typeof root !== "object") return null;
         if (visited.has(root) || depth > 3) return null;
         visited.add(root);
+        objectsChecked += 1;
         if (looksLikeGame(root)) {
           return { game: root, path };
         }
@@ -1558,17 +1648,18 @@ async function captureTetrioGameFromScopeObject(cdp, objectId, sourceLabel) {
       try {
         const found = scanObject(this, sourceLabel, 0);
         if (!found?.game) {
-          return { ok: false };
+          return { ok: false, objectsChecked };
         }
         window.__fusionTetrioGame = found.game;
         return {
           ok: true,
           source: found.path,
+          objectsChecked,
           at: Date.now(),
           href: location.href
         };
       } catch {
-        return { ok: false };
+        return { ok: false, objectsChecked };
       }
     }`,
     returnByValue: true,
@@ -1576,7 +1667,7 @@ async function captureTetrioGameFromScopeObject(cdp, objectId, sourceLabel) {
     silent: true
   }).catch(() => null);
 
-  return result?.result?.value ?? { ok: false };
+  return result?.result?.value ?? { ok: false, objectsChecked: 0 };
 }
 
 function buildSeedFallbackState(network) {

@@ -96,12 +96,27 @@ function createMockProbeCdp(options = {}) {
   const breakpoints = [];
   const removedBreakpoints = [];
   const sentMethods = [];
+  const listeners = new Map();
   let nextBreakpointId = 1;
 
   return {
     breakpoints,
     removedBreakpoints,
     sentMethods,
+    on(method, handler) {
+      const current = listeners.get(method) ?? [];
+      current.push(handler);
+      listeners.set(method, current);
+      return () => {
+        const next = (listeners.get(method) ?? []).filter((entry) => entry !== handler);
+        listeners.set(method, next);
+      };
+    },
+    emit(method, payload) {
+      for (const handler of listeners.get(method) ?? []) {
+        handler(payload);
+      }
+    },
     async send(method, params = {}) {
       sentMethods.push({ method, params });
       if (method === "Debugger.enable" || method === "Debugger.disable" || method === "Debugger.resume") {
@@ -140,6 +155,9 @@ function createMockProbeCdp(options = {}) {
       throw new Error(`Unhandled method ${method}`);
     },
     async waitForEvent(method) {
+      if (typeof options.waitForEventImpl === "function") {
+        return options.waitForEventImpl({ method, cdp: this });
+      }
       if (method !== "Debugger.paused") {
         throw new Error(`Unhandled event ${method}`);
       }
@@ -598,6 +616,29 @@ test("captureTetrioGame registers both raf and setTimeout breakpoints", async ()
   assert.equal(result.ok, true);
   assert.deepEqual(result.breakpoints, ["raf", "setTimeout"]);
   assert.deepEqual(cdp.breakpoints, ["raf-object", "timeout-object"]);
+});
+
+test("captureTetrioGame is cancelled immediately when navigation happens during probe", async () => {
+  const cdp = createMockProbeCdp({
+    waitForEventImpl: ({ method }) => {
+      if (method !== "Debugger.paused") {
+        throw new Error(`Unhandled event ${method}`);
+      }
+      return new Promise(() => undefined);
+    }
+  });
+
+  const startedAt = Date.now();
+  const capturePromise = captureTetrioGame(cdp, createProbePerfStub(), { attempt: 1 });
+  setTimeout(() => {
+    cdp.emit("Page.frameNavigated", { frame: { id: "root-frame" } });
+  }, 10);
+  const result = await capturePromise;
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /Page\.frameNavigated/);
+  assert.equal(elapsedMs < 1500, true);
 });
 
 test("readTetrioState falls through direct scan failure into closure probe capture", async () => {
