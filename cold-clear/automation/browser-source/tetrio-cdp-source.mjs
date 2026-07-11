@@ -18,6 +18,7 @@ const DIRECT_SCAN_MAX_ATTEMPTS = Number.POSITIVE_INFINITY;
 const PROBE_TIMEOUT_MS = 120;
 const PROBE_COOLDOWN_MS = 30_000;
 const PERF_LOG_INTERVAL_MS = 5000;
+const DISCOVERY_RESET_DEBOUNCE_MS = 250;
 
 export function normalizeDebuggerProbeMode(value) {
   return value === "manual" || value === "disabled" || value === "startup_only"
@@ -119,6 +120,17 @@ export function resetDiscoveryState(probeState) {
   probeState.probeAttempts = 0;
 }
 
+export function isTopFrameNavigation(event) {
+  const frame = event?.frame;
+  if (!frame?.id) return false;
+  return !frame.parentId;
+}
+
+export function isMainFrameDocumentNavigation(event, mainFrameId) {
+  if (!mainFrameId) return true;
+  return event?.frameId === mainFrameId;
+}
+
 async function clearCachedGameHandle(cdp) {
   await safeRuntimeEvaluate(
     cdp,
@@ -136,16 +148,34 @@ async function clearCachedGameHandle(cdp) {
 }
 
 function attachDiscoveryLifecycleHooks(cdp, probeState) {
+  let mainFrameId = null;
+  let lastResetAt = 0;
+
   const reset = (reason) => {
+    const now = Date.now();
+    if (now - lastResetAt < DISCOVERY_RESET_DEBOUNCE_MS) {
+      return;
+    }
+    lastResetAt = now;
     resetDiscoveryState(probeState);
     clearCachedGameHandle(cdp).catch(() => undefined);
     console.log(`[browser] discovery reset reason=${reason}`);
   };
 
-  cdp.on("Page.frameNavigated", () => reset("frame_navigated"));
-  cdp.on("Page.navigatedWithinDocument", () => reset("navigated_within_document"));
+  cdp.on("Page.frameNavigated", (event) => {
+    if (!isTopFrameNavigation(event)) {
+      return;
+    }
+    mainFrameId = event.frame.id;
+    reset("frame_navigated");
+  });
+  cdp.on("Page.navigatedWithinDocument", (event) => {
+    if (!isMainFrameDocumentNavigation(event, mainFrameId)) {
+      return;
+    }
+    reset("navigated_within_document");
+  });
   cdp.on("Runtime.executionContextsCleared", () => reset("execution_contexts_cleared"));
-  cdp.on("Runtime.executionContextDestroyed", () => reset("execution_context_destroyed"));
 }
 
 async function main() {

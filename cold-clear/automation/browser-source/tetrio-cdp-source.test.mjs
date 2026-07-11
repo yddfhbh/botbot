@@ -6,6 +6,8 @@ import {
   captureTetrioExportExpression,
   computeEffectiveStatePollMs,
   formatStateEvalPerfLog,
+  isMainFrameDocumentNavigation,
+  isTopFrameNavigation,
   resetDiscoveryState,
   shouldAttemptDebuggerProbe,
   shouldAttemptStartupDirectScan,
@@ -250,6 +252,33 @@ test("resetDiscoveryState re-enables direct discovery after lifecycle reset", ()
   assert.equal(probeState.gameCaptured, false);
   assert.equal(probeState.lastKnownPlaying, false);
   assert.equal(probeState.lastCaptureSource, null);
+});
+
+test("top frame navigation ignores child frames", () => {
+  assert.equal(
+    isTopFrameNavigation({
+      frame: { id: "root-frame" }
+    }),
+    true
+  );
+  assert.equal(
+    isTopFrameNavigation({
+      frame: { id: "child-frame", parentId: "root-frame" }
+    }),
+    false
+  );
+});
+
+test("document navigation only resets for the main frame once known", () => {
+  assert.equal(
+    isMainFrameDocumentNavigation({ frameId: "root-frame" }, "root-frame"),
+    true
+  );
+  assert.equal(
+    isMainFrameDocumentNavigation({ frameId: "child-frame" }, "root-frame"),
+    false
+  );
+  assert.equal(isMainFrameDocumentNavigation({}, null), true);
 });
 
 test("state perf logs show quick, startup scan, and disabled modes", () => {
