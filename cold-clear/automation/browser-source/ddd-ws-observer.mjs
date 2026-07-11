@@ -128,6 +128,23 @@ const TRACE_SUMMARY_SCALAR_KEYS = [
   "slot",
   "index"
 ];
+const GARBAGE_INTERACTION_EVENT_TYPES = new Set([
+  "interaction",
+  "interaction_confirm"
+]);
+const GARBAGE_INTERACTION_DATA_KEYS = [
+  "type",
+  "gameid",
+  "frame",
+  "amt",
+  "size",
+  "x",
+  "y",
+  "zthalt",
+  "iid",
+  "ackiid",
+  "cid"
+];
 
 export async function installDddWsObserver(
   cdp,
@@ -561,6 +578,8 @@ function createTraceRecorder(traceFilePath, log) {
       piece: 0,
       replay: 0,
       garbage: 0,
+      garbage_interaction: 0,
+      round_start: 0,
       mixed: 0
     }
   };
@@ -660,6 +679,18 @@ function buildTraceEntriesForObject(value, pathLabel, lineage) {
   const entries = [];
   const safeKeys = Object.keys(value).filter((key) => !isSensitiveKey(key));
   const keySet = new Set(safeKeys.map((key) => key.toLowerCase()));
+  const roundStartRecord =
+    pathLabel === "root" ? buildRoundStartTraceRecord(value) : null;
+  if (roundStartRecord) {
+    entries.push(roundStartRecord);
+  }
+  const garbageInteractionRecord = buildGarbageInteractionRecord(
+    value,
+    lineage
+  );
+  if (garbageInteractionRecord) {
+    entries.push(garbageInteractionRecord);
+  }
 
   if (hasSeedAndBagtype(value)) {
     entries.push(buildOptionTraceRecord(value, pathLabel, lineage));
@@ -723,6 +754,79 @@ function buildTraceRecord(kind, value, pathLabel, safeKeys, lineage) {
     context: extractTraceContext(lineage),
     summary: summarizeTraceObject(value)
   };
+}
+
+function buildGarbageInteractionRecord(value, lineage) {
+  const eventType = sanitizeTraceScalar(value.type);
+  if (!GARBAGE_INTERACTION_EVENT_TYPES.has(eventType)) {
+    return null;
+  }
+
+  const data = value.data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return null;
+  }
+  if (sanitizeTraceScalar(data.type) !== "garbage") {
+    return null;
+  }
+
+  const record = {
+    kind: "garbage_interaction",
+    eventType,
+    data: pickScalarFields(data, GARBAGE_INTERACTION_DATA_KEYS)
+  };
+  const eventFrame = sanitizeTraceScalar(value.frame);
+  if (eventFrame !== undefined) {
+    record.eventFrame = eventFrame;
+  }
+  const eventId = sanitizeTraceScalar(value.id);
+  if (eventId !== undefined) {
+    record.eventId = eventId;
+  }
+  const ownerGameId = findOwnerGameId(lineage);
+  if (ownerGameId !== undefined) {
+    record.ownerGameId = ownerGameId;
+  }
+  return record;
+}
+
+function buildRoundStartTraceRecord(value) {
+  const players = Array.isArray(value.players) ? value.players : null;
+  if (!players) {
+    return null;
+  }
+
+  const summarizedPlayers = players
+    .map((player) => summarizeRoundStartPlayer(player))
+    .filter((player) => player && Object.keys(player).length > 0);
+  if (summarizedPlayers.length === 0) {
+    return null;
+  }
+
+  const record = {
+    kind: "round_start",
+    players: summarizedPlayers
+  };
+  const roomSeed = sanitizeTraceScalar(value?.options?.seed);
+  if (roomSeed !== undefined) {
+    record.roomSeed = roomSeed;
+  }
+  return record;
+}
+
+function summarizeRoundStartPlayer(player) {
+  if (!player || typeof player !== "object" || Array.isArray(player)) {
+    return null;
+  }
+
+  const summary = {};
+  for (const key of ["username", "userid", "gameid", "seed"]) {
+    const scalar = sanitizeTraceScalar(player[key]);
+    if (scalar !== undefined) {
+      summary[key] = scalar;
+    }
+  }
+  return summary;
 }
 
 function classifyTraceKind(keySet) {
@@ -970,8 +1074,9 @@ function maybeRecordTraceCandidate(candidate, event, observerState, log) {
   }
 
   const signature = buildTraceSignature(record);
+  const duplicateLimit = traceDuplicateLimit(record);
   const seenCount = trace.signatureCounts.get(signature) ?? 0;
-  if (seenCount >= 3) {
+  if (seenCount >= duplicateLimit) {
     return;
   }
 
@@ -1011,6 +1116,38 @@ function maybeRecordTraceCandidate(candidate, event, observerState, log) {
 }
 
 function buildTraceSignature(record) {
+  if (record.kind === "garbage_interaction") {
+    const data = record.data ?? {};
+    return [
+      record.eventType ?? "",
+      record.ownerGameId ?? "",
+      data.gameid ?? "",
+      data.iid ?? "",
+      data.ackiid ?? "",
+      data.cid ?? "",
+      data.frame ?? "",
+      data.amt ?? "",
+      data.size ?? "",
+      data.x ?? ""
+    ].join("|");
+  }
+
+  if (record.kind === "round_start") {
+    const players = Array.isArray(record.players)
+      ? record.players
+          .map((player) =>
+            [
+              player?.username ?? "",
+              player?.userid ?? "",
+              player?.gameid ?? "",
+              player?.seed ?? ""
+            ].join(":")
+          )
+          .join("|")
+      : "";
+    return ["round_start", record.roomSeed ?? "", players].join("|");
+  }
+
   const keys = Array.isArray(record.keys) ? [...record.keys].sort().join(",") : "";
   const summary = record.summary ?? {};
   const context = record.context ?? {};
@@ -1038,6 +1175,13 @@ function buildTraceSignature(record) {
   ].join("|");
 }
 
+function traceDuplicateLimit(record) {
+  if (record.kind === "garbage_interaction" || record.kind === "round_start") {
+    return 1;
+  }
+  return 3;
+}
+
 function resolveTraceUrlHost(requestId, observerState) {
   if (!requestId || !observerState.requestUrls.has(requestId)) {
     return "unknown";
@@ -1052,6 +1196,36 @@ function sanitizeTraceScalar(value) {
     typeof value === "boolean"
   ) {
     return value;
+  }
+  return undefined;
+}
+
+function pickScalarFields(value, keys) {
+  const record = {};
+  for (const key of keys) {
+    if (isSensitiveKey(key) || !Object.prototype.hasOwnProperty.call(value, key)) {
+      continue;
+    }
+    const scalar = sanitizeTraceScalar(value[key]);
+    if (scalar !== undefined) {
+      record[key] = scalar;
+    }
+  }
+  return record;
+}
+
+function findOwnerGameId(lineage) {
+  for (const entry of lineage) {
+    const source = entry?.value;
+    if (!source || typeof source !== "object" || Array.isArray(source)) {
+      continue;
+    }
+    for (const key of ["gameid", "game_id"]) {
+      const scalar = sanitizeTraceScalar(source[key]);
+      if (scalar !== undefined) {
+        return scalar;
+      }
+    }
   }
   return undefined;
 }

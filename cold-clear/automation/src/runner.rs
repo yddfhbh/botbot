@@ -23,7 +23,8 @@ use crate::driver::{
     ExecutionTimings, GameAction, InputBackend,
 };
 use crate::scanner::{
-    read_snapshot_file, GameSnapshot, PieceToken, RotationToken, SnapshotScanner,
+    read_snapshot_file_with_age, GameSnapshot, PieceToken, RotationToken, SnapshotScanner,
+    MAX_SNAPSHOT_AGE_MS,
 };
 use crate::sprint::{
     register_lock_result, sprint_40l_weights, sprint_context, update_state_for_snapshot,
@@ -128,7 +129,7 @@ where
         piece_interval,
         hard_drop_interval: Duration::from_millis(config.hard_drop_interval_ms),
     };
-    let mut buffered_snapshot = None;
+    let mut buffered_snapshot: Option<ObservedSnapshot> = None;
     let mut sprint_state = SprintState::default();
     let mut perf_window = RollingPerfWindow::default();
 
@@ -139,10 +140,14 @@ where
         let snapshot_option = if let Some(snapshot) = buffered_snapshot.take() {
             Some(snapshot)
         } else {
-            scanner.next_snapshot()?
+            scanner.next_snapshot()?.map(|snapshot| ObservedSnapshot {
+                age: scanner.latest_snapshot_age(),
+                snapshot,
+            })
         };
         match snapshot_option {
-            Some(snapshot) => {
+            Some(observed_snapshot) => {
+                let ObservedSnapshot { snapshot, age } = observed_snapshot;
                 if config.play_style == crate::config::PlayStyleConfig::Speed {
                     update_state_for_snapshot(&mut sprint_state, &snapshot);
                 }
@@ -153,11 +158,8 @@ where
                         last_piece_counter = None;
                     }
                 }
-                if let Some(reason) = skip_snapshot_reason(&snapshot, last_piece_counter) {
-                    log(format!(
-                        "[automation] source={} token={} skip because {}",
-                        snapshot.source, snapshot.token, reason
-                    ));
+                if let Some(reason) = skip_snapshot_reason(&snapshot, last_piece_counter, age) {
+                    log_skip_snapshot_reason(&snapshot, reason, &mut log);
                     thread::sleep(poll_delay);
                     continue;
                 }
@@ -265,7 +267,7 @@ fn wait_for_next_piece_snapshot<S, F>(
     poll_delay: Duration,
     piece_interval: Duration,
     log: &mut F,
-) -> Result<Option<GameSnapshot>>
+) -> Result<Option<ObservedSnapshot>>
 where
     S: SnapshotScanner,
     F: FnMut(String),
@@ -286,27 +288,31 @@ where
         }
         match scanner.next_snapshot()? {
             Some(snapshot) => {
+                let observed_snapshot = ObservedSnapshot {
+                    age: scanner.latest_snapshot_age(),
+                    snapshot,
+                };
                 if idle_logged {
                     log(format!(
                         "[automation] live game resumed token={} queue={}",
-                        snapshot.token,
-                        queue_labels(&snapshot.queue)
+                        observed_snapshot.snapshot.token,
+                        queue_labels(&observed_snapshot.snapshot.queue)
                     ));
                 }
                 if !piece_interval.is_zero() {
                     log(format!(
                         "[automation] piece_interval {}ms before next token={}",
                         piece_interval.as_millis(),
-                        snapshot.token
+                        observed_snapshot.snapshot.token
                     ));
                     thread::sleep(piece_interval);
                 }
                 log(format!(
                     "[automation] next_piece_ready token={} queue={}",
-                    snapshot.token,
-                    queue_labels(&snapshot.queue)
+                    observed_snapshot.snapshot.token,
+                    queue_labels(&observed_snapshot.snapshot.queue)
                 ));
-                return Ok(Some(snapshot));
+                return Ok(Some(observed_snapshot));
             }
             None => {
                 thread::sleep(poll_delay);
@@ -339,16 +345,16 @@ where
         return Ok(HardDropDecision::Proceed);
     };
     if snapshot.active.is_some()
-        && snapshot.active == live_snapshot.active
+        && snapshot.active == live_snapshot.snapshot.active
         && !prepared.execution_plan.movement_actions.is_empty()
     {
         log(format!(
             "[automation] pre_hard_drop_probe_stale token={} active_state_unchanged=true",
-            live_snapshot.token
+            live_snapshot.snapshot.token
         ));
         return Ok(HardDropDecision::Proceed);
     }
-    let Some(active) = live_snapshot.active else {
+    let Some(active) = live_snapshot.snapshot.active else {
         return Ok(HardDropDecision::Proceed);
     };
 
@@ -357,7 +363,7 @@ where
     if active.rotation != target_rotation {
         log(format!(
             "[automation] pre_hard_drop_mismatch token={} active_x={} active_rot={:?} target_x={} target_rot={:?} -> skip/replan",
-            live_snapshot.token,
+            live_snapshot.snapshot.token,
             active.x,
             active.rotation,
             target.x,
@@ -379,24 +385,26 @@ where
         };
         log(format!(
             "[automation] pre_hard_drop_correction token={} active_x={} target_x={} action={:?}",
-            live_snapshot.token, active.x, target.x, correction
+            live_snapshot.snapshot.token, active.x, target.x, correction
         ));
         execute_single_action(driver, correction, &config.handling, timings, log)
             .with_context(|| format!("failed to execute correction action {:?}", correction))?;
 
         let corrected_snapshot =
             read_live_snapshot_for_correction(config, snapshot, log)?.unwrap_or(live_snapshot);
-        if let Some(corrected_active) = corrected_snapshot.active {
+        if let Some(corrected_active) = corrected_snapshot.snapshot.active {
             if corrected_active.rotation == target_rotation && corrected_active.x == target.x {
                 log(format!(
                     "[automation] pre_hard_drop_correction_applied token={} corrected_x={} corrected_rot={:?}",
-                    corrected_snapshot.token, corrected_active.x, corrected_active.rotation
+                    corrected_snapshot.snapshot.token,
+                    corrected_active.x,
+                    corrected_active.rotation
                 ));
                 return Ok(HardDropDecision::Proceed);
             }
             log(format!(
                 "[automation] pre_hard_drop_correction_failed token={} active_x={} active_rot={:?} target_x={} target_rot={:?} -> skip/replan",
-                corrected_snapshot.token,
+                corrected_snapshot.snapshot.token,
                 corrected_active.x,
                 corrected_active.rotation,
                 target.x,
@@ -407,14 +415,14 @@ where
 
         log(format!(
             "[automation] pre_hard_drop_correction_missing_active token={} -> skip/replan",
-            corrected_snapshot.token
+            corrected_snapshot.snapshot.token
         ));
         return Ok(HardDropDecision::Retry(corrected_snapshot));
     }
 
     log(format!(
         "[automation] pre_hard_drop_x_out_of_range token={} active_x={} target_x={} delta={} -> skip/replan",
-        live_snapshot.token, active.x, target.x, x_diff
+        live_snapshot.snapshot.token, active.x, target.x, x_diff
     ));
     Ok(HardDropDecision::Retry(live_snapshot))
 }
@@ -423,12 +431,12 @@ fn read_live_snapshot_for_correction<F>(
     config: &AutomationConfig,
     snapshot: &GameSnapshot,
     log: &mut F,
-) -> Result<Option<GameSnapshot>>
+) -> Result<Option<ObservedSnapshot>>
 where
     F: FnMut(String),
 {
-    let live_snapshot = match read_snapshot_file(&config.snapshot_path) {
-        Ok(snapshot) => snapshot,
+    let live_snapshot = match read_snapshot_file_with_age(&config.snapshot_path) {
+        Ok((snapshot, age)) => ObservedSnapshot { snapshot, age },
         Err(err) => {
             log(format!(
                 "[automation] pre_hard_drop_probe_unavailable token={} error={:#}",
@@ -438,10 +446,10 @@ where
         }
     };
 
-    if live_snapshot.token != snapshot.token {
+    if live_snapshot.snapshot.token != snapshot.token {
         log(format!(
             "[automation] pre_hard_drop_probe_token_changed expected={} actual={}",
-            snapshot.token, live_snapshot.token
+            snapshot.token, live_snapshot.snapshot.token
         ));
         return Ok(None);
     }
@@ -452,19 +460,53 @@ where
 fn skip_snapshot_reason(
     snapshot: &GameSnapshot,
     last_piece_counter: Option<u32>,
-) -> Option<String> {
+    snapshot_age: Option<Duration>,
+) -> Option<SkipSnapshotReason> {
     if !snapshot.playing {
-        return Some("playing=false".to_owned());
+        return Some(SkipSnapshotReason::PlayingFalse);
     }
     if snapshot.countdown {
-        return Some("countdown=true".to_owned());
+        return Some(SkipSnapshotReason::CountdownTrue);
+    }
+    if snapshot_age
+        .map(|age| age.as_millis() > u128::from(MAX_SNAPSHOT_AGE_MS))
+        .unwrap_or(false)
+    {
+        return Some(SkipSnapshotReason::Stale {
+            age_ms: snapshot_age
+                .expect("stale snapshot age should exist")
+                .as_millis(),
+        });
     }
     if let (Some(current), Some(previous)) = (snapshot.piece_counter, last_piece_counter) {
         if current == previous {
-            return Some(format!("duplicate pieceCounter={current}"));
+            return Some(SkipSnapshotReason::DuplicatePieceCounter { current });
         }
     }
     None
+}
+
+fn log_skip_snapshot_reason<F>(snapshot: &GameSnapshot, reason: SkipSnapshotReason, log: &mut F)
+where
+    F: FnMut(String),
+{
+    match reason {
+        SkipSnapshotReason::Stale { age_ms } => {
+            log(format!(
+                "[bot] ignoring stale snapshot token={} age_ms={age_ms}",
+                snapshot.token
+            ));
+            log("[bot] waiting for fresh snapshot".to_owned());
+        }
+        _ => {
+            log(format!(
+                "[automation] source={} token={} skip because {}",
+                snapshot.source,
+                snapshot.token,
+                reason.message()
+            ));
+        }
+    }
 }
 
 fn target_pps_interval(target_pps: f32) -> Option<Duration> {
@@ -595,6 +637,12 @@ fn average_perf_ms(samples: &VecDeque<u128>) -> u128 {
 }
 
 #[derive(Clone, Debug)]
+struct ObservedSnapshot {
+    snapshot: GameSnapshot,
+    age: Option<Duration>,
+}
+
+#[derive(Clone, Debug)]
 struct PreparedExecution {
     planned_move: Move,
     planned_piece: Piece,
@@ -612,7 +660,28 @@ struct PreparedExecution {
 #[derive(Clone, Debug)]
 enum HardDropDecision {
     Proceed,
-    Retry(GameSnapshot),
+    Retry(ObservedSnapshot),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum SkipSnapshotReason {
+    PlayingFalse,
+    CountdownTrue,
+    DuplicatePieceCounter { current: u32 },
+    Stale { age_ms: u128 },
+}
+
+impl SkipSnapshotReason {
+    fn message(self) -> String {
+        match self {
+            Self::PlayingFalse => "playing=false".to_owned(),
+            Self::CountdownTrue => "countdown=true".to_owned(),
+            Self::DuplicatePieceCounter { current } => {
+                format!("duplicate pieceCounter={current}")
+            }
+            Self::Stale { age_ms } => format!("stale snapshot age_ms={age_ms}"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1834,9 +1903,75 @@ mod tests {
         AutomationConfig, EvaluationProfileConfig, MovementModeConfig, PlayStyleConfig,
         RouteProfileConfig,
     };
+    use crate::driver::TimedGameAction;
     use crate::scanner::PieceToken;
     use libtetris::{PieceState, RotationState, Statistics, TspinStatus};
-    use std::sync::atomic::AtomicU32;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Mutex};
+
+    struct ScriptedScanner {
+        snapshots: VecDeque<(GameSnapshot, Option<Duration>)>,
+        latest_age: Option<Duration>,
+    }
+
+    impl SnapshotScanner for ScriptedScanner {
+        fn next_snapshot(&mut self) -> Result<Option<GameSnapshot>> {
+            let Some((snapshot, age)) = self.snapshots.pop_front() else {
+                return Ok(None);
+            };
+            self.latest_age = age;
+            Ok(Some(snapshot))
+        }
+
+        fn latest_snapshot_age(&self) -> Option<Duration> {
+            self.latest_age
+        }
+    }
+
+    struct CountingBackend {
+        stop: Arc<AtomicBool>,
+        taps: Arc<AtomicU32>,
+        sequences: Arc<AtomicU32>,
+    }
+
+    impl InputBackend for CountingBackend {
+        fn tap(&mut self, _: GameAction, _: Duration) -> Result<()> {
+            self.taps.fetch_add(1, AtomicOrdering::Relaxed);
+            self.stop.store(true, AtomicOrdering::Relaxed);
+            Ok(())
+        }
+
+        fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
+            self.sequences.fetch_add(1, AtomicOrdering::Relaxed);
+            self.taps
+                .fetch_add(actions.len() as u32, AtomicOrdering::Relaxed);
+            self.stop.store(true, AtomicOrdering::Relaxed);
+            Ok(())
+        }
+
+        fn release_all_keys(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn runner_test_snapshot(token: &str, piece_counter: u32) -> GameSnapshot {
+        GameSnapshot {
+            source: "browser_cdp".to_owned(),
+            token: token.to_owned(),
+            field: vec![[false; 10]; 40],
+            queue: vec![PieceToken::J, PieceToken::O, PieceToken::T, PieceToken::L],
+            hold: None,
+            combo: 0,
+            b2b: false,
+            incoming: 0,
+            piece_counter: Some(piece_counter),
+            lines_cleared: None,
+            playing: true,
+            countdown: false,
+            active: None,
+        }
+    }
 
     #[test]
     fn plan_move_requires_queue() {
@@ -2248,8 +2383,8 @@ mod tests {
         };
 
         assert_eq!(
-            skip_snapshot_reason(&snapshot, Some(12)).as_deref(),
-            Some("duplicate pieceCounter=12")
+            skip_snapshot_reason(&snapshot, Some(12), None),
+            Some(SkipSnapshotReason::DuplicatePieceCounter { current: 12 })
         );
     }
 
@@ -2271,16 +2406,80 @@ mod tests {
             active: None,
         };
         assert_eq!(
-            skip_snapshot_reason(&snapshot, None).as_deref(),
-            Some("playing=false")
+            skip_snapshot_reason(&snapshot, None, None),
+            Some(SkipSnapshotReason::PlayingFalse)
         );
 
         snapshot.playing = true;
         snapshot.countdown = true;
         assert_eq!(
-            skip_snapshot_reason(&snapshot, None).as_deref(),
-            Some("countdown=true")
+            skip_snapshot_reason(&snapshot, None, None),
+            Some(SkipSnapshotReason::CountdownTrue)
         );
+    }
+
+    #[test]
+    fn skip_snapshot_reason_allows_fresh_age_but_blocks_stale_age() {
+        let snapshot = runner_test_snapshot("browser-1-10", 10);
+
+        assert_eq!(
+            skip_snapshot_reason(&snapshot, None, Some(Duration::from_millis(500))),
+            None
+        );
+        assert_eq!(
+            skip_snapshot_reason(&snapshot, None, Some(Duration::from_millis(1001))),
+            Some(SkipSnapshotReason::Stale { age_ms: 1001 })
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_execute_until_fresh_snapshot_arrives() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let taps = Arc::new(AtomicU32::new(0));
+        let sequences = Arc::new(AtomicU32::new(0));
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let stale_snapshot = runner_test_snapshot("browser-1-1008", 1008);
+        let fresh_snapshot = runner_test_snapshot("browser-2-0", 0);
+        let mut scanner = ScriptedScanner {
+            snapshots: VecDeque::from([
+                (stale_snapshot, Some(Duration::from_millis(1001))),
+                (fresh_snapshot, Some(Duration::from_millis(100))),
+            ]),
+            latest_age: None,
+        };
+        let mut backend = CountingBackend {
+            stop: stop.clone(),
+            taps: taps.clone(),
+            sequences: sequences.clone(),
+        };
+
+        run_loop_until(
+            &AutomationConfig::default(),
+            &mut scanner,
+            &mut backend,
+            stop.as_ref(),
+            {
+                let logs = logs.clone();
+                move |line| logs.lock().unwrap().push(line)
+            },
+        )
+        .unwrap();
+
+        let logs = logs.lock().unwrap();
+        assert!(logs.iter().any(|line| {
+            line == "[bot] ignoring stale snapshot token=browser-1-1008 age_ms=1001"
+        }));
+        assert!(logs
+            .iter()
+            .any(|line| line == "[bot] waiting for fresh snapshot"));
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.contains("[automation] source=") && line.contains(" piece="))
+                .count(),
+            1
+        );
+        assert!(taps.load(AtomicOrdering::Relaxed) > 0);
+        assert_eq!(sequences.load(AtomicOrdering::Relaxed), 0);
     }
 
     #[test]

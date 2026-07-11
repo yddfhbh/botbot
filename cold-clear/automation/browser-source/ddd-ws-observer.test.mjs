@@ -606,6 +606,159 @@ test("trace stores at most three replay event samples", async () => {
   }
 });
 
+test("trace records garbage interaction scalar values and keeps confirm separate", async () => {
+  const cdp = new FakeCdp();
+  const { dir, filePath } = makeTempTraceFile();
+  const interactionData = {
+    type: "garbage",
+    gameid: 3839,
+    frame: 214,
+    amt: 4,
+    size: 4,
+    x: 6,
+    y: { blocked: true },
+    zthalt: ["skip-me"],
+    iid: 91,
+    ackiid: 92,
+    cid: "garbage-1"
+  };
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: () => {
+        throw new Error("unused");
+      },
+      log: () => {},
+      traceEnabled: true,
+      traceFilePath: filePath
+    });
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify({
+          gameid: 3840,
+          replay: {
+            events: [
+              { type: "interaction", frame: 179, id: 2, data: interactionData },
+              { type: "interaction", frame: 179, id: 2, data: interactionData },
+              {
+                type: "interaction_confirm",
+                frame: 180,
+                id: 3,
+                data: interactionData
+              }
+            ]
+          }
+        })
+      }
+    });
+
+    cleanup();
+
+    const interactions = readJsonLines(filePath).filter(
+      (entry) => entry.kind === "garbage_interaction"
+    );
+    assert.equal(interactions.length, 2);
+
+    const direct = interactions.find(
+      (entry) => entry.eventType === "interaction"
+    );
+    const confirm = interactions.find(
+      (entry) => entry.eventType === "interaction_confirm"
+    );
+    assert.ok(direct);
+    assert.ok(confirm);
+    assert.deepEqual(direct.data, {
+      type: "garbage",
+      gameid: 3839,
+      frame: 214,
+      amt: 4,
+      size: 4,
+      x: 6,
+      iid: 91,
+      ackiid: 92,
+      cid: "garbage-1"
+    });
+    assert.equal(direct.eventFrame, 179);
+    assert.equal(direct.eventId, 2);
+    assert.equal(direct.ownerGameId, 3840);
+    assert.equal("y" in direct.data, false);
+    assert.equal("zthalt" in direct.data, false);
+    assert.equal(confirm.eventFrame, 180);
+    assert.equal(confirm.ownerGameId, 3840);
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("trace records round_start players and keeps room seed separate", async () => {
+  const cdp = new FakeCdp();
+  const { dir, filePath } = makeTempTraceFile();
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: () => {
+        throw new Error("unused");
+      },
+      log: () => {},
+      traceEnabled: true,
+      traceFilePath: filePath
+    });
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify({
+          players: [
+            {
+              username: "hebi_",
+              userid: "user-a",
+              gameid: 3839,
+              seed: 484243732
+            },
+            {
+              username: "guest-e00651",
+              userid: "user-b",
+              gameid: 3840,
+              seed: 484243732
+            }
+          ],
+          options: {
+            seed: 187156,
+            bagtype: "7-bag"
+          }
+        })
+      }
+    });
+
+    cleanup();
+
+    const roundStart = readJsonLines(filePath).find(
+      (entry) => entry.kind === "round_start"
+    );
+    assert.ok(roundStart);
+    assert.equal(roundStart.roomSeed, 187156);
+    assert.deepEqual(roundStart.players, [
+      {
+        username: "hebi_",
+        userid: "user-a",
+        gameid: 3839,
+        seed: 484243732
+      },
+      {
+        username: "guest-e00651",
+        userid: "user-b",
+        gameid: 3840,
+        seed: 484243732
+      }
+    ]);
+    assert.equal("seed" in roundStart, false);
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
 test("trace redacts sensitive subtrees and never records raw payload data", async () => {
   const cdp = new FakeCdp();
   const { dir, filePath } = makeTempTraceFile();
