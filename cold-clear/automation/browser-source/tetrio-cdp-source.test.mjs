@@ -291,7 +291,7 @@ test("closure probe policy requires likely game page and allows cooldown retries
       likelyGamePage: true,
       needsProbe: true,
       gameCaptured: false,
-      probeAttempts: 4,
+      probeAttempts: 3,
       now: 20_000,
       lastAttemptAt: 0
     }),
@@ -558,7 +558,7 @@ test("paused call frame captures Ai before scope fallback", async () => {
   );
 });
 
-test("paused call frame falls back to generalized scope scan when Ai is missing", async () => {
+test("paused call frame does not run generalized scope scan when Ai is missing", async () => {
   const cdp = createMockProbeCdp({
     evaluateOnCallFrameQueue: [
       {
@@ -569,15 +569,7 @@ test("paused call frame falls back to generalized scope scan when Ai is missing"
           }
         }
       }
-    ],
-    callFunctionOnResult: {
-      result: {
-        value: {
-          ok: true,
-          source: "scope:local.gameHolder.hidden"
-        }
-      }
-    }
+    ]
   });
 
   const result = await exposeTetrioGameFromPausedCallFrames(cdp, {
@@ -589,11 +581,10 @@ test("paused call frame falls back to generalized scope scan when Ai is missing"
     ]
   });
 
-  assert.equal(result.ok, true);
-  assert.equal(result.source, "scope:local.gameHolder.hidden");
+  assert.equal(result.ok, false);
   assert.equal(
     cdp.sentMethods.some((entry) => entry.method === "Runtime.callFunctionOn"),
-    true
+    false
   );
 });
 
@@ -618,13 +609,44 @@ test("captureTetrioGame registers both raf and setTimeout breakpoints", async ()
   assert.deepEqual(cdp.breakpoints, ["raf-object", "timeout-object"]);
 });
 
+test("captureTetrioGame resumes within 150ms even when Ai is missing", async () => {
+  const cdp = createMockProbeCdp({
+    evaluateOnCallFrameQueue: [
+      new Promise((resolve) => {
+        setTimeout(() => resolve({ result: { value: { ok: false, reason: "Ai not visible" } } }), 200);
+      })
+    ]
+  });
+
+  const startedAt = Date.now();
+  const result = await captureTetrioGame(cdp, createProbePerfStub());
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.ok, false);
+  assert.equal(elapsedMs < 150, true);
+  assert.equal(result.pausedMs < 150, true);
+  assert.equal(
+    cdp.sentMethods.some((entry) => entry.method === "Debugger.resume"),
+    true
+  );
+  assert.equal(
+    cdp.sentMethods.some((entry) => entry.method === "Runtime.callFunctionOn"),
+    false
+  );
+});
+
 test("captureTetrioGame is cancelled immediately when navigation happens during probe", async () => {
   const cdp = createMockProbeCdp({
+    evaluateOnCallFrameQueue: [
+      new Promise((resolve) => {
+        setTimeout(() => resolve({ result: { value: { ok: false, reason: "Ai not visible" } } }), 200);
+      })
+    ],
     waitForEventImpl: ({ method }) => {
       if (method !== "Debugger.paused") {
         throw new Error(`Unhandled event ${method}`);
       }
-      return new Promise(() => undefined);
+      return Promise.resolve({ callFrames: [{ callFrameId: "frame-1", scopeChain: [] }] });
     }
   });
 
@@ -639,6 +661,31 @@ test("captureTetrioGame is cancelled immediately when navigation happens during 
   assert.equal(result.ok, false);
   assert.match(result.reason, /Page\.frameNavigated/);
   assert.equal(elapsedMs < 1500, true);
+  assert.equal(
+    cdp.sentMethods.some((entry) => entry.method === "Debugger.resume"),
+    true
+  );
+});
+
+test("captureTetrioGame rejects a second probe while one is already in flight", async () => {
+  const cdp = createMockProbeCdp({
+    waitForEventImpl: ({ method }) => {
+      if (method !== "Debugger.paused") {
+        throw new Error(`Unhandled event ${method}`);
+      }
+      return new Promise(() => undefined);
+    }
+  });
+
+  const firstCapture = captureTetrioGame(cdp, createProbePerfStub(), { attempt: 1 });
+  const secondCapture = await captureTetrioGame(cdp, createProbePerfStub(), { attempt: 2 });
+
+  assert.equal(secondCapture.ok, false);
+  assert.equal(secondCapture.reason, "probe already in progress");
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  cdp.emit("Page.frameNavigated", { frame: { id: "root-frame" } });
+  await firstCapture;
 });
 
 test("readTetrioState falls through direct scan failure into closure probe capture", async () => {
@@ -743,6 +790,131 @@ test("readTetrioState falls through direct scan failure into closure probe captu
     cdp.sentMethods.some((entry) => entry.method === "Debugger.enable"),
     true
   );
+});
+
+test("readTetrioState skips re-registering debugger probe after capture succeeds", async () => {
+  const cdp = createMockProbeCdp({
+    runtimeEvaluateValues: [
+      {
+        result: {
+          value: {
+            ok: false,
+            quick: false,
+            scanMode: "startup_direct",
+            scanAttempted: true,
+            scanReason: "no_game",
+            reason: "TETR.IO game instance not captured yet",
+            href: "https://tetr.io/#solo",
+            pageTitle: "TETR.IO",
+            pageHints: {
+              likelyGamePage: true,
+              canvasCount: 3,
+              largeCanvasCount: 2,
+              hash: "#solo"
+            }
+          }
+        }
+      },
+      {
+        result: {
+          value: {
+            ok: true,
+            quick: true,
+            scanMode: false,
+            scanAttempted: false,
+            captureSource: "window.__fusionTetrioGame",
+            href: "https://tetr.io/#solo",
+            pageTitle: "TETR.IO",
+            pageHints: {
+              likelyGamePage: true,
+              canvasCount: 3,
+              largeCanvasCount: 2,
+              hash: "#solo"
+            },
+            exported: createMockBrowserStateExport(),
+            boardState: createMockBoardState()
+          }
+        }
+      },
+      {
+        result: {
+          value: {
+            ok: true,
+            quick: true,
+            scanMode: false,
+            scanAttempted: false,
+            captureSource: "window.__fusionTetrioGame",
+            href: "https://tetr.io/#solo",
+            pageTitle: "TETR.IO",
+            pageHints: {
+              likelyGamePage: true,
+              canvasCount: 3,
+              largeCanvasCount: 2,
+              hash: "#solo"
+            },
+            exported: createMockBrowserStateExport(),
+            boardState: createMockBoardState()
+          }
+        }
+      }
+    ],
+    evaluateOnCallFrameQueue: [
+      {
+        result: {
+          value: {
+            ok: true,
+            source: "closure:Ai"
+          }
+        }
+      }
+    ]
+  });
+  const probeState = {
+    startupDirectScanAttempts: 0,
+    startupDirectScanLastAt: 0,
+    lastAttemptAt: 0,
+    probeAttempts: 0,
+    gameCaptured: false,
+    lastKnownPlaying: false,
+    lastDumpAt: 0,
+    lastCaptureSource: null,
+    lastLikelyGamePage: false,
+    lastLikelyGamePageAt: 0
+  };
+  const options = {
+    selector: {
+      playerSelector: "auto",
+      playerNickname: "",
+      playerUserId: "",
+      dumpStateOnFail: false,
+      dumpStatePath: "automation/debug/tetrio-state-dump.json"
+    },
+    targetTitle: "TETR.IO",
+    targetUrl: "https://tetr.io/#solo",
+    probePageState: true,
+    debuggerProbeMode: "startup_only",
+    useSeedSimulationFallback: false,
+    network: {
+      seed: null,
+      nextCount: 6,
+      readyAt: 0,
+      ribbonSeen: false,
+      lastPageProbeAt: 0,
+      frameCounts: { received: 0, sent: 0, decoded: 0 }
+    },
+    probeState,
+    perf: createProbePerfStub()
+  };
+
+  const first = await readTetrioState(cdp, options);
+  const enableCallsAfterFirst = cdp.sentMethods.filter((entry) => entry.method === "Debugger.enable").length;
+  const second = await readTetrioState(cdp, options);
+  const enableCallsAfterSecond = cdp.sentMethods.filter((entry) => entry.method === "Debugger.enable").length;
+
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  assert.equal(enableCallsAfterFirst, 1);
+  assert.equal(enableCallsAfterSecond, 1);
 });
 
 test("captured game uses quick path on later polls", () => {

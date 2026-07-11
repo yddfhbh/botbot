@@ -17,7 +17,9 @@ const DIRECT_SCAN_COOLDOWN_MS = 1500;
 const DIRECT_SCAN_MAX_ATTEMPTS = Number.POSITIVE_INFINITY;
 const PROBE_TIMEOUT_MS = 900;
 const PROBE_RETRY_COOLDOWN_MS = 750;
-const MAX_PROBE_ATTEMPTS = 4;
+const MAX_PROBE_ATTEMPTS = 3;
+const AI_FRAME_EVAL_TIMEOUT_MS = 25;
+const PAUSED_EVAL_TIMEOUT_MS = 120;
 const PERF_LOG_INTERVAL_MS = 5000;
 const DISCOVERY_RESET_DEBOUNCE_MS = 250;
 const TARGET_WAIT_TIMEOUT_MS = 10_000;
@@ -27,6 +29,7 @@ const CLOSURE_PROBE_BREAKPOINTS = [
   { label: "raf", expression: "window.requestAnimationFrame" },
   { label: "setTimeout", expression: "window.setTimeout" }
 ];
+let closureProbeInFlight = false;
 
 export function normalizeDebuggerProbeMode(value) {
   return value === "manual" || value === "disabled" || value === "startup_only"
@@ -1121,7 +1124,7 @@ export async function readTetrioState(cdp, options) {
       state = rawState.ok ? snapshotFromRaw(rawState) : buildNoGameFailure(rawState, options);
     } else if (state.reason) {
       console.log(
-        `[browser] closure probe failed ai_frames_checked=${capture.aiFramesChecked ?? 0} scope_objects_checked=${capture.scopeObjectsChecked ?? 0} reason=${capture.reason}`
+        `[browser] closure probe failed frames_checked=${capture.framesChecked ?? capture.aiFramesChecked ?? 0} paused_ms=${capture.pausedMs ?? 0} reason=${capture.reason}`
       );
       if (options.probeState.probeAttempts < MAX_PROBE_ATTEMPTS && likelyGamePage && !options.probeState.gameCaptured) {
         console.log(`[browser] closure probe retry in ${PROBE_RETRY_COOLDOWN_MS}ms`);
@@ -1360,23 +1363,33 @@ export function captureTetrioExportExpression({
 }
 
 export async function captureTetrioGame(cdp, perf, options = {}) {
+  if (closureProbeInFlight) {
+    return { ok: false, reason: "probe already in progress", framesChecked: 0, pausedMs: 0 };
+  }
+
+  closureProbeInFlight = true;
   const breakpointIds = [];
   let paused = false;
   const startedAt = Date.now();
   const attachedBreakpointLabels = [];
-  let totalAiFramesChecked = 0;
-  let totalScopeObjectsChecked = 0;
-  let totalCallFramesChecked = 0;
   let cancelReason = null;
   let cancelResolver = () => undefined;
   const cancelPromise = new Promise((resolve) => {
     cancelResolver = resolve;
   });
   const removeListeners = [];
+  let breakpointsRemoved = false;
   const cancelProbe = (reason) => {
     if (cancelReason) return;
     cancelReason = reason;
     cancelResolver({ cancelled: true, reason });
+  };
+  const removeBreakpoints = async () => {
+    if (breakpointsRemoved) return;
+    breakpointsRemoved = true;
+    for (const breakpointId of breakpointIds) {
+      await cdp.send("Debugger.removeBreakpoint", { breakpointId }).catch(() => undefined);
+    }
   };
 
   try {
@@ -1421,61 +1434,78 @@ export async function captureTetrioGame(cdp, perf, options = {}) {
       }
     }
 
-    const deadline = Date.now() + PROBE_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-      const outcome = await Promise.race([
-        cdp.waitForEvent(
-          "Debugger.paused",
-          () => true,
-          Math.max(50, deadline - Date.now())
-        )
-          .then((event) => ({ kind: "paused", event }))
-          .catch(() => ({ kind: "timeout" })),
-        cancelPromise
-      ]);
+    const outcome = await Promise.race([
+      cdp.waitForEvent(
+        "Debugger.paused",
+        () => true,
+        PROBE_TIMEOUT_MS
+      )
+        .then((event) => ({ kind: "paused", event }))
+        .catch(() => ({ kind: "timeout" })),
+      cancelPromise
+    ]);
 
-      if (outcome?.cancelled) {
-        return {
-          ok: false,
-          reason: outcome.reason,
-          breakpoints: attachedBreakpointLabels,
-          aiFramesChecked: totalAiFramesChecked,
-          scopeObjectsChecked: totalScopeObjectsChecked,
-          callFramesChecked: totalCallFramesChecked
-        };
-      }
-      if (outcome?.kind !== "paused") {
-        break;
-      }
-      const event = outcome.event;
-
-      paused = true;
-      console.log(`[browser] callframes=${event?.callFrames?.length ?? 0}`);
-      const exposed = await exposeTetrioGameFromPausedCallFrames(cdp, event);
-      totalAiFramesChecked += exposed.aiFramesChecked ?? 0;
-      totalScopeObjectsChecked += exposed.scopeObjectsChecked ?? 0;
-      totalCallFramesChecked += exposed.callFramesChecked ?? 0;
-      console.log(`[browser] direct Ai evaluation frames_checked=${exposed.aiFramesChecked ?? 0}`);
-      await cdp.send("Debugger.resume").catch(() => undefined);
-      paused = false;
-      if (exposed.ok) {
-        return {
-          ...exposed,
-          aiFramesChecked: totalAiFramesChecked,
-          scopeObjectsChecked: totalScopeObjectsChecked,
-          callFramesChecked: totalCallFramesChecked,
-          breakpoints: attachedBreakpointLabels
-        };
-      }
+    if (outcome?.cancelled) {
+      return {
+        ok: false,
+        reason: outcome.reason,
+        breakpoints: attachedBreakpointLabels,
+        framesChecked: 0,
+        pausedMs: 0
+      };
+    }
+    if (outcome?.kind !== "paused") {
+      return {
+        ok: false,
+        reason: "Ai not visible",
+        breakpoints: attachedBreakpointLabels,
+        framesChecked: 0,
+        pausedMs: 0
+      };
     }
 
+    const event = outcome.event;
+    let exposed = { ok: false, reason: "Ai not visible", aiFramesChecked: 0, callFramesChecked: 0 };
+    let pausedMs = 0;
+    paused = true;
+    console.log("[browser] closure probe paused");
+    const pausedStartedAt = Date.now();
+    try {
+      exposed = await exposeTetrioGameFromPausedCallFrames(cdp, event, {
+        perFrameTimeoutMs: options.perFrameTimeoutMs ?? AI_FRAME_EVAL_TIMEOUT_MS,
+        totalTimeoutMs: options.totalTimeoutMs ?? PAUSED_EVAL_TIMEOUT_MS,
+        cancelPromise
+      });
+    } finally {
+      await cdp.send("Debugger.resume").catch(() => undefined);
+      paused = false;
+      pausedMs = Date.now() - pausedStartedAt;
+      await removeBreakpoints();
+    }
+
+    if (exposed.ok) {
+      console.log("[browser] debugger resumed");
+      console.log(
+        `[browser] ai frames_checked=${exposed.aiFramesChecked ?? 0} elapsed_paused_ms=${pausedMs}`
+      );
+      return {
+        ...exposed,
+        breakpoints: attachedBreakpointLabels,
+        framesChecked: exposed.aiFramesChecked ?? 0,
+        pausedMs
+      };
+    }
+
+    console.log(
+      `[browser] closure probe failed frames_checked=${exposed.aiFramesChecked ?? 0} paused_ms=${pausedMs}`
+    );
+    console.log("[browser] debugger resumed after failure");
     return {
       ok: false,
-      reason: "Ai not visible",
+      reason: exposed.reason ?? "Ai not visible",
       breakpoints: attachedBreakpointLabels,
-      aiFramesChecked: totalAiFramesChecked,
-      scopeObjectsChecked: totalScopeObjectsChecked,
-      callFramesChecked: totalCallFramesChecked
+      framesChecked: exposed.aiFramesChecked ?? 0,
+      pausedMs
     };
   } finally {
     const elapsedMs = Date.now() - startedAt;
@@ -1486,9 +1516,7 @@ export async function captureTetrioGame(cdp, perf, options = {}) {
     if (paused) {
       await cdp.send("Debugger.resume").catch(() => undefined);
     }
-    for (const breakpointId of breakpointIds) {
-      await cdp.send("Debugger.removeBreakpoint", { breakpointId }).catch(() => undefined);
-    }
+    await removeBreakpoints();
     await cdp.send("Runtime.releaseObjectGroup", {
       objectGroup: "fusion-tetrio-probe"
     }).catch(() => undefined);
@@ -1496,6 +1524,7 @@ export async function captureTetrioGame(cdp, perf, options = {}) {
     for (const off of removeListeners.splice(0)) {
       off();
     }
+    closureProbeInFlight = false;
   }
 }
 
@@ -1520,29 +1549,57 @@ function isMissingExecutionContextError(error) {
   );
 }
 
-export async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent) {
+function withHardTimeout(promise, timeoutMs, onTimeout) {
+  if (!(timeoutMs > 0)) {
+    return promise;
+  }
+  let timer = null;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(onTimeout()), timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
+}
+
+export async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent, options = {}) {
   let aiFramesChecked = 0;
-  let scopeObjectsChecked = 0;
   let callFramesChecked = 0;
+  const perFrameTimeoutMs = Math.max(1, Number(options.perFrameTimeoutMs ?? AI_FRAME_EVAL_TIMEOUT_MS));
+  const totalTimeoutMs = Math.max(perFrameTimeoutMs, Number(options.totalTimeoutMs ?? PAUSED_EVAL_TIMEOUT_MS));
+  const deadline = Date.now() + totalTimeoutMs;
+  const cancelPromise = options.cancelPromise;
   for (const callFrame of pausedEvent.callFrames ?? []) {
+    if (Date.now() >= deadline) {
+      break;
+    }
     callFramesChecked += 1;
-    const aiCapture = await exposeTetrioGameFromAiCallFrame(cdp, callFrame);
+    const aiCapturePromise = withHardTimeout(
+      exposeTetrioGameFromAiCallFrame(cdp, callFrame),
+      Math.max(1, Math.min(perFrameTimeoutMs, deadline - Date.now())),
+      () => ({ ok: false, reason: "Ai evaluation timed out" })
+    );
+    const aiCapture = cancelPromise
+      ? await Promise.race([
+        aiCapturePromise,
+        cancelPromise
+      ])
+      : await aiCapturePromise;
+    if (aiCapture?.cancelled) {
+      return {
+        ok: false,
+        reason: aiCapture.reason,
+        aiFramesChecked,
+        callFramesChecked
+      };
+    }
     aiFramesChecked += 1;
     if (aiCapture.ok) {
       return {
         ...aiCapture,
         aiFramesChecked,
-        scopeObjectsChecked,
-        callFramesChecked
-      };
-    }
-    const scopeCapture = await exposeTetrioGameFromScopeChain(cdp, callFrame);
-    scopeObjectsChecked += scopeCapture.scopeObjectsChecked ?? 0;
-    if (scopeCapture.ok) {
-      return {
-        ...scopeCapture,
-        aiFramesChecked,
-        scopeObjectsChecked,
         callFramesChecked
       };
     }
@@ -1551,7 +1608,6 @@ export async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent) {
     ok: false,
     reason: "Ai not visible",
     aiFramesChecked,
-    scopeObjectsChecked,
     callFramesChecked
   };
 }
