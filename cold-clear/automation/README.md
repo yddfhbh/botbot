@@ -60,8 +60,10 @@ Running without arguments opens the launcher window. From there you can:
 
 - choose `2P Left 1080p`, `Solo 1080p`, or `Custom`
 - use the split Browser/Bot launcher
-- edit Browser CDP connection fields such as Chrome path, port, URL, target hint, and ribbon/seed fallbacks
-- edit dry-run, target PPS, timings, movement mode, and spawn rule
+- edit Browser CDP connection fields such as Chrome path, port, URL, and target hint
+- keep the Bot UI focused on `Play Style`, `PPS`, and `Bot ON` / `Bot OFF`
+- switch `Play Style` between `노말` and `속도 지향`
+- use the `Unlimited` checkbox instead of typing `0` for uncapped PPS
 - click `Open Chromium` to prewarm the snapshot and input CDP helpers, then log into TETR.IO and prepare the solo/custom room yourself
 - click `Bot ON` to attach the existing Browser CDP helper without launching a second Chromium
 - click `Bot OFF` to stop automation immediately while keeping Chromium open
@@ -77,12 +79,13 @@ The built-in live presets now apply a `TETR.IO Safe preset` aimed at personal so
 - `URL`: `https://tetr.io/`
 - `CDP Port`: `9222`
 - `Target`: `TETR.IO`
+- `Play Style`: `노말`
 - `Movement`: `ZeroG Safe` by default
 - `Spawn`: `Row 19 or 20`
 - `Planner threads`: auto-detect up to `4`
 - `Planner min nodes`: `4000`
 - `Legacy Tap`: `60ms`
-- `Target PPS`: `0.0` (`0 = unlimited`)
+- `PPS`: `Unlimited` by default in the launcher (`target_pps = 0.0` at runtime)
 - `Move Tap`: `40ms`
 - `Rotate Tap`: `45ms`
 - `HardDrop Tap`: `55ms`
@@ -110,7 +113,7 @@ when the logged input route is something the real client can actually reproduce.
 These defaults are tuned to match longer real TETR.IO tap windows instead of the old `18ms` single-tap
 profile:
 
-- `Target PPS`: `0.0` by default (`0 = unlimited`)
+- `PPS`: `Unlimited` by default (`target_pps = 0.0` internally)
 - `Movement Tap`: `40ms`
 - `Rotate Tap`: `45ms`
 - `HardDrop Tap`: `55ms`
@@ -130,6 +133,14 @@ dedicated press lengths. The launcher keeps `Legacy Tap` as a fallback, but the 
 the action-specific tap fields and the separate inter-action delay preset. `Target PPS` acts as a
 piece-rate limiter on top of those timings: when set above `0`, the runner waits before hard drop so
 the total placement rate does not exceed the requested PPS.
+
+## Play Style
+
+- `노말`: preserves the current default evaluation weights, route ordering, spin handling, and low-level planner/handling configuration
+- `속도 지향`: keeps the same low-level timings but uses a speed-biased evaluation profile plus a route selector that prefers non-spin, low-input, low-softdrop placements and only falls back to spin routes when no non-spin route exists
+
+Changing `Play Style` in the launcher only applies transient runtime overrides. The hidden low-level
+fields still stay in the saved config / launcher state for compatibility and CLI use.
 
 ## If inputs still feel unstable
 

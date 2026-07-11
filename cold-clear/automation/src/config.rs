@@ -11,6 +11,9 @@ pub struct AutomationConfig {
     pub dry_run: bool,
     pub poll_interval_ms: u64,
     pub target_pps: f32,
+    pub play_style: PlayStyleConfig,
+    pub evaluation_profile: EvaluationProfileConfig,
+    pub route_profile: RouteProfileConfig,
     pub tap_duration_ms: u64,
     pub movement_tap_duration_ms: u64,
     pub rotate_tap_duration_ms: u64,
@@ -38,6 +41,9 @@ impl Default for AutomationConfig {
             dry_run: true,
             poll_interval_ms: 4,
             target_pps: 0.0,
+            play_style: PlayStyleConfig::Normal,
+            evaluation_profile: EvaluationProfileConfig::Normal,
+            route_profile: RouteProfileConfig::Normal,
             tap_duration_ms: 60,
             movement_tap_duration_ms: 16,
             rotate_tap_duration_ms: 18,
@@ -111,6 +117,72 @@ impl Default for BrowserCdpConfig {
             use_ribbon_websocket: true,
             use_seed_simulation_fallback: true,
             bootstrap_timeout_ms: 500,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayStyleConfig {
+    Normal,
+    Speed,
+}
+
+impl Default for PlayStyleConfig {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl PlayStyleConfig {
+    pub fn log_label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Speed => "speed",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationProfileConfig {
+    Normal,
+    Speed,
+}
+
+impl Default for EvaluationProfileConfig {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl EvaluationProfileConfig {
+    pub fn log_label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Speed => "speed",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteProfileConfig {
+    Normal,
+    Speed,
+}
+
+impl Default for RouteProfileConfig {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl RouteProfileConfig {
+    pub fn log_label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Speed => "speed",
         }
     }
 }

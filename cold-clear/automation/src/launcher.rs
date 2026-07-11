@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -12,16 +12,52 @@ use serde::{Deserialize, Serialize};
 
 use crate::browser_source::{ChromiumHostProcess, ProviderProcess, SharedLogger};
 use crate::config::{
-    AutomationConfig, BotConfig, BrowserCdpConfig, BufferModeConfig, HandlingConfig,
-    InputBackendConfig, KeyBindings, MovementModeConfig, ScannerSourceConfig,
-    SnapshotProviderConfig, SoftDropModeConfig, SpawnRuleConfig,
+    AutomationConfig, BotConfig, BrowserCdpConfig, BufferModeConfig, EvaluationProfileConfig,
+    HandlingConfig, InputBackendConfig, KeyBindings, MovementModeConfig, PlayStyleConfig,
+    RouteProfileConfig, ScannerSourceConfig, SnapshotProviderConfig, SoftDropModeConfig,
+    SpawnRuleConfig,
 };
 use crate::driver::{
     BrowserCdpInputBackend, DebugLogBackend, InputBackend, SharedBrowserCdpInputBackend,
 };
 use crate::paths::AppPaths;
-use crate::runtime::run_automation_with_resources;
+use crate::runtime::run_automation_with_resources_and_live_pps;
 use crate::scanner::{read_snapshot_file, JsonFileScanner};
+
+const BOT_UI_VISIBLE_LABELS: &[&str] = &[
+    "Play Style",
+    "PPS",
+    "Unlimited",
+    "Status",
+    "Bot ON",
+    "Bot OFF",
+];
+const BOT_UI_HIDDEN_LABELS: &[&str] = &[
+    "Dry run",
+    "Use hold",
+    "Speculate",
+    "Allow spin routes",
+    "Allow post-softdrop horizontal",
+    "Release after each action",
+    "Settle",
+    "Poll",
+    "Move Tap",
+    "Rotate Tap",
+    "Hold Tap",
+    "HardDrop Tap",
+    "SoftDrop Tap",
+    "Move Delay",
+    "Rotate Delay",
+    "HardDrop Delay",
+    "Piece Delay",
+    "Min age",
+    "Movement",
+    "Spawn",
+    "Threads",
+    "Min Nodes",
+    "Max Nodes",
+    "Planner",
+];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ModePreset {
@@ -129,7 +165,9 @@ struct LauncherState {
     browser: BrowserCdpConfig,
     always_on_top: bool,
     dry_run: bool,
+    play_style: PlayStyleConfig,
     poll_interval_ms: u64,
+    pps_unlimited: bool,
     target_pps: f32,
     tap_duration_ms: u64,
     movement_tap_duration_ms: u64,
@@ -159,8 +197,10 @@ impl Default for LauncherState {
             browser: BrowserCdpConfig::default(),
             always_on_top: false,
             dry_run: true,
+            play_style: PlayStyleConfig::Normal,
             poll_interval_ms: 4,
-            target_pps: 0.0,
+            pps_unlimited: true,
+            target_pps: 3.0,
             tap_duration_ms: 60,
             movement_tap_duration_ms: 16,
             rotate_tap_duration_ms: 18,
@@ -204,7 +244,8 @@ pub fn launcher_viewport(paths: &AppPaths) -> egui::ViewportBuilder {
 
 impl LauncherState {
     fn apply_tetrio_safe_preset(&mut self) {
-        self.target_pps = 0.0;
+        self.pps_unlimited = true;
+        self.target_pps = 3.0;
         self.tap_duration_ms = 60;
         self.poll_interval_ms = 4;
         self.movement_tap_duration_ms = 16;
@@ -236,6 +277,7 @@ impl LauncherState {
         self.handling.prefer_soft_drop_over_movement = false;
         self.handling.irs_mode = BufferModeConfig::Off;
         self.handling.ihs_mode = BufferModeConfig::Off;
+        self.normalize_pps_state();
     }
 
     fn apply_preset(&mut self) {
@@ -267,10 +309,11 @@ impl LauncherState {
         if self.preset != ModePreset::Custom && self.matches_known_legacy_safe_preset() {
             self.apply_tetrio_safe_preset();
         }
+        self.normalize_pps_state();
     }
 
     fn matches_known_legacy_safe_preset(&self) -> bool {
-        self.target_pps == 0.0
+        self.effective_target_pps() == 0.0
             && (self.matches_first_safe_preset_family()
                 || self.matches_second_safe_preset_family()
                 || self.matches_third_safe_preset_family())
@@ -323,12 +366,15 @@ impl LauncherState {
     }
 
     fn to_automation_config(&self, paths: &AppPaths) -> AutomationConfig {
-        AutomationConfig {
+        let mut config = AutomationConfig {
             snapshot_provider: SnapshotProviderConfig::BrowserCdp,
             snapshot_path: paths.resolve_workspace_path(&self.snapshot_path),
             dry_run: self.dry_run,
             poll_interval_ms: self.poll_interval_ms,
-            target_pps: self.target_pps,
+            target_pps: self.effective_target_pps(),
+            play_style: self.play_style,
+            evaluation_profile: EvaluationProfileConfig::Normal,
+            route_profile: RouteProfileConfig::Normal,
             tap_duration_ms: self.tap_duration_ms,
             movement_tap_duration_ms: self.movement_tap_duration_ms,
             rotate_tap_duration_ms: self.rotate_tap_duration_ms,
@@ -349,13 +395,33 @@ impl LauncherState {
             bot: self.bot.clone(),
             handling: self.handling.clone(),
             keys: self.keys.clone(),
+        };
+        if self.play_style == PlayStyleConfig::Speed {
+            config.evaluation_profile = EvaluationProfileConfig::Speed;
+            config.route_profile = RouteProfileConfig::Speed;
         }
+        config
     }
 
     fn to_bot_automation_config(&self, paths: &AppPaths) -> AutomationConfig {
         let mut config = self.to_automation_config(paths);
         config.browser.connect_only = true;
         config
+    }
+
+    fn normalize_pps_state(&mut self) {
+        if !self.target_pps.is_finite() || self.target_pps < 0.25 {
+            self.target_pps = 3.0;
+        }
+        self.target_pps = self.target_pps.clamp(0.25, 20.0);
+    }
+
+    fn effective_target_pps(&self) -> f32 {
+        if self.pps_unlimited {
+            0.0
+        } else {
+            self.target_pps
+        }
     }
 }
 
@@ -376,6 +442,7 @@ struct BrowserSession {
 
 struct BotSession {
     stop: Arc<AtomicBool>,
+    live_target_pps: Arc<AtomicU32>,
     automation_thread: Option<JoinHandle<()>>,
 }
 
@@ -480,6 +547,19 @@ impl LauncherApp {
                 "[launcher] saved settings to {}",
                 self.paths
                     .display_workspace_relative(&self.paths.launcher_state_path)
+            ));
+        }
+    }
+
+    fn update_live_target_pps(&mut self) {
+        let effective_target_pps = self.state.effective_target_pps();
+        if let Some(bot_session) = self.bot_session.as_ref() {
+            bot_session
+                .live_target_pps
+                .store(effective_target_pps.to_bits(), Ordering::Relaxed);
+            self.push_log(format!(
+                "[bot] target PPS changed {}",
+                format_target_pps_label(effective_target_pps)
             ));
         }
     }
@@ -607,6 +687,19 @@ impl LauncherApp {
         }
 
         let config = self.state.to_bot_automation_config(&self.paths);
+        self.push_log(format!(
+            "[bot] style={} target_pps={}",
+            config.play_style.log_label(),
+            format_target_pps_label(config.target_pps)
+        ));
+        self.push_log(format!(
+            "[bot] evaluation_profile={} route_profile={}",
+            config.evaluation_profile.log_label(),
+            config.route_profile.log_label()
+        ));
+        if config.play_style == PlayStyleConfig::Speed {
+            self.push_log("[bot] speed priorities=non_spin,short_input,no_softdrop");
+        }
         let scanner = JsonFileScanner::with_last_token(
             config.snapshot_path.clone(),
             Duration::from_millis(config.min_snapshot_age_ms),
@@ -620,16 +713,19 @@ impl LauncherApp {
         };
 
         let stop = Arc::new(AtomicBool::new(false));
+        let live_target_pps = Arc::new(AtomicU32::new(config.target_pps.to_bits()));
         let worker_stop = stop.clone();
+        let worker_target_pps = live_target_pps.clone();
         let tx = self.event_tx.clone();
         let last_used_token = last_used_token_handle;
         let automation_thread = thread::spawn(move || {
             let log_tx = tx.clone();
-            let result = run_automation_with_resources(
+            let result = run_automation_with_resources_and_live_pps(
                 config,
                 scanner,
                 input_backend,
                 &worker_stop,
+                worker_target_pps,
                 move |line| {
                     if let Some(token) = extract_planned_token(&line) {
                         if let Ok(mut guard) = last_used_token.lock() {
@@ -645,6 +741,7 @@ impl LauncherApp {
 
         self.bot_session = Some(BotSession {
             stop,
+            live_target_pps,
             automation_thread: Some(automation_thread),
         });
         self.bot_status = BotStatus::On;
@@ -962,15 +1059,6 @@ impl eframe::App for LauncherApp {
                 });
             });
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.state.browser.probe_page_state, "Probe page state");
-                ui.checkbox(
-                    &mut self.state.browser.use_ribbon_websocket,
-                    "Use ribbon websocket",
-                );
-                ui.checkbox(
-                    &mut self.state.browser.use_seed_simulation_fallback,
-                    "Use seed simulation fallback",
-                );
                 ui.checkbox(&mut self.state.always_on_top, "Always on top");
             });
 
@@ -1006,137 +1094,61 @@ impl eframe::App for LauncherApp {
             ui.separator();
             ui.heading("Bot");
             if bot_locked {
-                ui.small("Runtime settings are locked while the bot is on.");
+                ui.small("플레이 스타일은 다음 Bot ON부터 적용됩니다.");
             }
-            ui.add_enabled_ui(!bot_locked, |ui| {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.state.dry_run, "Dry run");
-                    ui.checkbox(&mut self.state.bot.use_hold, "Use hold");
-                    ui.checkbox(&mut self.state.bot.speculate, "Speculate");
-                    ui.checkbox(
-                        &mut self.state.handling.allow_post_softdrop_actions,
-                        "Allow spin routes",
-                    );
-                    ui.checkbox(
-                        &mut self.state.handling.allow_post_softdrop_horizontal,
-                        "Allow post-softdrop horizontal",
-                    );
-                    ui.label("Input");
-                    ui.monospace("Browser CDP");
-                });
-                ui.horizontal(|ui| {
-                    ui.checkbox(
-                        &mut self.state.handling.release_after_each_action,
-                        "Release after each action",
-                    );
-                    ui.label("Settle");
-                    ui.add(
-                        egui::DragValue::new(&mut self.state.handling.action_settle_ms).speed(1),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Poll");
-                    ui.add(egui::DragValue::new(&mut self.state.poll_interval_ms).speed(1));
-                    ui.label("Target PPS");
-                    ui.add(
-                        egui::DragValue::new(&mut self.state.target_pps)
-                            .speed(0.05)
-                            .range(0.0..=20.0),
-                    );
-                    ui.small("0 = unlimited");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Move Tap");
-                    ui.add(
-                        egui::DragValue::new(&mut self.state.movement_tap_duration_ms).speed(1),
-                    );
-                    ui.label("Rotate Tap");
-                    ui.add(
-                        egui::DragValue::new(&mut self.state.rotate_tap_duration_ms).speed(1),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("HardDrop Tap");
-                    ui.add(
-                        egui::DragValue::new(&mut self.state.hard_drop_tap_duration_ms).speed(1),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Move Delay");
-                    ui.add(egui::DragValue::new(&mut self.state.movement_interval_ms).speed(1));
-                    ui.label("Rotate Delay");
-                    ui.add(egui::DragValue::new(&mut self.state.rotation_interval_ms).speed(1));
-                    ui.label("HardDrop Delay");
-                    ui.add(egui::DragValue::new(&mut self.state.hard_drop_interval_ms).speed(1));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Piece Delay");
-                    ui.add(egui::DragValue::new(&mut self.state.piece_interval_ms).speed(1));
-                    ui.label("Min age");
-                    ui.add(egui::DragValue::new(&mut self.state.min_snapshot_age_ms).speed(1));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Movement");
-                    egui::ComboBox::from_id_salt("movement_mode")
-                        .selected_text(movement_mode_label(self.state.bot.movement_mode))
+            ui.horizontal(|ui| {
+                ui.label(BOT_UI_VISIBLE_LABELS[0]);
+                ui.add_enabled_ui(!bot_locked, |ui| {
+                    egui::ComboBox::from_id_salt("play_style")
+                        .selected_text(play_style_label(self.state.play_style))
                         .show_ui(ui, |ui| {
-                            for mode in [
-                                MovementModeConfig::HardDropOnly,
-                                MovementModeConfig::ZeroGSafe,
-                                MovementModeConfig::ZeroG,
-                                MovementModeConfig::ZeroGComplete,
-                                MovementModeConfig::TwentyG,
-                            ] {
-                                ui.selectable_value(
-                                    &mut self.state.bot.movement_mode,
-                                    mode,
-                                    movement_mode_label(mode),
-                                );
-                            }
+                            ui.selectable_value(
+                                &mut self.state.play_style,
+                                PlayStyleConfig::Normal,
+                                play_style_label(PlayStyleConfig::Normal),
+                            );
+                            ui.selectable_value(
+                                &mut self.state.play_style,
+                                PlayStyleConfig::Speed,
+                                play_style_label(PlayStyleConfig::Speed),
+                            );
                         });
-                    ui.label("Spawn");
-                    egui::ComboBox::from_id_salt("spawn_rule")
-                        .selected_text(spawn_rule_label(self.state.bot.spawn_rule))
-                        .show_ui(ui, |ui| {
-                            for rule in [SpawnRuleConfig::Row19Or20, SpawnRuleConfig::Row21AndFall]
-                            {
-                                ui.selectable_value(
-                                    &mut self.state.bot.spawn_rule,
-                                    rule,
-                                    spawn_rule_label(rule),
-                                );
-                            }
-                        });
-                    ui.label("Planner");
-                    ui.monospace("Safe spawn tap route");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Threads");
-                    ui.add(egui::DragValue::new(&mut self.state.bot.threads).range(1..=8).speed(1));
-                    ui.label("Min Nodes");
-                    ui.add(
-                        egui::DragValue::new(&mut self.state.bot.min_nodes)
-                            .range(50..=50_000)
-                            .speed(50),
-                    );
-                    ui.label("Max Nodes");
-                    ui.add(
-                        egui::DragValue::new(&mut self.state.bot.max_nodes)
-                            .range(100..=500_000)
-                            .speed(100),
-                    );
                 });
             });
+            ui.small(play_style_description(self.state.play_style));
+
+            let previous_target_pps = self.state.target_pps;
+            let previous_pps_unlimited = self.state.pps_unlimited;
             ui.horizontal(|ui| {
-                ui.label(format!("Status: {}", self.bot_status.label()));
+                ui.label(BOT_UI_VISIBLE_LABELS[1]).on_hover_text(
+                    "PPS는 초당 배치할 미노 수의 최대값입니다.\n실제 속도는 계산 및 입력 경로에 따라 더 낮을 수 있습니다.",
+                );
+                ui.add_enabled_ui(!self.state.pps_unlimited, |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.state.target_pps)
+                            .speed(0.1)
+                            .range(0.25..=20.0)
+                            .fixed_decimals(2),
+                    );
+                });
+                ui.checkbox(&mut self.state.pps_unlimited, BOT_UI_VISIBLE_LABELS[2]);
+            });
+            self.state.normalize_pps_state();
+            if previous_target_pps != self.state.target_pps
+                || previous_pps_unlimited != self.state.pps_unlimited
+            {
+                self.update_live_target_pps();
+            }
+            ui.horizontal(|ui| {
+                ui.label(format!("{}: {}", BOT_UI_VISIBLE_LABELS[3], self.bot_status.label()));
                 if ui
-                    .add_enabled(can_turn_bot_on, egui::Button::new("Bot ON"))
+                    .add_enabled(can_turn_bot_on, egui::Button::new(BOT_UI_VISIBLE_LABELS[4]))
                     .clicked()
                 {
                     self.start_bot();
                 }
                 if ui
-                    .add_enabled(bot_locked, egui::Button::new("Bot OFF"))
+                    .add_enabled(bot_locked, egui::Button::new(BOT_UI_VISIBLE_LABELS[5]))
                     .clicked()
                 {
                     self.stop_bot();
@@ -1180,8 +1192,14 @@ fn load_launcher_state(paths: &AppPaths) -> Result<LauncherState> {
             paths.launcher_state_path.display()
         )
     })?;
-    let state: LauncherState =
+    let raw_json: serde_json::Value =
         serde_json::from_str(&raw).context("failed to parse launcher state JSON")?;
+    let mut state: LauncherState =
+        serde_json::from_value(raw_json.clone()).context("failed to decode launcher state")?;
+    if raw_json.get("pps_unlimited").is_none() {
+        state.pps_unlimited = state.target_pps <= 0.0;
+    }
+    state.normalize_pps_state();
     Ok(state)
 }
 
@@ -1204,6 +1222,28 @@ fn movement_mode_label(mode: MovementModeConfig) -> &'static str {
     }
 }
 
+fn play_style_label(style: PlayStyleConfig) -> &'static str {
+    match style {
+        PlayStyleConfig::Normal => "노말",
+        PlayStyleConfig::Speed => "속도 지향",
+    }
+}
+
+fn play_style_description(style: PlayStyleConfig) -> &'static str {
+    match style {
+        PlayStyleConfig::Normal => "현재 기본 설정으로 플레이합니다.",
+        PlayStyleConfig::Speed => "스핀과 복잡한 입력을 줄이고 빠른 배치를 우선합니다.",
+    }
+}
+
+fn format_target_pps_label(target_pps: f32) -> String {
+    if target_pps.is_finite() && target_pps > 0.0 {
+        format!("{target_pps:.2}")
+    } else {
+        "unlimited".to_owned()
+    }
+}
+
 fn spawn_rule_label(rule: SpawnRuleConfig) -> &'static str {
     match rule {
         SpawnRuleConfig::Row19Or20 => "Row 19 or 20",
@@ -1222,6 +1262,7 @@ fn extract_planned_token(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn built_in_preset_uses_safe_defaults() {
@@ -1231,7 +1272,9 @@ mod tests {
 
         assert_eq!(state.bot.movement_mode, MovementModeConfig::ZeroGSafe);
         assert_eq!(state.bot.spawn_rule, SpawnRuleConfig::Row19Or20);
-        assert_eq!(state.target_pps, 0.0);
+        assert!(state.pps_unlimited);
+        assert_eq!(state.effective_target_pps(), 0.0);
+        assert_eq!(state.target_pps, 3.0);
         assert_eq!(state.tap_duration_ms, 60);
         assert_eq!(state.poll_interval_ms, 4);
         assert_eq!(state.movement_tap_duration_ms, 16);
@@ -1260,6 +1303,8 @@ mod tests {
         assert!(readme.contains("Open Chromium"));
         assert!(readme.contains("Bot ON"));
         assert!(readme.contains("snapshot and input CDP helpers"));
+        assert!(readme.contains("Play Style"));
+        assert!(readme.contains("Unlimited"));
     }
 
     #[test]
@@ -1268,7 +1313,8 @@ mod tests {
             preset: ModePreset::Solo1080p,
             dry_run: false,
             poll_interval_ms: 4,
-            target_pps: 0.0,
+            pps_unlimited: true,
+            target_pps: 3.0,
             movement_tap_duration_ms: 25,
             rotate_tap_duration_ms: 28,
             hold_tap_duration_ms: 35,
@@ -1309,6 +1355,73 @@ mod tests {
         let state = LauncherState::default();
         let config = state.to_bot_automation_config(&paths);
         assert!(config.browser.connect_only);
+    }
+
+    #[test]
+    fn launcher_state_missing_play_style_defaults_to_normal() {
+        let state: LauncherState = serde_json::from_value(json!({
+            "preset": "Solo1080p"
+        }))
+        .unwrap();
+        assert_eq!(state.play_style, PlayStyleConfig::Normal);
+    }
+
+    #[test]
+    fn normal_style_preserves_base_profiles() {
+        let paths = AppPaths::discover();
+        let mut state = LauncherState::default();
+        state.play_style = PlayStyleConfig::Normal;
+        let config = state.to_automation_config(&paths);
+        assert_eq!(config.play_style, PlayStyleConfig::Normal);
+        assert_eq!(config.evaluation_profile, EvaluationProfileConfig::Normal);
+        assert_eq!(config.route_profile, RouteProfileConfig::Normal);
+        assert_eq!(config.bot.movement_mode, state.bot.movement_mode);
+        assert_eq!(config.bot.min_nodes, state.bot.min_nodes);
+    }
+
+    #[test]
+    fn speed_style_only_applies_transient_profiles() {
+        let paths = AppPaths::discover();
+        let mut state = LauncherState::default();
+        state.bot.movement_mode = MovementModeConfig::TwentyG;
+        state.bot.min_nodes = 1234;
+        state.play_style = PlayStyleConfig::Speed;
+
+        let config = state.to_automation_config(&paths);
+
+        assert_eq!(config.play_style, PlayStyleConfig::Speed);
+        assert_eq!(config.evaluation_profile, EvaluationProfileConfig::Speed);
+        assert_eq!(config.route_profile, RouteProfileConfig::Speed);
+        assert_eq!(config.bot.movement_mode, MovementModeConfig::TwentyG);
+        assert_eq!(config.bot.min_nodes, 1234);
+        assert_eq!(state.bot.movement_mode, MovementModeConfig::TwentyG);
+        assert_eq!(state.bot.min_nodes, 1234);
+    }
+
+    #[test]
+    fn pps_unlimited_migration_is_inferred_from_zero_target_pps() {
+        let raw = json!({
+            "preset": "Solo1080p",
+            "target_pps": 0.0
+        });
+        let mut state: LauncherState = serde_json::from_value(raw).unwrap();
+        state.pps_unlimited = state.target_pps <= 0.0;
+        state.normalize_pps_state();
+        assert!(state.pps_unlimited);
+        assert_eq!(state.target_pps, 3.0);
+        assert_eq!(state.effective_target_pps(), 0.0);
+    }
+
+    #[test]
+    fn bot_ui_hides_legacy_controls() {
+        assert!(BOT_UI_VISIBLE_LABELS.contains(&"Play Style"));
+        assert!(BOT_UI_VISIBLE_LABELS.contains(&"PPS"));
+        assert!(BOT_UI_VISIBLE_LABELS.contains(&"Bot ON"));
+        assert!(BOT_UI_VISIBLE_LABELS.contains(&"Bot OFF"));
+        assert!(!BOT_UI_VISIBLE_LABELS.contains(&"Dry run"));
+        assert!(BOT_UI_HIDDEN_LABELS.contains(&"Dry run"));
+        assert!(BOT_UI_HIDDEN_LABELS.contains(&"Movement"));
+        assert!(BOT_UI_HIDDEN_LABELS.contains(&"Threads"));
     }
 
     #[test]

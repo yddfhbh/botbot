@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::thread;
@@ -14,7 +15,8 @@ use libtetris::{
 };
 
 use crate::config::{
-    AutomationConfig, HandlingConfig, MovementModeConfig, SoftDropModeConfig, SpawnRuleConfig,
+    AutomationConfig, EvaluationProfileConfig, HandlingConfig, MovementModeConfig,
+    RouteProfileConfig, SoftDropModeConfig, SpawnRuleConfig,
 };
 use crate::driver::{
     execute_hard_drop_action, execute_plan_until_hard_drop, execute_single_action, ExecutionPlan,
@@ -31,7 +33,7 @@ pub fn run_loop<S: SnapshotScanner, D: InputBackend + ?Sized>(
     driver: &mut D,
 ) -> Result<()> {
     let stop = AtomicBool::new(false);
-    run_loop_until(config, scanner, driver, &stop, |line| {
+    run_loop_until_with_live_pps(config, scanner, driver, &stop, None, |line| {
         println!("{}", line);
     })
 }
@@ -41,6 +43,22 @@ pub fn run_loop_until<S, D, F>(
     scanner: &mut S,
     driver: &mut D,
     stop: &AtomicBool,
+    log: F,
+) -> Result<()>
+where
+    S: SnapshotScanner,
+    D: InputBackend + ?Sized,
+    F: FnMut(String),
+{
+    run_loop_until_with_live_pps(config, scanner, driver, stop, None, log)
+}
+
+pub fn run_loop_until_with_live_pps<S, D, F>(
+    config: &AutomationConfig,
+    scanner: &mut S,
+    driver: &mut D,
+    stop: &AtomicBool,
+    live_target_pps: Option<&AtomicU32>,
     mut log: F,
 ) -> Result<()>
 where
@@ -50,7 +68,6 @@ where
 {
     let poll_delay = Duration::from_millis(config.poll_interval_ms);
     let piece_interval = Duration::from_millis(config.piece_interval_ms);
-    let target_piece_time = target_pps_interval(config.target_pps);
     let mut last_piece_counter = None;
     let mut last_hard_drop_started_at = None;
     let execution_timings = ExecutionTimings {
@@ -115,9 +132,8 @@ where
                             )? {
                                 HardDropDecision::Proceed => {
                                     if !wait_for_target_pps(
-                                        target_piece_time,
                                         last_hard_drop_started_at,
-                                        config.target_pps,
+                                        current_target_pps(config, live_target_pps),
                                         stop,
                                         &mut log,
                                     ) {
@@ -385,6 +401,12 @@ fn target_pps_interval(target_pps: f32) -> Option<Duration> {
     Some(Duration::from_secs_f64(1.0 / f64::from(target_pps)))
 }
 
+fn current_target_pps(config: &AutomationConfig, live_target_pps: Option<&AtomicU32>) -> f32 {
+    live_target_pps
+        .map(|value| f32::from_bits(value.load(AtomicOrdering::Relaxed)))
+        .unwrap_or(config.target_pps)
+}
+
 fn pps_wait_duration(target_piece_time: Option<Duration>, elapsed: Duration) -> Option<Duration> {
     let target_piece_time = target_piece_time?;
     let wait = target_piece_time.checked_sub(elapsed)?;
@@ -396,7 +418,6 @@ fn pps_wait_duration(target_piece_time: Option<Duration>, elapsed: Duration) -> 
 }
 
 fn wait_for_target_pps<F>(
-    target_piece_time: Option<Duration>,
     last_hard_drop_started_at: Option<Instant>,
     target_pps: f32,
     stop: &AtomicBool,
@@ -405,7 +426,7 @@ fn wait_for_target_pps<F>(
 where
     F: FnMut(String),
 {
-    let Some(target_piece_time) = target_piece_time else {
+    let Some(target_piece_time) = target_pps_interval(target_pps) else {
         return true;
     };
     let Some(last_hard_drop_started_at) = last_hard_drop_started_at else {
@@ -473,6 +494,13 @@ struct RouteSelection {
     candidate_count: usize,
     rejected_count: usize,
     representative_reject_reason: Option<String>,
+    estimated_input_cost: usize,
+    rotation_count: usize,
+    direction_changes: usize,
+    action_count: usize,
+    soft_drop_count: usize,
+    is_spin_route: bool,
+    used_spin_fallback: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -501,11 +529,28 @@ struct RouteScore {
     soft_drop_penalty: usize,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct SpeedRouteScore {
+    soft_drop_penalty: usize,
+    post_softdrop_penalty: usize,
+    estimated_input_cost: usize,
+    rotation_count: usize,
+    direction_changes: usize,
+    action_count: usize,
+}
+
 #[derive(Clone, Debug)]
 struct CandidateRoute {
     score: RouteScore,
+    speed_score: SpeedRouteScore,
     route_kind: &'static str,
     movement_actions: Vec<GameAction>,
+    rotation_count: usize,
+    direction_changes: usize,
+    action_count: usize,
+    soft_drop_count: usize,
+    estimated_input_cost: usize,
+    is_spin_route: bool,
 }
 
 fn prepare_execution<F>(
@@ -695,6 +740,30 @@ fn emit_move_logs<F>(
             .as_deref()
             .unwrap_or("none")
     ));
+    if config.route_profile == RouteProfileConfig::Speed {
+        if prepared.route_selection.used_spin_fallback {
+            log(format!(
+                "[style] speed spin fallback reason=no_non_spin_route input_cost={}",
+                prepared.route_selection.estimated_input_cost
+            ));
+        } else {
+            log(format!(
+                "[style] speed route={} inputs={} rotations={} softdrops={} spin={} estimated_cost={} direction_changes={} actions={}",
+                if prepared.route_selection.is_spin_route {
+                    "spin"
+                } else {
+                    "non_spin"
+                },
+                prepared.route_selection.action_count,
+                prepared.route_selection.rotation_count,
+                prepared.route_selection.soft_drop_count,
+                prepared.route_selection.is_spin_route,
+                prepared.route_selection.estimated_input_cost,
+                prepared.route_selection.direction_changes,
+                prepared.route_selection.action_count
+            ));
+        }
+    }
 }
 
 fn route_actions_with_hard_drop(plan: &ExecutionPlan) -> Vec<GameAction> {
@@ -783,7 +852,7 @@ fn plan_move_for_mode(
             max_nodes: config.bot.max_nodes,
             threads: config.bot.threads,
         },
-        Standard::default(),
+        evaluation_weights_for_profile(config.evaluation_profile),
         Option::<Arc<cold_clear::Book>>::None,
     );
     interface.suggest_next_move(snapshot.incoming);
@@ -801,6 +870,24 @@ fn format_planner_info(info: &Info) -> String {
             "normal nodes={} depth={} rank={}",
             details.nodes, details.depth, details.original_rank
         ),
+    }
+}
+
+fn evaluation_weights_for_profile(profile: EvaluationProfileConfig) -> Standard {
+    match profile {
+        EvaluationProfileConfig::Normal => Standard::default(),
+        EvaluationProfileConfig::Speed => {
+            let mut weights = Standard::default();
+            weights.tslot = [0, 0, 0, 0];
+            weights.tspin1 = weights.clear1;
+            weights.tspin2 = weights.clear2;
+            weights.tspin3 = weights.clear3;
+            weights.mini_tspin1 = weights.clear1;
+            weights.mini_tspin2 = weights.clear2;
+            weights.wasted_t = 0;
+            weights.move_time = -12;
+            weights
+        }
     }
 }
 
@@ -835,6 +922,7 @@ fn build_execution_plan(
             spawned,
             planned_move.expected_location,
             movement_mode_for_routes(movement_mode),
+            config.route_profile,
             &config.handling,
         )
     }
@@ -904,6 +992,13 @@ fn safe_spawn_tap_route(
 
     Ok(RouteSelection {
         route_kind: "SpawnTapCountSafe",
+        estimated_input_cost: estimate_game_action_cost(&movement_actions),
+        rotation_count: count_game_action_rotations(&movement_actions),
+        direction_changes: count_game_action_direction_changes(&movement_actions),
+        action_count: movement_actions.len(),
+        soft_drop_count: 0,
+        is_spin_route: false,
+        used_spin_fallback: false,
         movement_actions,
         candidate_count: 1,
         rejected_count: 0,
@@ -1038,6 +1133,7 @@ fn placement_actions_for_target(
     spawned: FallingPiece,
     target: FallingPiece,
     movement_mode: MovementMode,
+    route_profile: RouteProfileConfig,
     handling: &HandlingConfig,
 ) -> std::result::Result<RouteSelection, RouteSelectionFailure> {
     let placements: Vec<Placement> = find_moves(board, spawned, movement_mode)
@@ -1085,14 +1181,31 @@ fn placement_actions_for_target(
         });
     }
 
-    candidates.sort_by(|left, right| compare_route_candidates(left, right));
-    let chosen = candidates.remove(0);
+    let chosen = select_route_candidate(route_profile, candidates);
+    let CandidateRoute {
+        route_kind,
+        movement_actions,
+        rotation_count,
+        direction_changes,
+        action_count,
+        soft_drop_count,
+        estimated_input_cost,
+        is_spin_route,
+        ..
+    } = chosen;
     Ok(RouteSelection {
-        route_kind: chosen.route_kind,
-        movement_actions: chosen.movement_actions,
+        route_kind,
+        movement_actions,
         candidate_count: placements.len(),
         rejected_count: rejected_reasons.len(),
         representative_reject_reason: summarize_reject_reasons(&rejected_reasons),
+        estimated_input_cost,
+        rotation_count,
+        direction_changes,
+        action_count,
+        soft_drop_count,
+        is_spin_route,
+        used_spin_fallback: route_profile == RouteProfileConfig::Speed && is_spin_route,
     })
 }
 
@@ -1102,6 +1215,39 @@ fn compare_route_candidates(left: &CandidateRoute, right: &CandidateRoute) -> Or
             .len()
             .cmp(&right.movement_actions.len())
     })
+}
+
+fn compare_speed_route_candidates(left: &CandidateRoute, right: &CandidateRoute) -> Ordering {
+    left.speed_score.cmp(&right.speed_score).then_with(|| {
+        left.movement_actions
+            .len()
+            .cmp(&right.movement_actions.len())
+    })
+}
+
+fn select_route_candidate(
+    profile: RouteProfileConfig,
+    mut candidates: Vec<CandidateRoute>,
+) -> CandidateRoute {
+    match profile {
+        RouteProfileConfig::Normal => {
+            candidates.sort_by(compare_route_candidates);
+            candidates.remove(0)
+        }
+        RouteProfileConfig::Speed => {
+            let mut non_spin = candidates
+                .iter()
+                .filter(|candidate| !candidate.is_spin_route)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !non_spin.is_empty() {
+                non_spin.sort_by(compare_speed_route_candidates);
+                return non_spin.remove(0);
+            }
+            candidates.sort_by(compare_speed_route_candidates);
+            candidates.remove(0)
+        }
+    }
 }
 
 fn summarize_reject_reasons(reasons: &[String]) -> Option<String> {
@@ -1140,12 +1286,20 @@ fn candidate_route_from_movements(
         .filter(|movement| **movement == PieceMovement::SonicDrop)
         .count();
     let direction_changes = count_direction_changes(movements);
+    let rotation_count = count_rotations(movements);
     let rotation_before_drop = count_rotations_before_soft_drop(movements);
+    let action_count = movements.len();
+    let is_spin_route = has_post_softdrop_actions;
+    let estimated_input_cost = estimate_input_cost(
+        movements,
+        has_post_softdrop_actions,
+        post_softdrop_horizontal_count,
+    );
     let score = RouteScore {
         has_soft_drop,
         post_softdrop_horizontal: post_softdrop_horizontal_count > 0,
         post_softdrop_horizontal_count,
-        action_count: movements.len(),
+        action_count,
         direction_changes: if handling.cancel_das_on_direction_change {
             direction_changes
         } else {
@@ -1159,9 +1313,18 @@ fn candidate_route_from_movements(
             soft_drop_count
         },
     };
+    let speed_score = SpeedRouteScore {
+        soft_drop_penalty: soft_drop_count,
+        post_softdrop_penalty: post_softdrop_horizontal_count,
+        estimated_input_cost,
+        rotation_count,
+        direction_changes,
+        action_count,
+    };
 
     Ok(CandidateRoute {
         score,
+        speed_score,
         route_kind: if has_post_softdrop_actions {
             "SoftDropSpinRoute"
         } else if has_soft_drop {
@@ -1170,6 +1333,12 @@ fn candidate_route_from_movements(
             "NoSoftDrop"
         },
         movement_actions,
+        rotation_count,
+        direction_changes,
+        action_count,
+        soft_drop_count,
+        estimated_input_cost,
+        is_spin_route,
     })
 }
 
@@ -1294,6 +1463,32 @@ fn count_rotations_before_soft_drop(movements: &[PieceMovement]) -> usize {
         .count()
 }
 
+fn count_rotations(movements: &[PieceMovement]) -> usize {
+    movements
+        .iter()
+        .filter(|movement| matches!(movement, PieceMovement::Cw | PieceMovement::Ccw))
+        .count()
+}
+
+fn estimate_input_cost(
+    movements: &[PieceMovement],
+    is_spin_route: bool,
+    post_softdrop_horizontal_count: usize,
+) -> usize {
+    let mut cost = 0;
+    for movement in movements {
+        cost += match movement {
+            PieceMovement::Left | PieceMovement::Right => 1,
+            PieceMovement::Cw | PieceMovement::Ccw => 2,
+            PieceMovement::SonicDrop => 4,
+        };
+    }
+    if is_spin_route {
+        cost += 100;
+    }
+    cost + (post_softdrop_horizontal_count * 8)
+}
+
 fn game_action_from_piece_movement(movement: PieceMovement) -> GameAction {
     match movement {
         PieceMovement::Left => GameAction::Left,
@@ -1302,6 +1497,47 @@ fn game_action_from_piece_movement(movement: PieceMovement) -> GameAction {
         PieceMovement::Ccw => GameAction::RotateCcw,
         PieceMovement::SonicDrop => GameAction::SoftDrop,
     }
+}
+
+fn count_game_action_direction_changes(actions: &[GameAction]) -> usize {
+    let mut last_horizontal = None;
+    let mut changes = 0;
+    for action in actions {
+        let current = match action {
+            GameAction::Left => Some(-1_i32),
+            GameAction::Right => Some(1_i32),
+            _ => None,
+        };
+        if let Some(current) = current {
+            if let Some(last) = last_horizontal {
+                if last != current {
+                    changes += 1;
+                }
+            }
+            last_horizontal = Some(current);
+        }
+    }
+    changes
+}
+
+fn count_game_action_rotations(actions: &[GameAction]) -> usize {
+    actions
+        .iter()
+        .filter(|action| matches!(action, GameAction::RotateCw | GameAction::RotateCcw))
+        .count()
+}
+
+fn estimate_game_action_cost(actions: &[GameAction]) -> usize {
+    actions
+        .iter()
+        .map(|action| match action {
+            GameAction::Left | GameAction::Right => 1,
+            GameAction::RotateCw | GameAction::RotateCcw => 2,
+            GameAction::SoftDrop => 4,
+            GameAction::Hold => 2,
+            GameAction::HardDrop => 0,
+        })
+        .sum()
 }
 
 impl PieceToken {
@@ -1321,9 +1557,12 @@ impl PieceToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AutomationConfig, MovementModeConfig};
+    use crate::config::{
+        AutomationConfig, EvaluationProfileConfig, MovementModeConfig, RouteProfileConfig,
+    };
     use crate::scanner::PieceToken;
     use libtetris::{PieceState, RotationState, TspinStatus};
+    use std::sync::atomic::AtomicU32;
 
     #[test]
     fn plan_move_requires_queue() {
@@ -1589,6 +1828,114 @@ mod tests {
     }
 
     #[test]
+    fn speed_profile_uses_requested_weight_overrides() {
+        let weights = evaluation_weights_for_profile(EvaluationProfileConfig::Speed);
+        let defaults = Standard::default();
+
+        assert_eq!(weights.tslot, [0, 0, 0, 0]);
+        assert_eq!(weights.tspin1, defaults.clear1);
+        assert_eq!(weights.tspin2, defaults.clear2);
+        assert_eq!(weights.tspin3, defaults.clear3);
+        assert_eq!(weights.mini_tspin1, defaults.clear1);
+        assert_eq!(weights.mini_tspin2, defaults.clear2);
+        assert_eq!(weights.wasted_t, 0);
+        assert_eq!(weights.move_time, -12);
+        assert_eq!(weights.clear4, defaults.clear4);
+        assert_eq!(weights.b2b_clear, defaults.b2b_clear);
+        assert_eq!(weights.combo_garbage, defaults.combo_garbage);
+    }
+
+    #[test]
+    fn speed_route_prefers_non_spin_routes() {
+        let handling = HandlingConfig {
+            soft_drop_mode: SoftDropModeConfig::Step,
+            allow_post_softdrop_actions: true,
+            ..HandlingConfig::default()
+        };
+        let non_spin = candidate_route_from_movements(&[PieceMovement::Left], &handling).unwrap();
+        let spin = candidate_route_from_movements(
+            &[
+                PieceMovement::Left,
+                PieceMovement::SonicDrop,
+                PieceMovement::Cw,
+            ],
+            &handling,
+        )
+        .unwrap();
+
+        let chosen =
+            select_route_candidate(RouteProfileConfig::Speed, vec![spin, non_spin.clone()]);
+
+        assert_eq!(chosen.route_kind, non_spin.route_kind);
+        assert!(!chosen.is_spin_route);
+    }
+
+    #[test]
+    fn speed_route_prefers_shorter_input_costs() {
+        let handling = HandlingConfig {
+            soft_drop_mode: SoftDropModeConfig::Step,
+            ..HandlingConfig::default()
+        };
+        let shorter =
+            candidate_route_from_movements(&[PieceMovement::Left, PieceMovement::Cw], &handling)
+                .unwrap();
+        let longer = candidate_route_from_movements(
+            &[PieceMovement::Left, PieceMovement::Right, PieceMovement::Cw],
+            &handling,
+        )
+        .unwrap();
+
+        let chosen =
+            select_route_candidate(RouteProfileConfig::Speed, vec![longer, shorter.clone()]);
+
+        assert_eq!(chosen.estimated_input_cost, shorter.estimated_input_cost);
+    }
+
+    #[test]
+    fn speed_route_prefers_fewer_rotations_after_cost_tie() {
+        let handling = HandlingConfig {
+            soft_drop_mode: SoftDropModeConfig::Step,
+            ..HandlingConfig::default()
+        };
+        let fewer_rotations =
+            candidate_route_from_movements(&[PieceMovement::Left, PieceMovement::Right], &handling)
+                .unwrap();
+        let more_rotations =
+            candidate_route_from_movements(&[PieceMovement::Cw], &handling).unwrap();
+
+        let chosen = select_route_candidate(
+            RouteProfileConfig::Speed,
+            vec![more_rotations, fewer_rotations.clone()],
+        );
+
+        assert_eq!(chosen.rotation_count, fewer_rotations.rotation_count);
+        assert_eq!(chosen.route_kind, fewer_rotations.route_kind);
+    }
+
+    #[test]
+    fn speed_route_falls_back_to_spin_when_needed() {
+        let handling = HandlingConfig {
+            soft_drop_mode: SoftDropModeConfig::Step,
+            allow_post_softdrop_actions: true,
+            ..HandlingConfig::default()
+        };
+        let spin = candidate_route_from_movements(
+            &[
+                PieceMovement::Left,
+                PieceMovement::SonicDrop,
+                PieceMovement::Cw,
+            ],
+            &handling,
+        )
+        .unwrap();
+
+        let chosen = select_route_candidate(RouteProfileConfig::Speed, vec![spin.clone()]);
+
+        assert!(chosen.is_spin_route);
+        assert_eq!(chosen.route_kind, spin.route_kind);
+    }
+
+    #[test]
     fn skip_snapshot_reason_blocks_duplicate_piece_counter() {
         let snapshot = GameSnapshot {
             source: "browser_cdp".to_owned(),
@@ -1645,6 +1992,27 @@ mod tests {
         assert_eq!(target_pps_interval(0.0), None);
         assert_eq!(target_pps_interval(-1.0), None);
         assert_eq!(target_pps_interval(f32::NAN), None);
+    }
+
+    #[test]
+    fn target_pps_interval_matches_expected_piece_times() {
+        assert_eq!(target_pps_interval(2.0), Some(Duration::from_millis(500)));
+        assert_eq!(target_pps_interval(5.0), Some(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn live_target_pps_overrides_static_config_value() {
+        let config = AutomationConfig {
+            target_pps: 2.0,
+            ..AutomationConfig::default()
+        };
+        let live_target_pps = AtomicU32::new(5.0f32.to_bits());
+
+        assert_eq!(current_target_pps(&config, Some(&live_target_pps)), 5.0);
+        assert_eq!(
+            target_pps_interval(current_target_pps(&config, Some(&live_target_pps))),
+            Some(Duration::from_millis(200))
+        );
     }
 
     #[test]

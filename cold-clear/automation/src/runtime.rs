@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -8,7 +8,7 @@ use crate::browser_source::{emit_log, ProviderProcess, SharedLogger};
 use crate::config::AutomationConfig;
 use crate::driver::{create_input_backend, InputBackend};
 use crate::paths::AppPaths;
-use crate::runner::run_loop_until;
+use crate::runner::{run_loop_until, run_loop_until_with_live_pps};
 use crate::scanner::{JsonFileScanner, SnapshotScanner};
 
 pub fn run_automation<F>(
@@ -21,22 +21,15 @@ where
     F: FnMut(String) + Send + 'static,
 {
     let logger: SharedLogger = Arc::new(Mutex::new(Box::new(log)));
-    emit_log(
-        &logger,
-        format!(
-            "[automation] watching {} dry_run={} target_pps={:.2}",
-            config.snapshot_path.display(),
-            config.dry_run,
-            config.target_pps
-        ),
-    );
+    emit_startup_logs(&logger, &config);
     let mut provider = ProviderProcess::start(&paths, &config, logger.clone())?;
     let mut scanner = JsonFileScanner::new(
         config.snapshot_path.clone(),
         Duration::from_millis(config.min_snapshot_age_ms),
     );
     let mut backend = create_input_backend(&paths, &config)?;
-    let result = run_loop_with_resources(config, &mut scanner, backend.as_mut(), stop, logger);
+    let result =
+        run_loop_with_resources(config, &mut scanner, backend.as_mut(), stop, logger, None);
     let release_result = backend.release_all_keys();
     drop(provider.take());
     result.and(release_result)
@@ -55,16 +48,42 @@ where
     F: FnMut(String) + Send + 'static,
 {
     let logger: SharedLogger = Arc::new(Mutex::new(Box::new(log)));
-    emit_log(
-        &logger,
-        format!(
-            "[automation] watching {} dry_run={} target_pps={:.2}",
-            config.snapshot_path.display(),
-            config.dry_run,
-            config.target_pps
-        ),
+    emit_startup_logs(&logger, &config);
+    let result = run_loop_with_resources(
+        config,
+        &mut scanner,
+        &mut backend,
+        stop,
+        logger.clone(),
+        None,
     );
-    let result = run_loop_with_resources(config, &mut scanner, &mut backend, stop, logger.clone());
+    let release_result = backend.release_all_keys();
+    result.and(release_result)
+}
+
+pub fn run_automation_with_resources_and_live_pps<S, D, F>(
+    config: AutomationConfig,
+    mut scanner: S,
+    mut backend: D,
+    stop: &AtomicBool,
+    live_target_pps: Arc<AtomicU32>,
+    log: F,
+) -> Result<()>
+where
+    S: SnapshotScanner,
+    D: InputBackend,
+    F: FnMut(String) + Send + 'static,
+{
+    let logger: SharedLogger = Arc::new(Mutex::new(Box::new(log)));
+    emit_startup_logs(&logger, &config);
+    let result = run_loop_with_resources(
+        config,
+        &mut scanner,
+        &mut backend,
+        stop,
+        logger.clone(),
+        Some(live_target_pps.as_ref()),
+    );
     let release_result = backend.release_all_keys();
     result.and(release_result)
 }
@@ -75,6 +94,7 @@ fn run_loop_with_resources<S, D>(
     backend: &mut D,
     stop: &AtomicBool,
     logger: SharedLogger,
+    live_target_pps: Option<&AtomicU32>,
 ) -> Result<()>
 where
     S: SnapshotScanner,
@@ -85,11 +105,67 @@ where
     let mut observed_backend =
         ObservedInputBackend::new(backend, logger.clone(), started_at, perf.clone());
     let logger_for_loop = logger.clone();
-    let result = run_loop_until(&config, scanner, &mut observed_backend, stop, move |line| {
-        maybe_emit_perf_from_log(&logger_for_loop, &perf, started_at, &line);
-        emit_log(&logger_for_loop, line);
-    });
+    let result = if let Some(live_target_pps) = live_target_pps {
+        run_loop_until_with_live_pps(
+            &config,
+            scanner,
+            &mut observed_backend,
+            stop,
+            Some(live_target_pps),
+            move |line| {
+                maybe_emit_perf_from_log(&logger_for_loop, &perf, started_at, &line);
+                emit_log(&logger_for_loop, line);
+            },
+        )
+    } else {
+        run_loop_until(&config, scanner, &mut observed_backend, stop, move |line| {
+            maybe_emit_perf_from_log(&logger_for_loop, &perf, started_at, &line);
+            emit_log(&logger_for_loop, line);
+        })
+    };
     result
+}
+
+fn emit_startup_logs(logger: &SharedLogger, config: &AutomationConfig) {
+    emit_log(
+        logger,
+        format!(
+            "[automation] watching {} dry_run={} target_pps={}",
+            config.snapshot_path.display(),
+            config.dry_run,
+            format_target_pps(config.target_pps)
+        ),
+    );
+    emit_log(
+        logger,
+        format!(
+            "[bot] style={} target_pps={}",
+            config.play_style.log_label(),
+            format_target_pps(config.target_pps)
+        ),
+    );
+    emit_log(
+        logger,
+        format!(
+            "[bot] evaluation_profile={} route_profile={}",
+            config.evaluation_profile.log_label(),
+            config.route_profile.log_label()
+        ),
+    );
+    if config.play_style == crate::config::PlayStyleConfig::Speed {
+        emit_log(
+            logger,
+            "[bot] speed priorities=non_spin,short_input,no_softdrop".to_owned(),
+        );
+    }
+}
+
+fn format_target_pps(target_pps: f32) -> String {
+    if target_pps.is_finite() && target_pps > 0.0 {
+        format!("{target_pps:.2}")
+    } else {
+        "unlimited".to_owned()
+    }
 }
 
 #[derive(Clone, Default)]
