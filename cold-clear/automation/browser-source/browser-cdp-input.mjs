@@ -30,6 +30,7 @@ async function main() {
 
   await waitForCdpReady(port);
   let cdp = await connectToTarget({ port, url, targetHint });
+  const pressedKeys = new Set();
   writeResponse({ type: "ready", ok: true });
 
   const rl = readline.createInterface({
@@ -49,6 +50,7 @@ async function main() {
     }
 
     if (message.type === "quit") {
+      await releaseTrackedKeys(cdp, pressedKeys).catch(() => undefined);
       await cdp.close().catch(() => undefined);
       if (ownsChromium && browserProcess) {
         await shutdownChromium(browserProcess);
@@ -57,56 +59,18 @@ async function main() {
       return;
     }
 
-    try {
-      if (message.type === "releaseAll") {
-        cdp = await ensureConnected(cdp, { port, url, targetHint });
-        await releaseAllKeys(cdp);
-        writeResponse({
-          ok: true,
-          id: message.id ?? null,
-          type: "releaseAll"
-        });
-        return;
-      }
-
-      if (message.type === "tap") {
-        const spec = KEY_MAP[message.key];
-        if (!spec) {
-          writeResponse({
-            ok: false,
-            id: message.id ?? null,
-            type: "tap",
-            error: `unknown key: ${message.key ?? ""}`
-          });
-          return;
-        }
-        cdp = await ensureConnected(cdp, { port, url, targetHint });
-        await dispatchWithReconnect(cdp, spec, "keyDown", { port, url, targetHint }, (nextCdp) => {
-          cdp = nextCdp;
-        });
-        await sleep(numberArg(message.durationMs, 55));
-        await dispatchWithReconnect(cdp, spec, "keyUp", { port, url, targetHint }, (nextCdp) => {
-          cdp = nextCdp;
-        });
-        writeResponse({
-          ok: true,
-          id: message.id ?? null,
-          type: "tap",
-          key: message.key,
-          durationMs: numberArg(message.durationMs, 55)
-        });
-      }
-    } catch (error) {
-      writeResponse({
-        ok: false,
-        id: message.id ?? null,
-        type: message.type ?? "unknown",
-        error: error?.message ?? String(error)
-      });
-    }
+    cdp = await handleMessage(message, {
+      cdp,
+      port,
+      url,
+      targetHint,
+      pressedKeys,
+      writeResponse
+    });
   });
 
   process.on("SIGINT", async () => {
+    await releaseTrackedKeys(cdp, pressedKeys).catch(() => undefined);
     await cdp.close().catch(() => undefined);
     if (ownsChromium && browserProcess) {
       await shutdownChromium(browserProcess);
@@ -136,10 +100,95 @@ function keySpec(key, code, windowsVirtualKeyCode, text = "") {
   };
 }
 
-async function releaseAllKeys(cdp) {
-  for (const spec of Object.values(KEY_MAP)) {
-    await dispatchKey(cdp, spec, "keyUp");
+export async function handleMessage(
+  message,
+  { cdp, port, url, targetHint, pressedKeys, writeResponse: sendResponse }
+) {
+  const targetInfo = { port, url, targetHint };
+  try {
+    if (message.type === "releaseAll") {
+      cdp = await ensureConnected(cdp, targetInfo, pressedKeys);
+      await releaseTrackedKeys(cdp, pressedKeys);
+      sendResponse({
+        ok: true,
+        id: message.id ?? null,
+        type: "releaseAll"
+      });
+      return cdp;
+    }
+
+    if (message.type === "tap") {
+      const action = normalizeTapAction(message);
+      cdp = await ensureConnected(cdp, targetInfo, pressedKeys);
+      await executeInputAction(cdp, action, targetInfo, (nextCdp) => {
+        cdp = nextCdp;
+      }, pressedKeys);
+      sendResponse({
+        ok: true,
+        id: message.id ?? null,
+        type: "tap",
+        key: action.key,
+        durationMs: action.durationMs
+      });
+      return cdp;
+    }
+
+    if (message.type === "sequence") {
+      const actions = normalizeSequenceActions(message.actions);
+      cdp = await ensureConnected(cdp, targetInfo, pressedKeys);
+      await executeSequence(cdp, actions, targetInfo, (nextCdp) => {
+        cdp = nextCdp;
+      }, pressedKeys);
+      sendResponse({
+        ok: true,
+        id: message.id ?? null,
+        type: "sequence",
+        actionCount: actions.length
+      });
+      return cdp;
+    }
+
+    return cdp;
+  } catch (error) {
+    sendResponse({
+      ok: false,
+      id: message.id ?? null,
+      type: message.type ?? "unknown",
+      error: error?.message ?? String(error)
+    });
+    return cdp;
   }
+}
+
+function normalizeTapAction(message) {
+  const spec = KEY_MAP[message.key];
+  if (!spec) {
+    throw new Error(`unknown key: ${message.key ?? ""}`);
+  }
+  return {
+    key: message.key,
+    spec,
+    durationMs: numberArg(message.durationMs, 55),
+    afterMs: 0
+  };
+}
+
+export function normalizeSequenceActions(actions) {
+  if (!Array.isArray(actions) || actions.length === 0) {
+    throw new Error("sequence requires at least one action");
+  }
+  return actions.map((action) => {
+    const spec = KEY_MAP[action?.key];
+    if (!spec) {
+      throw new Error(`unknown key: ${action?.key ?? ""}`);
+    }
+    return {
+      key: action.key,
+      spec,
+      durationMs: numberArg(action.durationMs, 55),
+      afterMs: numberArg(action.afterMs, 0)
+    };
+  });
 }
 
 async function focusPage(cdp) {
@@ -168,24 +217,82 @@ async function dispatchKey(cdp, spec, type) {
   });
 }
 
-async function dispatchWithReconnect(cdp, spec, type, targetInfo, setClient) {
-  try {
-    await dispatchKey(cdp, spec, type);
-  } catch (error) {
-    if (!isSocketClosedError(error)) {
-      throw error;
+async function dispatchTrackedKey(cdp, spec, type, pressedKeys) {
+  await dispatchKey(cdp, spec, type);
+  if (type === "keyDown") {
+    pressedKeys.add(spec.code);
+    return;
+  }
+  pressedKeys.delete(spec.code);
+}
+
+export async function releaseTrackedKeys(cdp, pressedKeys) {
+  let firstError = null;
+  for (const code of [...pressedKeys]) {
+    const spec = Object.values(KEY_MAP).find((candidate) => candidate.code === code);
+    if (!spec) {
+      pressedKeys.delete(code);
+      continue;
     }
-    const reconnected = await connectToTarget(targetInfo);
-    setClient(reconnected);
-    await dispatchKey(reconnected, spec, type);
+    try {
+      await dispatchKey(cdp, spec, "keyUp");
+    } catch (error) {
+      if (!firstError) {
+        firstError = error;
+      }
+    } finally {
+      pressedKeys.delete(code);
+    }
+  }
+  if (firstError) {
+    throw firstError;
   }
 }
 
-async function ensureConnected(cdp, targetInfo) {
+async function executeInputAction(cdp, action, targetInfo, setClient, pressedKeys) {
+  try {
+    await dispatchTrackedKey(cdp, action.spec, "keyDown", pressedKeys);
+    await sleep(action.durationMs);
+    await dispatchTrackedKey(cdp, action.spec, "keyUp", pressedKeys);
+    if (action.afterMs > 0) {
+      await sleep(action.afterMs);
+    }
+  } catch (error) {
+    await recoverInputState(cdp, error, targetInfo, setClient, pressedKeys);
+  }
+}
+
+export async function executeSequence(cdp, actions, targetInfo, setClient, pressedKeys) {
+  for (const action of actions) {
+    await executeInputAction(cdp, action, targetInfo, setClient, pressedKeys);
+  }
+}
+
+async function recoverInputState(cdp, error, targetInfo, setClient, pressedKeys) {
+  if (isSocketClosedError(error)) {
+    const reconnected = await connectToTarget(targetInfo);
+    setClient(reconnected);
+    await releaseTrackedKeys(reconnected, pressedKeys).catch(() => undefined);
+    throw new Error(`CDP reconnected during input; released tracked keys (${error.message ?? error})`);
+  }
+
+  try {
+    await releaseTrackedKeys(cdp, pressedKeys);
+  } catch (releaseError) {
+    throw new Error(
+      `${error?.message ?? error}; additionally failed to release tracked keys: ${releaseError?.message ?? releaseError}`
+    );
+  }
+  throw error;
+}
+
+async function ensureConnected(cdp, targetInfo, pressedKeys) {
   if (cdp?.isOpen()) {
     return cdp;
   }
-  return await connectToTarget(targetInfo);
+  const reconnected = await connectToTarget(targetInfo);
+  await releaseTrackedKeys(reconnected, pressedKeys).catch(() => undefined);
+  return reconnected;
 }
 
 async function connectToTarget({ port, url, targetHint }) {

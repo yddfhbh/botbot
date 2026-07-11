@@ -6,7 +6,7 @@ use anyhow::Result;
 
 use crate::browser_source::{emit_log, ProviderProcess, SharedLogger};
 use crate::config::AutomationConfig;
-use crate::driver::{create_input_backend, InputBackend};
+use crate::driver::{create_input_backend, InputBackend, TimedGameAction};
 use crate::paths::AppPaths;
 use crate::runner::{run_loop_until, run_loop_until_with_live_pps};
 use crate::scanner::{JsonFileScanner, SnapshotScanner};
@@ -196,6 +196,26 @@ impl<'a, D: InputBackend + ?Sized> ObservedInputBackend<'a, D> {
 
 impl<D: InputBackend + ?Sized> InputBackend for ObservedInputBackend<'_, D> {
     fn tap(&mut self, action: crate::driver::GameAction, duration: Duration) -> Result<()> {
+        self.emit_first_input_perf()?;
+        self.inner.tap(action, duration)
+    }
+
+    fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
+        self.emit_first_input_perf()?;
+        self.inner.execute_sequence(actions)
+    }
+
+    fn release_all_keys(&mut self) -> Result<()> {
+        self.inner.release_all_keys()
+    }
+
+    fn supports_batched_sequences(&self) -> bool {
+        self.inner.supports_batched_sequences()
+    }
+}
+
+impl<D: InputBackend + ?Sized> ObservedInputBackend<'_, D> {
+    fn emit_first_input_perf(&mut self) -> Result<()> {
         let mut first_input_logged = self
             .perf
             .first_input_logged
@@ -212,11 +232,7 @@ impl<D: InputBackend + ?Sized> InputBackend for ObservedInputBackend<'_, D> {
             );
         }
         drop(first_input_logged);
-        self.inner.tap(action, duration)
-    }
-
-    fn release_all_keys(&mut self) -> Result<()> {
-        self.inner.release_all_keys()
+        Ok(())
     }
 }
 
@@ -250,5 +266,56 @@ fn maybe_emit_perf_from_log(
                 emit_log(logger, format!("[perf] bot_on_to_first_plan_ms={elapsed}"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::GameAction;
+    use crate::scanner::GameSnapshot;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct EmptyScanner;
+
+    impl SnapshotScanner for EmptyScanner {
+        fn next_snapshot(&mut self) -> Result<Option<GameSnapshot>> {
+            Ok(None)
+        }
+    }
+
+    struct RecordingBackend {
+        release_calls: Rc<Cell<u32>>,
+    }
+
+    impl InputBackend for RecordingBackend {
+        fn tap(&mut self, _: GameAction, _: Duration) -> Result<()> {
+            Ok(())
+        }
+
+        fn release_all_keys(&mut self) -> Result<()> {
+            self.release_calls.set(self.release_calls.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bot_off_releases_all_keys_once() {
+        let stop = AtomicBool::new(true);
+        let release_calls = Rc::new(Cell::new(0));
+
+        run_automation_with_resources(
+            AutomationConfig::default(),
+            EmptyScanner,
+            RecordingBackend {
+                release_calls: release_calls.clone(),
+            },
+            &stop,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(release_calls.get(), 1);
     }
 }

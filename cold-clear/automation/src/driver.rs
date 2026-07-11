@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::config::{
     AutomationConfig, BufferModeConfig, HandlingConfig, InputBackendConfig, KeyBindings,
@@ -58,9 +59,28 @@ struct ActionDelayProfile {
     source: &'static str,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TimedGameAction {
+    pub action: GameAction,
+    pub duration: Duration,
+    pub after_delay: Duration,
+}
+
 pub trait InputBackend {
     fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()>;
+    fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
+        for action in actions {
+            self.tap(action.action, action.duration)?;
+            if !action.after_delay.is_zero() {
+                thread::sleep(action.after_delay);
+            }
+        }
+        Ok(())
+    }
     fn release_all_keys(&mut self) -> Result<()>;
+    fn supports_batched_sequences(&self) -> bool {
+        false
+    }
 }
 
 pub type SharedBrowserCdpInputBackend = Arc<Mutex<BrowserCdpInputBackend>>;
@@ -70,8 +90,16 @@ impl<T: InputBackend + ?Sized> InputBackend for Box<T> {
         (**self).tap(action, duration)
     }
 
+    fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
+        (**self).execute_sequence(actions)
+    }
+
     fn release_all_keys(&mut self) -> Result<()> {
         (**self).release_all_keys()
+    }
+
+    fn supports_batched_sequences(&self) -> bool {
+        (**self).supports_batched_sequences()
     }
 }
 
@@ -103,6 +131,10 @@ where
     B: InputBackend + ?Sized,
     F: FnMut(String),
 {
+    if backend.supports_batched_sequences() && !handling.release_after_each_action {
+        return execute_sequence_plan(backend, plan, handling, timings, true, log);
+    }
+
     execute_plan_until_hard_drop(backend, plan, handling, timings, |line| log(line))?;
     if plan.hard_drop {
         execute_hard_drop_action(backend, &plan.movement_actions, handling, timings, |line| {
@@ -123,6 +155,10 @@ where
     B: InputBackend + ?Sized,
     F: FnMut(String),
 {
+    if backend.supports_batched_sequences() && !handling.release_after_each_action {
+        return execute_sequence_plan(backend, plan, handling, timings, false, log);
+    }
+
     log_release(&mut log, "before_plan");
     backend
         .release_all_keys()
@@ -190,6 +226,19 @@ where
         "[automation] pre_hard_drop_actions={:?}",
         actions_before_hard_drop
     ));
+    if backend.supports_batched_sequences() && !handling.release_after_each_action {
+        if handling.prevent_accidental_hard_drops {
+            log("[automation] prevent_accidental_hard_drops=On".to_owned());
+        }
+        return execute_sequence_actions(
+            backend,
+            &[build_timed_action(GameAction::HardDrop, handling, timings)],
+            handling,
+            &mut log,
+        )
+        .context("failed to send hard drop sequence");
+    }
+
     log_release(&mut log, "before_hard_drop");
     backend
         .release_all_keys()
@@ -205,6 +254,130 @@ where
         .context("failed to release all keys after hard drop")?;
     sleep_action_delay(&mut log, GameAction::HardDrop, timings);
 
+    Ok(())
+}
+
+fn execute_sequence_plan<B, F>(
+    backend: &mut B,
+    plan: &ExecutionPlan,
+    handling: &HandlingConfig,
+    timings: ExecutionTimings,
+    include_hard_drop: bool,
+    mut log: F,
+) -> Result<()>
+where
+    B: InputBackend + ?Sized,
+    F: FnMut(String),
+{
+    if plan.hold && handling.ihs_mode == BufferModeConfig::Off {
+        log("[automation] ihs_mode=Off hold will be tapped after snapshot".to_owned());
+    }
+    if handling.irs_mode == BufferModeConfig::Off
+        && plan
+            .movement_actions
+            .iter()
+            .any(|action| matches!(action, GameAction::RotateCw | GameAction::RotateCcw))
+    {
+        log("[automation] irs_mode=Off rotations will be tapped after snapshot".to_owned());
+    }
+    if include_hard_drop && handling.prevent_accidental_hard_drops && plan.hard_drop {
+        log("[automation] prevent_accidental_hard_drops=On".to_owned());
+    }
+
+    let actions = build_plan_sequence_actions(plan, handling, timings, include_hard_drop);
+    execute_sequence_actions(backend, &actions, handling, &mut log)
+}
+
+fn build_plan_sequence_actions(
+    plan: &ExecutionPlan,
+    handling: &HandlingConfig,
+    timings: ExecutionTimings,
+    include_hard_drop: bool,
+) -> Vec<TimedGameAction> {
+    let mut actions = Vec::with_capacity(
+        usize::from(plan.hold) + plan.movement_actions.len() + usize::from(include_hard_drop),
+    );
+    if plan.hold {
+        actions.push(build_timed_action(GameAction::Hold, handling, timings));
+    }
+    for action in &plan.movement_actions {
+        actions.push(build_timed_action(*action, handling, timings));
+    }
+    if include_hard_drop && plan.hard_drop {
+        actions.push(build_timed_action(GameAction::HardDrop, handling, timings));
+    }
+    actions
+}
+
+fn build_timed_action(
+    action: GameAction,
+    handling: &HandlingConfig,
+    timings: ExecutionTimings,
+) -> TimedGameAction {
+    let tap = action_tap_profile(action, handling, timings);
+    let delay = action_delay_profile(action, timings);
+    TimedGameAction {
+        action,
+        duration: tap.actual_duration,
+        after_delay: delay.duration,
+    }
+}
+
+fn execute_sequence_actions<B, F>(
+    backend: &mut B,
+    actions: &[TimedGameAction],
+    handling: &HandlingConfig,
+    log: &mut F,
+) -> Result<()>
+where
+    B: InputBackend + ?Sized,
+    F: FnMut(String),
+{
+    if actions.is_empty() {
+        return Ok(());
+    }
+
+    for action in actions {
+        let tap = action_tap_profile(
+            action.action,
+            handling,
+            ExecutionTimings {
+                tap_duration: Duration::ZERO,
+                movement_tap_duration: action.duration,
+                rotate_tap_duration: action.duration,
+                hold_tap_duration: action.duration,
+                hard_drop_tap_duration: action.duration,
+                soft_drop_tap_duration: action.duration,
+                movement_interval: action.after_delay,
+                rotation_interval: action.after_delay,
+                piece_interval: action.after_delay,
+                hard_drop_interval: action.after_delay,
+            },
+        );
+        log_movement_clamp(action.action, tap, handling, log);
+        log(format!(
+            "[automation] sequence {:?} duration_ms={} after_ms={}",
+            action.action,
+            action.duration.as_millis(),
+            action.after_delay.as_millis()
+        ));
+    }
+
+    let started_at = unix_time_ms();
+    log(format!(
+        "[automation] sequence_start ts={} actions={:?}",
+        started_at,
+        actions
+            .iter()
+            .map(|action| action.action)
+            .collect::<Vec<_>>()
+    ));
+    backend.execute_sequence(actions)?;
+    log(format!(
+        "[automation] sequence_end ts={} actions={}",
+        unix_time_ms(),
+        actions.len()
+    ));
     Ok(())
 }
 
@@ -885,20 +1058,53 @@ impl Drop for BrowserCdpInputBackend {
 impl InputBackend for BrowserCdpInputBackend {
     fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()> {
         let key = Self::command_name_for(action);
-        self.send_command("tap", |id| {
+        let result = self.send_command("tap", |id| {
             format!(
                 r#"{{"id":{},"type":"tap","key":"{}","durationMs":{}}}"#,
                 id,
                 key,
                 duration.as_millis()
             )
-        })
+        });
+        if result.is_err() {
+            let _ = self.release_all_keys();
+        }
+        result
+    }
+
+    fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
+        let payload_actions = actions
+            .iter()
+            .map(|action| {
+                json!({
+                    "key": Self::command_name_for(action.action),
+                    "durationMs": action.duration.as_millis(),
+                    "afterMs": action.after_delay.as_millis(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let result = self.send_command("sequence", |id| {
+            json!({
+                "id": id,
+                "type": "sequence",
+                "actions": payload_actions,
+            })
+            .to_string()
+        });
+        if result.is_err() {
+            let _ = self.release_all_keys();
+        }
+        result
     }
 
     fn release_all_keys(&mut self) -> Result<()> {
         self.send_command("releaseAll", |id| {
             format!(r#"{{"id":{},"type":"releaseAll"}}"#, id)
         })
+    }
+
+    fn supports_batched_sequences(&self) -> bool {
+        true
     }
 }
 
@@ -915,12 +1121,24 @@ impl InputBackend for SharedBrowserCdpInputBackendHandle {
         backend.tap(action, duration)
     }
 
+    fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
+        let mut backend = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shared browser input backend lock poisoned"))?;
+        backend.execute_sequence(actions)
+    }
+
     fn release_all_keys(&mut self) -> Result<()> {
         let mut backend = self
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("shared browser input backend lock poisoned"))?;
         backend.release_all_keys()
+    }
+
+    fn supports_batched_sequences(&self) -> bool {
+        true
     }
 }
 
@@ -971,6 +1189,7 @@ mod tests {
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum RecordedEvent {
         Tap(GameAction, Duration),
+        Sequence(Vec<TimedGameAction>),
         ReleaseAll,
     }
 
@@ -1000,14 +1219,51 @@ mod tests {
         }
     }
 
+    struct SequenceRecordingBackend {
+        events: RefCell<Vec<RecordedEvent>>,
+    }
+
+    impl SequenceRecordingBackend {
+        fn new() -> Self {
+            Self {
+                events: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl InputBackend for SequenceRecordingBackend {
+        fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()> {
+            self.events
+                .borrow_mut()
+                .push(RecordedEvent::Tap(action, duration));
+            Ok(())
+        }
+
+        fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
+            self.events
+                .borrow_mut()
+                .push(RecordedEvent::Sequence(actions.to_vec()));
+            Ok(())
+        }
+
+        fn release_all_keys(&mut self) -> Result<()> {
+            self.events.borrow_mut().push(RecordedEvent::ReleaseAll);
+            Ok(())
+        }
+
+        fn supports_batched_sequences(&self) -> bool {
+            true
+        }
+    }
+
     fn timings() -> ExecutionTimings {
         ExecutionTimings {
             tap_duration: Duration::from_millis(60),
-            movement_tap_duration: Duration::from_millis(16),
-            rotate_tap_duration: Duration::from_millis(18),
-            hold_tap_duration: Duration::from_millis(20),
-            hard_drop_tap_duration: Duration::from_millis(20),
-            soft_drop_tap_duration: Duration::from_millis(16),
+            movement_tap_duration: Duration::from_millis(10),
+            rotate_tap_duration: Duration::from_millis(10),
+            hold_tap_duration: Duration::from_millis(10),
+            hard_drop_tap_duration: Duration::from_millis(8),
+            soft_drop_tap_duration: Duration::from_millis(10),
             movement_interval: Duration::ZERO,
             rotation_interval: Duration::ZERO,
             piece_interval: Duration::ZERO,
@@ -1046,16 +1302,16 @@ mod tests {
             &*backend.events.borrow(),
             &[
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::Hold, Duration::from_millis(20)),
+                RecordedEvent::Tap(GameAction::Hold, Duration::from_millis(10)),
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::RotateCw, Duration::from_millis(18)),
+                RecordedEvent::Tap(GameAction::RotateCw, Duration::from_millis(10)),
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::Left, Duration::from_millis(16)),
+                RecordedEvent::Tap(GameAction::Left, Duration::from_millis(12)),
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::SoftDrop, Duration::from_millis(16)),
+                RecordedEvent::Tap(GameAction::SoftDrop, Duration::from_millis(10)),
                 RecordedEvent::ReleaseAll,
                 RecordedEvent::ReleaseAll,
-                RecordedEvent::Tap(GameAction::HardDrop, Duration::from_millis(20)),
+                RecordedEvent::Tap(GameAction::HardDrop, Duration::from_millis(8)),
                 RecordedEvent::ReleaseAll,
             ]
         );
@@ -1094,7 +1350,7 @@ mod tests {
         );
         assert_eq!(
             backend.events.borrow()[backend.events.borrow().len() - 2],
-            RecordedEvent::Tap(GameAction::HardDrop, Duration::from_millis(20))
+            RecordedEvent::Tap(GameAction::HardDrop, Duration::from_millis(8))
         );
     }
 
@@ -1143,23 +1399,100 @@ mod tests {
 
         assert_eq!(
             duration_for_action(GameAction::RotateCw, &handling, timings),
-            Duration::from_millis(18)
+            Duration::from_millis(10)
         );
         assert_eq!(
             duration_for_action(GameAction::RotateCcw, &handling, timings),
-            Duration::from_millis(18)
+            Duration::from_millis(10)
         );
         assert_eq!(
             duration_for_action(GameAction::Hold, &handling, timings),
-            Duration::from_millis(20)
+            Duration::from_millis(10)
         );
         assert_eq!(
             duration_for_action(GameAction::SoftDrop, &handling, timings),
-            Duration::from_millis(16)
+            Duration::from_millis(10)
         );
         assert_eq!(
             duration_for_action(GameAction::HardDrop, &handling, timings),
-            Duration::from_millis(20)
+            Duration::from_millis(8)
+        );
+    }
+
+    #[test]
+    fn execute_plan_batches_sequence_for_browser_cdp_fast_path() {
+        let mut backend = SequenceRecordingBackend::new();
+        let plan = ExecutionPlan {
+            hold: true,
+            movement_actions: vec![GameAction::RotateCw, GameAction::Left, GameAction::SoftDrop],
+            hard_drop: true,
+        };
+
+        execute_plan(
+            &mut backend,
+            &plan,
+            &HandlingConfig::default(),
+            timings(),
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            &*backend.events.borrow(),
+            &[RecordedEvent::Sequence(vec![
+                TimedGameAction {
+                    action: GameAction::Hold,
+                    duration: Duration::from_millis(10),
+                    after_delay: Duration::ZERO,
+                },
+                TimedGameAction {
+                    action: GameAction::RotateCw,
+                    duration: Duration::from_millis(10),
+                    after_delay: Duration::ZERO,
+                },
+                TimedGameAction {
+                    action: GameAction::Left,
+                    duration: Duration::from_millis(12),
+                    after_delay: Duration::ZERO,
+                },
+                TimedGameAction {
+                    action: GameAction::SoftDrop,
+                    duration: Duration::from_millis(10),
+                    after_delay: Duration::ZERO,
+                },
+                TimedGameAction {
+                    action: GameAction::HardDrop,
+                    duration: Duration::from_millis(8),
+                    after_delay: Duration::ZERO,
+                },
+            ])]
+        );
+    }
+
+    #[test]
+    fn execute_plan_keeps_hard_drop_last_in_sequence_fast_path() {
+        let mut backend = SequenceRecordingBackend::new();
+        let plan = ExecutionPlan {
+            hold: false,
+            movement_actions: vec![GameAction::Left, GameAction::RotateCw],
+            hard_drop: true,
+        };
+
+        execute_plan(
+            &mut backend,
+            &plan,
+            &HandlingConfig::default(),
+            timings(),
+            |_| {},
+        )
+        .unwrap();
+
+        let RecordedEvent::Sequence(actions) = &backend.events.borrow()[0] else {
+            panic!("expected sequence event");
+        };
+        assert_eq!(
+            actions.last().map(|action| action.action),
+            Some(GameAction::HardDrop)
         );
     }
 }

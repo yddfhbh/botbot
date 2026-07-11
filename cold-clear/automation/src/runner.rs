@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -130,6 +130,7 @@ where
     };
     let mut buffered_snapshot = None;
     let mut sprint_state = SprintState::default();
+    let mut perf_window = RollingPerfWindow::default();
 
     loop {
         if stop.load(AtomicOrdering::Relaxed) {
@@ -160,9 +161,11 @@ where
                     thread::sleep(poll_delay);
                     continue;
                 }
+                let piece_cycle_started_at = Instant::now();
                 match prepare_execution(config, &snapshot, &sprint_state, &mut log)? {
                     Some(prepared) => {
                         emit_move_logs(config, &snapshot, &prepared, &mut log);
+                        let input_started_at = Instant::now();
                         execute_plan_until_hard_drop(
                             driver,
                             &prepared.execution_plan,
@@ -208,24 +211,38 @@ where
                                             &prepared.planned_lock,
                                         );
                                     }
+                                    let input_sequence_ms = input_started_at.elapsed().as_millis();
+                                    let wait_started_at = Instant::now();
+                                    buffered_snapshot = wait_for_next_piece_snapshot(
+                                        scanner,
+                                        &snapshot,
+                                        stop,
+                                        poll_delay,
+                                        piece_interval,
+                                        &mut log,
+                                    )?;
+                                    let wait_next_snapshot_ms =
+                                        wait_started_at.elapsed().as_millis();
+                                    let total_piece_cycle_ms =
+                                        piece_cycle_started_at.elapsed().as_millis();
+                                    perf_window.record_and_log(
+                                        prepared.planner_elapsed_ms,
+                                        input_sequence_ms,
+                                        wait_next_snapshot_ms,
+                                        total_piece_cycle_ms,
+                                        &mut log,
+                                    );
+                                    if buffered_snapshot.is_none()
+                                        && stop.load(AtomicOrdering::Relaxed)
+                                    {
+                                        return Ok(());
+                                    }
                                 }
                                 HardDropDecision::Retry(retry_snapshot) => {
                                     buffered_snapshot = Some(retry_snapshot);
                                     thread::sleep(poll_delay);
                                     continue;
                                 }
-                            }
-
-                            buffered_snapshot = wait_for_next_piece_snapshot(
-                                scanner,
-                                &snapshot,
-                                stop,
-                                poll_delay,
-                                piece_interval,
-                                &mut log,
-                            )?;
-                            if buffered_snapshot.is_none() && stop.load(AtomicOrdering::Relaxed) {
-                                return Ok(());
                             }
                         }
                     }
@@ -517,6 +534,64 @@ fn sleep_with_stop(stop: &AtomicBool, duration: Duration) -> bool {
         }
         thread::sleep(step.min(deadline.saturating_duration_since(now)));
     }
+}
+
+const PERF_WINDOW_SIZE: usize = 50;
+
+#[derive(Default)]
+struct RollingPerfWindow {
+    planner_ms: VecDeque<u128>,
+    input_sequence_ms: VecDeque<u128>,
+    wait_next_snapshot_ms: VecDeque<u128>,
+    total_piece_cycle_ms: VecDeque<u128>,
+}
+
+impl RollingPerfWindow {
+    fn record_and_log<F>(
+        &mut self,
+        planner_ms: u128,
+        input_sequence_ms: u128,
+        wait_next_snapshot_ms: u128,
+        total_piece_cycle_ms: u128,
+        log: &mut F,
+    ) where
+        F: FnMut(String),
+    {
+        push_perf_sample(&mut self.planner_ms, planner_ms);
+        push_perf_sample(&mut self.input_sequence_ms, input_sequence_ms);
+        push_perf_sample(&mut self.wait_next_snapshot_ms, wait_next_snapshot_ms);
+        push_perf_sample(&mut self.total_piece_cycle_ms, total_piece_cycle_ms);
+
+        log(format!("[perf] planner_ms={planner_ms}"));
+        log(format!("[perf] input_sequence_ms={input_sequence_ms}"));
+        log(format!(
+            "[perf] wait_next_snapshot_ms={wait_next_snapshot_ms}"
+        ));
+        log(format!(
+            "[perf] total_piece_cycle_ms={total_piece_cycle_ms}"
+        ));
+        log(format!(
+            "[perf] avg50 planner_ms={} input_sequence_ms={} wait_next_snapshot_ms={} total_piece_cycle_ms={}",
+            average_perf_ms(&self.planner_ms),
+            average_perf_ms(&self.input_sequence_ms),
+            average_perf_ms(&self.wait_next_snapshot_ms),
+            average_perf_ms(&self.total_piece_cycle_ms),
+        ));
+    }
+}
+
+fn push_perf_sample(samples: &mut VecDeque<u128>, value: u128) {
+    samples.push_back(value);
+    while samples.len() > PERF_WINDOW_SIZE {
+        samples.pop_front();
+    }
+}
+
+fn average_perf_ms(samples: &VecDeque<u128>) -> u128 {
+    if samples.is_empty() {
+        return 0;
+    }
+    samples.iter().copied().sum::<u128>() / samples.len() as u128
 }
 
 #[derive(Clone, Debug)]
@@ -2250,6 +2325,33 @@ mod tests {
             pps_wait_duration(Some(Duration::from_millis(500)), Duration::from_millis(750)),
             None
         );
+    }
+
+    #[test]
+    fn unlimited_target_pps_has_no_intentional_wait() {
+        let stop = AtomicBool::new(false);
+        let mut logs = Vec::new();
+
+        assert!(wait_for_target_pps(
+            Some(Instant::now()),
+            0.0,
+            &stop,
+            &mut |line| logs.push(line),
+        ));
+        assert!(logs.is_empty());
+    }
+
+    #[test]
+    fn rolling_perf_window_keeps_recent_fifty_samples() {
+        let mut samples = VecDeque::new();
+        for value in 1..=75 {
+            push_perf_sample(&mut samples, value);
+        }
+
+        assert_eq!(samples.len(), 50);
+        assert_eq!(samples.front(), Some(&26));
+        assert_eq!(samples.back(), Some(&75));
+        assert_eq!(average_perf_ms(&samples), (26u128 + 75u128) * 50 / 2 / 50);
     }
 
     #[derive(Default)]

@@ -23,7 +23,10 @@ export function createSnapshotTracking() {
     stableSignature: "",
     stableCount: 0,
     lastWrittenSignature: "",
-    lastLoggedToken: ""
+    lastLoggedToken: "",
+    pendingPieceKey: "",
+    pendingPieceDetectedAt: 0,
+    lastPerfLoggedPieceKey: ""
   };
 }
 
@@ -32,6 +35,9 @@ export function resetSnapshotTracking(tracking) {
   tracking.stableCount = 0;
   tracking.lastWrittenSignature = "";
   tracking.lastLoggedToken = "";
+  tracking.pendingPieceKey = "";
+  tracking.pendingPieceDetectedAt = 0;
+  tracking.lastPerfLoggedPieceKey = "";
   return tracking;
 }
 
@@ -42,6 +48,10 @@ export function buildSnapshotSignature(gameEpoch, state) {
 
 export function buildSnapshotToken(gameEpoch, pieceCounter) {
   return `browser-${gameEpoch}-${pieceCounter}`;
+}
+
+export function resolvePollMs(args) {
+  return numberArg(args.pollMs, 8);
 }
 
 export function isTetrioGameEndedState(state) {
@@ -70,7 +80,7 @@ async function main() {
   const url = args.url ?? DEFAULT_URL;
   const port = numberArg(args.port, DEFAULT_PORT);
   const targetHint = args.target ?? "TETR.IO";
-  const pollMs = numberArg(args.pollMs, 40);
+  const pollMs = resolvePollMs(args);
   const connectOnly = args.connectOnly === "1";
   const probePageState = args.probePageState !== "0";
   const useRibbonWebsocket = args.useRibbonWebsocket !== "0";
@@ -177,6 +187,12 @@ async function main() {
     lastReason = "";
     lastReasonAt = 0;
 
+    const pieceKey = `${gameEpoch}:${state.pieceCounter}`;
+    if (pieceKey !== snapshotTracking.pendingPieceKey) {
+      snapshotTracking.pendingPieceKey = pieceKey;
+      snapshotTracking.pendingPieceDetectedAt = Date.now();
+    }
+
     const signature = buildSnapshotSignature(gameEpoch, state);
     if (signature === snapshotTracking.stableSignature) {
       snapshotTracking.stableCount += 1;
@@ -212,6 +228,15 @@ async function main() {
     if (signature !== snapshotTracking.lastWrittenSignature) {
       writeSnapshot(snapshotPath, snapshot);
       snapshotTracking.lastWrittenSignature = signature;
+      if (
+        pieceKey === snapshotTracking.pendingPieceKey &&
+        pieceKey !== snapshotTracking.lastPerfLoggedPieceKey
+      ) {
+        snapshotTracking.lastPerfLoggedPieceKey = pieceKey;
+        console.log(
+          `[browser-perf] piece_change_to_snapshot_ms=${Math.max(0, Date.now() - snapshotTracking.pendingPieceDetectedAt)}`
+        );
+      }
       if (snapshot.token !== snapshotTracking.lastLoggedToken) {
         snapshotTracking.lastLoggedToken = snapshot.token;
         console.log(

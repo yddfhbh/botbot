@@ -13,6 +13,7 @@ import {
   determineChromiumOwnership,
   isTetrioGameEndedState,
   pausedFrameExposureExpression,
+  resolvePollMs,
   resetSnapshotTracking,
   shouldAdvanceGameEpoch,
   shouldHandleEndedGame,
@@ -130,6 +131,9 @@ test("resetSnapshotTracking clears stable signature state", () => {
   tracking.stableCount = 2;
   tracking.lastWrittenSignature = "written";
   tracking.lastLoggedToken = "browser-1-0";
+  tracking.pendingPieceKey = "1:0";
+  tracking.pendingPieceDetectedAt = 123;
+  tracking.lastPerfLoggedPieceKey = "1:0";
 
   resetSnapshotTracking(tracking);
 
@@ -137,8 +141,16 @@ test("resetSnapshotTracking clears stable signature state", () => {
     stableSignature: "",
     stableCount: 0,
     lastWrittenSignature: "",
-    lastLoggedToken: ""
+    lastLoggedToken: "",
+    pendingPieceKey: "",
+    pendingPieceDetectedAt: 0,
+    lastPerfLoggedPieceKey: ""
   });
+});
+
+test("snapshot helper defaults browser poll to 8ms", () => {
+  assert.equal(resolvePollMs({}), 8);
+  assert.equal(resolvePollMs({ pollMs: "12" }), 12);
 });
 
 test("snapshot tokens and signatures include the game epoch", () => {

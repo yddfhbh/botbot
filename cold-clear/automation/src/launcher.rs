@@ -202,11 +202,11 @@ impl Default for LauncherState {
             pps_unlimited: true,
             target_pps: 3.0,
             tap_duration_ms: 60,
-            movement_tap_duration_ms: 16,
-            rotate_tap_duration_ms: 18,
-            hold_tap_duration_ms: 20,
-            hard_drop_tap_duration_ms: 20,
-            soft_drop_tap_duration_ms: 16,
+            movement_tap_duration_ms: 10,
+            rotate_tap_duration_ms: 10,
+            hold_tap_duration_ms: 10,
+            hard_drop_tap_duration_ms: 8,
+            soft_drop_tap_duration_ms: 10,
             movement_interval_ms: 0,
             rotation_interval_ms: 0,
             piece_interval_ms: 0,
@@ -247,12 +247,12 @@ impl LauncherState {
         self.pps_unlimited = true;
         self.target_pps = 3.0;
         self.tap_duration_ms = 60;
-        self.poll_interval_ms = 4;
-        self.movement_tap_duration_ms = 16;
-        self.rotate_tap_duration_ms = 18;
-        self.hold_tap_duration_ms = 20;
-        self.hard_drop_tap_duration_ms = 20;
-        self.soft_drop_tap_duration_ms = 16;
+        self.poll_interval_ms = 8;
+        self.movement_tap_duration_ms = 10;
+        self.rotate_tap_duration_ms = 10;
+        self.hold_tap_duration_ms = 10;
+        self.hard_drop_tap_duration_ms = 8;
+        self.soft_drop_tap_duration_ms = 10;
         self.movement_interval_ms = 0;
         self.rotation_interval_ms = 0;
         self.piece_interval_ms = 0;
@@ -1276,12 +1276,12 @@ mod tests {
         assert_eq!(state.effective_target_pps(), 0.0);
         assert_eq!(state.target_pps, 3.0);
         assert_eq!(state.tap_duration_ms, 60);
-        assert_eq!(state.poll_interval_ms, 4);
-        assert_eq!(state.movement_tap_duration_ms, 16);
-        assert_eq!(state.rotate_tap_duration_ms, 18);
-        assert_eq!(state.hold_tap_duration_ms, 20);
-        assert_eq!(state.hard_drop_tap_duration_ms, 20);
-        assert_eq!(state.soft_drop_tap_duration_ms, 16);
+        assert_eq!(state.poll_interval_ms, 8);
+        assert_eq!(state.movement_tap_duration_ms, 10);
+        assert_eq!(state.rotate_tap_duration_ms, 10);
+        assert_eq!(state.hold_tap_duration_ms, 10);
+        assert_eq!(state.hard_drop_tap_duration_ms, 8);
+        assert_eq!(state.soft_drop_tap_duration_ms, 10);
         assert_eq!(state.movement_interval_ms, 0);
         assert_eq!(state.rotation_interval_ms, 0);
         assert_eq!(state.piece_interval_ms, 0);
@@ -1335,11 +1335,11 @@ mod tests {
 
         state.migrate_legacy_defaults();
 
-        assert_eq!(state.poll_interval_ms, 4);
-        assert_eq!(state.movement_tap_duration_ms, 16);
-        assert_eq!(state.rotate_tap_duration_ms, 18);
-        assert_eq!(state.hold_tap_duration_ms, 20);
-        assert_eq!(state.hard_drop_tap_duration_ms, 20);
+        assert_eq!(state.poll_interval_ms, 8);
+        assert_eq!(state.movement_tap_duration_ms, 10);
+        assert_eq!(state.rotate_tap_duration_ms, 10);
+        assert_eq!(state.hold_tap_duration_ms, 10);
+        assert_eq!(state.hard_drop_tap_duration_ms, 8);
         assert_eq!(state.movement_interval_ms, 0);
         assert_eq!(state.rotation_interval_ms, 0);
         assert_eq!(state.piece_interval_ms, 0);
