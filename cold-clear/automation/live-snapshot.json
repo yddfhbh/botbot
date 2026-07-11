@@ -8,31 +8,31 @@
       true,
       true,
       true,
+      false,
       true,
       true,
       true,
-      true,
-      false
+      true
     ],
     [
       true,
       true,
       true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      false
-    ],
-    [
       true,
       true,
       false,
       true,
       true,
       true,
+      true
+    ],
+    [
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
       true,
       true,
       true,
@@ -45,10 +45,10 @@
       true,
       true,
       true,
+      false,
       true,
       true,
-      true,
-      false
+      true
     ],
     [
       true,
@@ -57,10 +57,10 @@
       true,
       true,
       true,
+      false,
       true,
       true,
-      true,
-      false
+      true
     ],
     [
       true,
@@ -69,10 +69,10 @@
       true,
       true,
       true,
+      false,
       true,
       true,
-      true,
-      false
+      true
     ],
     [
       true,
@@ -81,41 +81,41 @@
       true,
       true,
       true,
+      false,
       true,
       true,
-      true,
-      false
+      true
     ],
     [
       true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true
+    ],
+    [
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
       false,
       false,
-      true,
-      true,
-      true,
       false,
-      true,
-      true,
-      false
+      true
     ],
     [
       false,
       false,
       false,
       false,
-      true,
-      true,
       false,
-      true,
-      true,
-      false
-    ],
-    [
-      false,
-      false,
-      false,
-      false,
-      true,
       true,
       false,
       false,
@@ -483,29 +483,29 @@
       false
     ]
   ],
-  "current": "I",
+  "current": "O",
   "hold": "T",
   "queue": [
-    "T",
-    "S",
-    "O",
     "I",
+    "S",
+    "J",
+    "I",
+    "L",
+    "O",
     "J",
     "T",
-    "L",
+    "S",
     "Z",
     "S",
-    "L",
-    "J",
-    "T"
+    "I"
   ],
   "b2b": false,
   "combo": 0,
   "incoming": 0,
-  "pieceCounter": 150,
-  "token": "browser-150",
+  "pieceCounter": 218,
+  "token": "browser-218",
   "playing": true,
   "countdown": false,
-  "activeX": 6,
+  "activeX": 5,
   "activeY": 18
 }
