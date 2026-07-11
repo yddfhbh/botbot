@@ -8,11 +8,11 @@
       true,
       true,
       true,
-      false,
       true,
       true,
       true,
-      true
+      true,
+      false
     ],
     [
       true,
@@ -20,11 +20,11 @@
       true,
       true,
       true,
-      false,
       true,
       true,
       true,
-      true
+      true,
+      false
     ],
     [
       true,
@@ -32,11 +32,11 @@
       true,
       true,
       true,
-      false,
       true,
       true,
       true,
-      true
+      true,
+      false
     ],
     [
       true,
@@ -44,23 +44,35 @@
       true,
       true,
       true,
-      false,
       true,
       true,
       true,
-      true
+      true,
+      false
     ],
     [
       true,
       true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ],
+    [
       false,
-      false,
+      true,
       true,
       false,
       false,
       true,
       true,
-      true
+      true,
+      true,
+      false
     ],
     [
       false,
@@ -68,19 +80,7 @@
       false,
       false,
       false,
-      false,
-      false,
-      false,
       true,
-      true
-    ],
-    [
-      false,
-      false,
-      false,
-      false,
-      false,
-      false,
       false,
       false,
       false,
@@ -484,28 +484,28 @@
     ]
   ],
   "current": "I",
-  "hold": "J",
+  "hold": "T",
   "queue": [
-    "Z",
-    "T",
-    "S",
-    "J",
-    "I",
-    "O",
-    "Z",
     "T",
     "L",
-    "Z",
+    "O",
+    "T",
     "I",
+    "Z",
+    "S",
+    "L",
+    "J",
+    "S",
+    "T",
     "O"
   ],
   "b2b": false,
-  "combo": 1,
+  "combo": 0,
   "incoming": 0,
-  "pieceCounter": 101,
-  "token": "browser-4-101",
+  "pieceCounter": 108,
+  "token": "browser-6-108",
   "playing": true,
   "countdown": false,
-  "activeX": 4,
+  "activeX": 8,
   "activeY": 18
 }
