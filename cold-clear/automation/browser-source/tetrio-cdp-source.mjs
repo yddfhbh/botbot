@@ -15,10 +15,15 @@ const DEFAULT_STATE_POLL_MS = 40;
 const DEFAULT_MIN_STATE_POLL_MS = 16;
 const DIRECT_SCAN_COOLDOWN_MS = 1500;
 const DIRECT_SCAN_MAX_ATTEMPTS = Number.POSITIVE_INFINITY;
-const PROBE_TIMEOUT_MS = 120;
-const PROBE_COOLDOWN_MS = 30_000;
+const PROBE_TIMEOUT_MS = 900;
+const PROBE_RETRY_COOLDOWN_MS = 750;
+const MAX_PROBE_ATTEMPTS = 4;
 const PERF_LOG_INTERVAL_MS = 5000;
 const DISCOVERY_RESET_DEBOUNCE_MS = 250;
+const CLOSURE_PROBE_BREAKPOINTS = [
+  { label: "raf", expression: "window.requestAnimationFrame" },
+  { label: "setTimeout", expression: "window.setTimeout" }
+];
 
 export function normalizeDebuggerProbeMode(value) {
   return value === "manual" || value === "disabled" || value === "startup_only"
@@ -42,18 +47,40 @@ export function shouldAttemptDebuggerProbe({
   mode,
   needsProbe,
   gameCaptured,
-  playing,
   now,
   lastAttemptAt = 0,
-  lastKnownPlaying = false,
-  cooldownMs = PROBE_COOLDOWN_MS
+  cooldownMs = PROBE_RETRY_COOLDOWN_MS
 }) {
   if (!needsProbe) return false;
   if (normalizeDebuggerProbeMode(mode) !== "startup_only") return false;
   if (gameCaptured) return false;
   if (lastAttemptAt === 0) return true;
-  if ((playing || lastKnownPlaying) && lastAttemptAt > 0) return false;
   return now - lastAttemptAt >= cooldownMs;
+}
+
+export function shouldAttemptClosureProbe({
+  probePageState,
+  debuggerProbeMode,
+  likelyGamePage,
+  needsProbe,
+  gameCaptured,
+  probeAttempts = 0,
+  maxAttempts = MAX_PROBE_ATTEMPTS,
+  now,
+  lastAttemptAt = 0,
+  cooldownMs = PROBE_RETRY_COOLDOWN_MS
+}) {
+  if (!probePageState) return false;
+  if (!likelyGamePage) return false;
+  if (probeAttempts >= maxAttempts) return false;
+  return shouldAttemptDebuggerProbe({
+    mode: debuggerProbeMode,
+    needsProbe,
+    gameCaptured,
+    now,
+    lastAttemptAt,
+    cooldownMs
+  });
 }
 
 export function shouldDecodeRibbonFrame({ mode, seedCaptured, direction }) {
@@ -118,6 +145,7 @@ export function resetDiscoveryState(probeState) {
   probeState.lastKnownPlaying = false;
   probeState.lastCaptureSource = null;
   probeState.probeAttempts = 0;
+  probeState.lastLikelyGamePage = false;
 }
 
 export function isTopFrameNavigation(event) {
@@ -135,6 +163,21 @@ export function shouldResetDiscoveryOnExecutionContextsCleared(probeState) {
   return Boolean(probeState?.gameCaptured || probeState?.lastCaptureSource);
 }
 
+export function resetProbeRetryState(probeState) {
+  probeState.lastAttemptAt = 0;
+  probeState.probeAttempts = 0;
+}
+
+export function updateLikelyGamePageState(probeState, likelyGamePage, now = Date.now()) {
+  const transitionedToGamePage = Boolean(likelyGamePage) && !probeState.lastLikelyGamePage;
+  if (transitionedToGamePage) {
+    resetProbeRetryState(probeState);
+    probeState.lastLikelyGamePageAt = now;
+  }
+  probeState.lastLikelyGamePage = Boolean(likelyGamePage);
+  return transitionedToGamePage;
+}
+
 export function isLikelyGamePage({
   href = "",
   pathname = "",
@@ -148,6 +191,10 @@ export function isLikelyGamePage({
     return true;
   }
   return Number(largeCanvasCount) >= 2;
+}
+
+export function getClosureProbeBreakpoints() {
+  return [...CLOSURE_PROBE_BREAKPOINTS];
 }
 
 async function clearCachedGameHandle(cdp) {
@@ -195,6 +242,7 @@ function attachDiscoveryLifecycleHooks(cdp, probeState) {
     reset("navigated_within_document");
   });
   cdp.on("Runtime.executionContextsCleared", () => {
+    resetProbeRetryState(probeState);
     if (!shouldResetDiscoveryOnExecutionContextsCleared(probeState)) {
       return;
     }
@@ -281,7 +329,9 @@ async function main() {
     gameCaptured: false,
     lastKnownPlaying: false,
     lastDumpAt: 0,
-    lastCaptureSource: null
+    lastCaptureSource: null,
+    lastLikelyGamePage: false,
+    lastLikelyGamePageAt: 0
   };
   attachDiscoveryLifecycleHooks(cdp, probeState);
 
@@ -714,7 +764,7 @@ function finiteNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
-async function readTetrioState(cdp, options) {
+export async function readTetrioState(cdp, options) {
   const readRawState = async () => {
     const now = Date.now();
     const allowStartupDirectScan = shouldAttemptStartupDirectScan({
@@ -808,24 +858,26 @@ async function readTetrioState(cdp, options) {
   let state = rawState.ok ? snapshotFromRaw(rawState) : buildNoGameFailure(rawState, options);
   options.probeState.lastKnownPlaying = Boolean(state?.playing);
   let probeStatus = "skipped";
-  const likelyGamePage = rawState?.pageHints?.likelyGamePage !== false;
+  const likelyGamePage = Boolean(rawState?.pageHints?.likelyGamePage);
+  updateLikelyGamePageState(options.probeState, likelyGamePage, Date.now());
+  const closureProbeAttempt = options.probeState.probeAttempts + 1;
 
-  const shouldCapture = options.probePageState &&
-    likelyGamePage &&
-    options.probeState.probeAttempts < 1 &&
-    options.probeState.startupDirectScanAttempts >= 3 &&
-    shouldAttemptDebuggerProbe({
-      mode: options.debuggerProbeMode,
+  const shouldCapture = shouldAttemptClosureProbe({
+      probePageState: options.probePageState,
+      debuggerProbeMode: options.debuggerProbeMode,
+      likelyGamePage,
       needsProbe: !state.ok || !state.ready || !state.playing || state.countdown,
       gameCaptured: options.probeState.gameCaptured,
-      playing: Boolean(state?.playing),
-      lastKnownPlaying: options.probeState.lastKnownPlaying,
+      probeAttempts: options.probeState.probeAttempts,
       now: Date.now(),
       lastAttemptAt: options.probeState.lastAttemptAt
     });
 
   if (shouldCapture) {
     probeStatus = "attempted";
+    console.log(
+      `[browser] closure probe attempt=${closureProbeAttempt} timeoutMs=${PROBE_TIMEOUT_MS} breakpoints=${getClosureProbeBreakpoints().map((entry) => entry.label).join(",")}`
+    );
     options.probeState.lastAttemptAt = Date.now();
     options.probeState.probeAttempts += 1;
     if (options.network) {
@@ -836,6 +888,7 @@ async function readTetrioState(cdp, options) {
       reason: error?.message ?? String(error)
     }));
     if (capture.ok) {
+      console.log(`[browser] closure probe captured source=${capture.source}`);
       options.probeState.gameCaptured = true;
       if (capture.source && capture.source !== options.probeState.lastCaptureSource) {
         options.probeState.lastCaptureSource = capture.source;
@@ -847,6 +900,12 @@ async function readTetrioState(cdp, options) {
       }
       state = rawState.ok ? snapshotFromRaw(rawState) : buildNoGameFailure(rawState, options);
     } else if (state.reason) {
+      console.log(
+        `[browser] closure probe attempt=${closureProbeAttempt} failed reason=${capture.reason}`
+      );
+      if (options.probeState.probeAttempts < MAX_PROBE_ATTEMPTS && likelyGamePage && !options.probeState.gameCaptured) {
+        console.log(`[browser] closure probe retry in ${PROBE_RETRY_COOLDOWN_MS}ms`);
+      }
       state = {
         ...state,
         reason: `${state.reason}; page probe: ${capture.reason}`,
@@ -1080,18 +1139,19 @@ export function captureTetrioExportExpression({
   })()`;
 }
 
-async function captureTetrioGame(cdp, perf) {
+export async function captureTetrioGame(cdp, perf) {
   const breakpointIds = [];
   let paused = false;
   const startedAt = Date.now();
+  const attachedBreakpointLabels = [];
 
   try {
     await cdp.send("Debugger.enable");
-    for (const expression of ["window.requestAnimationFrame"]) {
+    for (const breakpointSpec of getClosureProbeBreakpoints()) {
       const evaluated = await safeRuntimeEvaluate(
         cdp,
         {
-          expression,
+          expression: breakpointSpec.expression,
           objectGroup: "fusion-tetrio-probe",
           silent: true
         },
@@ -1104,6 +1164,7 @@ async function captureTetrioGame(cdp, perf) {
       }).catch(() => null);
       if (breakpoint?.breakpointId) {
         breakpointIds.push(breakpoint.breakpointId);
+        attachedBreakpointLabels.push(breakpointSpec.label);
       }
     }
 
@@ -1128,10 +1189,19 @@ async function captureTetrioGame(cdp, perf) {
       const exposed = await exposeTetrioGameFromPausedCallFrames(cdp, event);
       await cdp.send("Debugger.resume").catch(() => undefined);
       paused = false;
-      if (exposed.ok) return exposed;
+      if (exposed.ok) {
+        return {
+          ...exposed,
+          breakpoints: attachedBreakpointLabels
+        };
+      }
     }
 
-    return { ok: false, reason: "TETR.IO game closure not visible yet" };
+    return {
+      ok: false,
+      reason: "Ai not visible",
+      breakpoints: attachedBreakpointLabels
+    };
   } finally {
     const elapsedMs = Date.now() - startedAt;
     perf?.recordProbe(elapsedMs);
@@ -1172,14 +1242,47 @@ function isMissingExecutionContextError(error) {
   );
 }
 
-async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent) {
+export async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent) {
   for (const callFrame of pausedEvent.callFrames ?? []) {
+    const aiCapture = await exposeTetrioGameFromAiCallFrame(cdp, callFrame);
+    if (aiCapture.ok) {
+      return aiCapture;
+    }
     const scopeCapture = await exposeTetrioGameFromScopeChain(cdp, callFrame);
     if (scopeCapture.ok) {
       return scopeCapture;
     }
   }
-  return { ok: false, reason: "TETR.IO active game variable was not in paused scopes" };
+  return { ok: false, reason: "Ai not visible" };
+}
+
+async function exposeTetrioGameFromAiCallFrame(cdp, callFrame) {
+  const result = await cdp.send("Debugger.evaluateOnCallFrame", {
+    callFrameId: callFrame.callFrameId,
+    expression: `(() => {
+      try {
+        if (
+          typeof Ai !== "undefined" &&
+          Ai &&
+          Ai.ejectState instanceof Function &&
+          Ai.ejectBoardState instanceof Function
+        ) {
+          window.__fusionTetrioGame = Ai;
+          return {
+            ok: true,
+            source: "closure:Ai",
+            at: Date.now(),
+            href: location.href
+          };
+        }
+      } catch {}
+      return { ok: false, reason: "Ai not visible" };
+    })()`,
+    returnByValue: true,
+    silent: true
+  }).catch(() => null);
+
+  return result?.result?.value ?? { ok: false, reason: "Ai not visible" };
 }
 
 async function exposeTetrioGameFromScopeChain(cdp, callFrame) {
