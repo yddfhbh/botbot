@@ -13,9 +13,10 @@ const DEFAULT_NEXT_COUNT = 6;
 const DEFAULT_STATUS_MS = 2500;
 const DEFAULT_STATE_POLL_MS = 40;
 const DEFAULT_MIN_STATE_POLL_MS = 16;
+const DIRECT_SCAN_COOLDOWN_MS = 1500;
+const DIRECT_SCAN_MAX_ATTEMPTS = Number.POSITIVE_INFINITY;
 const PROBE_TIMEOUT_MS = 120;
-const PROBE_COOLDOWN_MS = 10_000;
-const UNCAPTURED_PROBE_COOLDOWN_MS = 2_000;
+const PROBE_COOLDOWN_MS = 30_000;
 const PERF_LOG_INTERVAL_MS = 5000;
 
 export function normalizeDebuggerProbeMode(value) {
@@ -49,12 +50,9 @@ export function shouldAttemptDebuggerProbe({
   if (!needsProbe) return false;
   if (normalizeDebuggerProbeMode(mode) !== "startup_only") return false;
   if (gameCaptured) return false;
+  if (lastAttemptAt === 0) return true;
   if ((playing || lastKnownPlaying) && lastAttemptAt > 0) return false;
-  const effectiveCooldownMs =
-    !gameCaptured && !playing && !lastKnownPlaying
-      ? Math.min(cooldownMs, UNCAPTURED_PROBE_COOLDOWN_MS)
-      : cooldownMs;
-  return now - lastAttemptAt >= effectiveCooldownMs;
+  return now - lastAttemptAt >= cooldownMs;
 }
 
 export function shouldDecodeRibbonFrame({ mode, seedCaptured, direction }) {
@@ -72,18 +70,30 @@ export function shouldAttemptStartupDirectScan({
   gameCaptured,
   quickGameAvailable = false,
   now,
-  sessionStartedAt = 0,
   lastAttemptAt = 0,
   attempts = 0,
-  maxAttempts = 3,
-  startupWindowMs = 30_000,
-  cooldownMs = 5_000
+  maxAttempts = DIRECT_SCAN_MAX_ATTEMPTS,
+  cooldownMs = DIRECT_SCAN_COOLDOWN_MS
 }) {
   if (gameCaptured || quickGameAvailable) return false;
-  if (attempts >= maxAttempts) return false;
-  if (sessionStartedAt > 0 && now - sessionStartedAt > startupWindowMs) return false;
+  if (Number.isFinite(maxAttempts) && attempts >= maxAttempts) return false;
   if (lastAttemptAt > 0 && now - lastAttemptAt < cooldownMs) return false;
   return true;
+}
+
+export function startupDirectScanDisabledReason({
+  gameCaptured,
+  quickGameAvailable = false,
+  now,
+  lastAttemptAt = 0,
+  attempts = 0,
+  maxAttempts = DIRECT_SCAN_MAX_ATTEMPTS,
+  cooldownMs = DIRECT_SCAN_COOLDOWN_MS
+}) {
+  if (gameCaptured || quickGameAvailable) return "game_captured";
+  if (Number.isFinite(maxAttempts) && attempts >= maxAttempts) return "max_attempts";
+  if (lastAttemptAt > 0 && now - lastAttemptAt < cooldownMs) return "cooldown";
+  return "no_game";
 }
 
 export function formatStateEvalPerfLog(rawState, elapsedMs) {
@@ -97,6 +107,45 @@ export function formatStateEvalPerfLog(rawState, elapsedMs) {
     return `[perf][state] quick=false scan=disabled reason=${rawState?.scanReason ?? "no_game"}`;
   }
   return `[perf][state] quick=false scan=unknown eval_ms=${elapsedMs}`;
+}
+
+export function resetDiscoveryState(probeState) {
+  probeState.startupDirectScanAttempts = 0;
+  probeState.startupDirectScanLastAt = 0;
+  probeState.lastAttemptAt = 0;
+  probeState.gameCaptured = false;
+  probeState.lastKnownPlaying = false;
+  probeState.lastCaptureSource = null;
+  probeState.probeAttempts = 0;
+}
+
+async function clearCachedGameHandle(cdp) {
+  await safeRuntimeEvaluate(
+    cdp,
+    {
+      expression: `(() => {
+        try { delete window.__fusionTetrioGame; } catch {}
+        try { window.__fusionTetrioGame = undefined; } catch {}
+        return true;
+      })()`,
+      returnByValue: true,
+      awaitPromise: true
+    },
+    null
+  ).catch(() => undefined);
+}
+
+function attachDiscoveryLifecycleHooks(cdp, probeState) {
+  const reset = (reason) => {
+    resetDiscoveryState(probeState);
+    clearCachedGameHandle(cdp).catch(() => undefined);
+    console.log(`[browser] discovery reset reason=${reason}`);
+  };
+
+  cdp.on("Page.frameNavigated", () => reset("frame_navigated"));
+  cdp.on("Page.navigatedWithinDocument", () => reset("navigated_within_document"));
+  cdp.on("Runtime.executionContextsCleared", () => reset("execution_contexts_cleared"));
+  cdp.on("Runtime.executionContextDestroyed", () => reset("execution_context_destroyed"));
 }
 
 async function main() {
@@ -151,6 +200,12 @@ async function main() {
   console.log(
     `[browser] selector=${selector.playerSelector} nickname=${selector.playerNickname || "-"} userId=${selector.playerUserId || "-"}`
   );
+  console.log(
+    `[browser] config probePageState=${args.probePageState !== "0"} debuggerProbeMode=${debuggerProbeMode}`
+  );
+  console.log(`[browser] directScanCooldownMs=${DIRECT_SCAN_COOLDOWN_MS}`);
+  console.log("[browser] directScanMaxAttempts=unlimited");
+  console.log(`[browser] statePollMs=${pollMs}`);
 
   const perf = createBrowserPerfTracker({ enabled: perfLogEnabled });
   const network = createTetrioNetworkState();
@@ -165,15 +220,16 @@ async function main() {
   let lastSelectedPath = "";
   let lastSelectionReason = "";
   const probeState = {
-    sessionStartedAt: Date.now(),
     startupDirectScanAttempts: 0,
     startupDirectScanLastAt: 0,
     lastAttemptAt: 0,
+    probeAttempts: 0,
     gameCaptured: false,
     lastKnownPlaying: false,
     lastDumpAt: 0,
     lastCaptureSource: null
   };
+  attachDiscoveryLifecycleHooks(cdp, probeState);
 
   const stop = async () => {
     await cdp.close().catch(() => undefined);
@@ -611,7 +667,13 @@ async function readTetrioState(cdp, options) {
       gameCaptured: options.probeState.gameCaptured,
       quickGameAvailable: false,
       now,
-      sessionStartedAt: options.probeState.sessionStartedAt,
+      lastAttemptAt: options.probeState.startupDirectScanLastAt,
+      attempts: options.probeState.startupDirectScanAttempts
+    });
+    const directDisabledReason = startupDirectScanDisabledReason({
+      gameCaptured: options.probeState.gameCaptured,
+      quickGameAvailable: false,
+      now,
       lastAttemptAt: options.probeState.startupDirectScanLastAt,
       attempts: options.probeState.startupDirectScanAttempts
     });
@@ -623,7 +685,10 @@ async function readTetrioState(cdp, options) {
     const raw = await safeRuntimeEvaluate(
       cdp,
       {
-        expression: captureTetrioExportExpression({ allowStartupDirectScan }),
+        expression: captureTetrioExportExpression({
+          allowStartupDirectScan,
+          directDisabledReason
+        }),
         returnByValue: true,
         awaitPromise: true
       },
@@ -643,6 +708,17 @@ async function readTetrioState(cdp, options) {
       const perfLog = formatStateEvalPerfLog(value, elapsedMs);
       if (perfLog) {
         console.log(perfLog);
+      }
+    }
+    if (value?.scanMode === "startup_direct") {
+      if (value?.ok) {
+        console.log(
+          `[browser] direct discovery attempt=${options.probeState.startupDirectScanAttempts} source=${value.captureSource}`
+        );
+      } else {
+        console.log(
+          `[browser] direct discovery attempt=${options.probeState.startupDirectScanAttempts} reason=${value.scanReason ?? "no_game"}`
+        );
       }
     }
     return value;
@@ -671,11 +747,17 @@ async function readTetrioState(cdp, options) {
     }
   }
 
+  if (rawState?.cacheInvalidated) {
+    resetDiscoveryState(options.probeState);
+  }
+
   let state = rawState.ok ? snapshotFromRaw(rawState) : buildNoGameFailure(rawState, options);
   options.probeState.lastKnownPlaying = Boolean(state?.playing);
   let probeStatus = "skipped";
 
   const shouldCapture = options.probePageState &&
+    options.probeState.probeAttempts < 1 &&
+    options.probeState.startupDirectScanAttempts >= 3 &&
     shouldAttemptDebuggerProbe({
       mode: options.debuggerProbeMode,
       needsProbe: !state.ok || !state.ready || !state.playing || state.countdown,
@@ -689,6 +771,7 @@ async function readTetrioState(cdp, options) {
   if (shouldCapture) {
     probeStatus = "attempted";
     options.probeState.lastAttemptAt = Date.now();
+    options.probeState.probeAttempts += 1;
     if (options.network) {
       options.network.lastPageProbeAt = Date.now();
     }
@@ -723,6 +806,7 @@ async function readTetrioState(cdp, options) {
   const retainedLogs = (state.logs ?? []).filter((line) => !line.startsWith("[browser] reject reason="));
   state.logs = [
     ...retainedLogs,
+    `[browser] discovery gameCaptured=${options.probeState.gameCaptured} directAttempts=${options.probeState.startupDirectScanAttempts} directDisabledReason=${rawState?.scanReason ?? "none"} probeMode=${options.debuggerProbeMode} probePageState=${options.probePageState} probeStatus=${probeStatus}`,
     `[browser] reject reason=${rejectReason} scan=${rawState?.scanMode ?? "disabled"} attempted=${Boolean(rawState?.scanAttempted)} probe=${probeStatus}`
   ];
   if (!options.useSeedSimulationFallback || !options.network.seed) {
@@ -762,10 +846,12 @@ function buildNoGameFailure(rawState, options) {
 
 export function captureTetrioExportExpression({
   allowStartupDirectScan = false,
+  directDisabledReason = "no_game",
   startupWindowPropertyLimit = 1500
 } = {}) {
   return `(() => {
     const allowStartupDirectScan = ${allowStartupDirectScan ? "true" : "false"};
+    const directDisabledReason = ${JSON.stringify(directDisabledReason)};
     const startupWindowPropertyLimit = ${startupWindowPropertyLimit};
     const looksLikeGame = (value) =>
       value &&
@@ -799,23 +885,39 @@ export function captureTetrioExportExpression({
     const quickCandidate = directCandidates[0]?.[1];
     if (looksLikeGame(quickCandidate)) {
       const game = quickCandidate;
-      const exported = typeof game.ejectState === "function" ? game.ejectState() : null;
-      const boardState = typeof game.ejectBoardState === "function" ? game.ejectBoardState() : null;
-      return {
-        ok: true,
-        quick: true,
-        scanMode: false,
-        scanAttempted: false,
-        captureSource: "window.__fusionTetrioGame",
-        href: location.href,
-        pageTitle: document.title,
-        exported,
-        boardState,
-        pageHints: {
-          gameIsPlaying: typeof game.isPlaying === "function" ? Boolean(game.isPlaying()) : null,
-          gameIsStarted: typeof game.isStarted === "function" ? Boolean(game.isStarted()) : null
-        }
-      };
+      try {
+        const exported = typeof game.ejectState === "function" ? game.ejectState() : null;
+        const boardState = typeof game.ejectBoardState === "function" ? game.ejectBoardState() : null;
+        return {
+          ok: true,
+          quick: true,
+          scanMode: false,
+          scanAttempted: false,
+          captureSource: "window.__fusionTetrioGame",
+          href: location.href,
+          pageTitle: document.title,
+          exported,
+          boardState,
+          pageHints: {
+            gameIsPlaying: typeof game.isPlaying === "function" ? Boolean(game.isPlaying()) : null,
+            gameIsStarted: typeof game.isStarted === "function" ? Boolean(game.isStarted()) : null
+          }
+        };
+      } catch (error) {
+        try { delete window.__fusionTetrioGame; } catch {}
+        try { window.__fusionTetrioGame = undefined; } catch {}
+        return {
+          ok: false,
+          quick: false,
+          scanMode: "disabled",
+          scanAttempted: false,
+          scanReason: "cache_invalidated",
+          cacheInvalidated: true,
+          reason: error?.message || "cached TETR.IO game object became invalid",
+          href: location.href,
+          pageTitle: document.title
+        };
+      }
     }
 
     let located = null;
@@ -854,7 +956,7 @@ export function captureTetrioExportExpression({
         quick: false,
         scanMode: allowStartupDirectScan ? "startup_direct" : "disabled",
         scanAttempted: allowStartupDirectScan,
-        scanReason: allowStartupDirectScan ? "no_game" : "no_game",
+        scanReason: allowStartupDirectScan ? "no_game" : directDisabledReason,
         reason: "TETR.IO game instance not captured yet",
         href: location.href,
         pageTitle: document.title

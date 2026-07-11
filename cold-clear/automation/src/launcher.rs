@@ -278,13 +278,22 @@ impl LauncherState {
         {
             self.bot.movement_mode = MovementModeConfig::ZeroGSafe;
         }
-        if self.preset != ModePreset::Custom
-            && self.browser.debugger_probe_mode == DebuggerProbeMode::StartupOnly
-        {
-            self.browser.debugger_probe_mode = DebuggerProbeMode::Manual;
-        }
         if self.preset != ModePreset::Custom && self.matches_known_legacy_safe_preset() {
             self.apply_active_preset();
+        }
+        self.repair_known_good_preset_fields();
+    }
+
+    fn repair_known_good_preset_fields(&mut self) {
+        if self.preset != ModePreset::SoloBrowserCdpKnownGood {
+            return;
+        }
+        if self.snapshot_provider != SnapshotProviderConfig::BrowserCdp
+            || self.input_backend != InputBackendConfig::BrowserCdp
+            || !self.browser.probe_page_state
+            || self.browser.debugger_probe_mode != DebuggerProbeMode::StartupOnly
+        {
+            self.apply_solo_browser_cdp_preset();
         }
     }
 
@@ -450,7 +459,13 @@ impl LauncherApp {
 
     fn push_log(&mut self, line: impl Into<String>) {
         let line = line.into();
-        if line.contains("[browser] reject reason=TETR.IO game instance not captured yet") {
+        if line.contains("directDisabledReason=max_attempts") {
+            self.status =
+                "Direct discovery expired; restart provider after entering a game".to_owned();
+        } else if line.contains("probeMode=manual") {
+            self.status =
+                "Set Debugger Probe to Startup Only or press Capture game object".to_owned();
+        } else if line.contains("[browser] reject reason=TETR.IO game instance not captured yet") {
             self.status = "Capture Required".to_owned();
         } else if line.contains("[automation] idle waiting for next live game") {
             self.status = "Waiting".to_owned();
@@ -1556,5 +1571,34 @@ mod tests {
         assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
         assert_eq!(state.handling.action_settle_ms, 0);
         assert!(!state.handling.release_after_each_action);
+    }
+
+    #[test]
+    fn migrate_legacy_defaults_keeps_startup_only_probe_mode() {
+        let mut state = LauncherState::default();
+        state.browser.debugger_probe_mode = DebuggerProbeMode::StartupOnly;
+
+        state.migrate_legacy_defaults();
+
+        assert_eq!(
+            state.browser.debugger_probe_mode,
+            DebuggerProbeMode::StartupOnly
+        );
+    }
+
+    #[test]
+    fn solo_preset_repairs_manual_probe_mode_from_saved_state() {
+        let mut state = LauncherState::default();
+        state.browser.debugger_probe_mode = DebuggerProbeMode::Manual;
+
+        state.migrate_legacy_defaults();
+
+        assert!(state.browser.probe_page_state);
+        assert_eq!(
+            state.browser.debugger_probe_mode,
+            DebuggerProbeMode::StartupOnly
+        );
+        assert_eq!(state.snapshot_provider, SnapshotProviderConfig::BrowserCdp);
+        assert_eq!(state.input_backend, InputBackendConfig::BrowserCdp);
     }
 }

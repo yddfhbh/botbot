@@ -434,6 +434,8 @@ mod tests {
         assert!(joined.contains("--player-user-id user-123"));
         assert!(joined.contains("--dump-state-on-fail 1"));
         assert!(joined.contains("--dump-state-path automation/debug/tetrio-state-dump.json"));
+        assert!(joined.contains("--probe-page-state 1"));
+        assert!(joined.contains("--debugger-probe-mode startup_only"));
         assert!(joined.contains("--state-poll-ms 40"));
         assert!(joined.contains("--min-state-poll-ms 16"));
     }

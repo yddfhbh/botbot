@@ -6,8 +6,10 @@ import {
   captureTetrioExportExpression,
   computeEffectiveStatePollMs,
   formatStateEvalPerfLog,
+  resetDiscoveryState,
   shouldAttemptDebuggerProbe,
   shouldAttemptStartupDirectScan,
+  startupDirectScanDisabledReason,
   shouldDecodeRibbonFrame
 } from "./tetrio-cdp-source.mjs";
 
@@ -191,7 +193,6 @@ test("disabled mode still allows startup direct scan helper decisions", () => {
     shouldAttemptStartupDirectScan({
       gameCaptured: false,
       now: 20_000,
-      sessionStartedAt: 10_000,
       lastAttemptAt: 0,
       attempts: 0
     }),
@@ -201,12 +202,54 @@ test("disabled mode still allows startup direct scan helper decisions", () => {
     shouldAttemptStartupDirectScan({
       gameCaptured: true,
       now: 20_000,
-      sessionStartedAt: 10_000,
       lastAttemptAt: 0,
       attempts: 0
     }),
     false
   );
+});
+
+test("startup direct scan does not permanently expire after three failures or twenty seconds", () => {
+  assert.equal(
+    shouldAttemptStartupDirectScan({
+      gameCaptured: false,
+      now: 20_000,
+      lastAttemptAt: 18_000,
+      attempts: 3
+    }),
+    true
+  );
+  assert.equal(
+    startupDirectScanDisabledReason({
+      gameCaptured: false,
+      now: 20_000,
+      lastAttemptAt: 19_200,
+      attempts: 3
+    }),
+    "cooldown"
+  );
+});
+
+test("resetDiscoveryState re-enables direct discovery after lifecycle reset", () => {
+  const probeState = {
+    startupDirectScanAttempts: 9,
+    startupDirectScanLastAt: 19_000,
+    lastAttemptAt: 10_000,
+    probeAttempts: 1,
+    gameCaptured: true,
+    lastKnownPlaying: true,
+    lastCaptureSource: "window.game"
+  };
+
+  resetDiscoveryState(probeState);
+
+  assert.equal(probeState.startupDirectScanAttempts, 0);
+  assert.equal(probeState.startupDirectScanLastAt, 0);
+  assert.equal(probeState.lastAttemptAt, 0);
+  assert.equal(probeState.probeAttempts, 0);
+  assert.equal(probeState.gameCaptured, false);
+  assert.equal(probeState.lastKnownPlaying, false);
+  assert.equal(probeState.lastCaptureSource, null);
 });
 
 test("state perf logs show quick, startup scan, and disabled modes", () => {
