@@ -18,6 +18,52 @@ export function determineChromiumOwnership({ connectOnly, alreadyOpen }) {
   return !connectOnly && !alreadyOpen;
 }
 
+export function createSnapshotTracking() {
+  return {
+    stableSignature: "",
+    stableCount: 0,
+    lastWrittenSignature: "",
+    lastLoggedToken: ""
+  };
+}
+
+export function resetSnapshotTracking(tracking) {
+  tracking.stableSignature = "";
+  tracking.stableCount = 0;
+  tracking.lastWrittenSignature = "";
+  tracking.lastLoggedToken = "";
+  return tracking;
+}
+
+export function buildSnapshotSignature(gameEpoch, state) {
+  const queueText = state.queue.join(",");
+  return `${gameEpoch}|${state.pieceCounter}|${state.current}|${state.hold ?? "-"}|${queueText}|${state.activeX ?? "-"}|${state.activeY ?? "-"}|${state.activeRotation ?? "-"}`;
+}
+
+export function buildSnapshotToken(gameEpoch, pieceCounter) {
+  return `browser-${gameEpoch}-${pieceCounter}`;
+}
+
+export function isTetrioGameEndedState(state) {
+  return Boolean(state?.ok && state.ready === false && state.reason === "TETR.IO game ended");
+}
+
+export function shouldHandleEndedGame(state, endedHandled) {
+  return isTetrioGameEndedState(state) && !endedHandled;
+}
+
+export function isActiveTetrioGameState(state) {
+  return Boolean(state?.ok && state.ready && state.playing && !state.countdown);
+}
+
+export function shouldAdvanceGameEpoch(state, waitingForNextGame) {
+  return waitingForNextGame && isActiveTetrioGameState(state);
+}
+
+export function clearSnapshotFile(snapshotPath) {
+  rmSync(snapshotPath, { force: true });
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const snapshotPath = args.snapshotPath ?? "automation/live-snapshot.json";
@@ -61,12 +107,12 @@ async function main() {
     await installRibbonMonitor(cdp, network, msgpack);
   }
 
+  let gameEpoch = 1;
+  let waitingForNextGame = false;
+  let endedHandled = false;
   let lastReason = "";
   let lastReasonAt = 0;
-  let stableSignature = "";
-  let stableCount = 0;
-  let lastWrittenSignature = "";
-  let lastLoggedToken = "";
+  const snapshotTracking = createSnapshotTracking();
   const probeState = {
     lastCaptureAt: 0
   };
@@ -88,6 +134,25 @@ async function main() {
       probeState
     });
 
+    if (shouldHandleEndedGame(state, endedHandled)) {
+      endedHandled = true;
+      waitingForNextGame = true;
+
+      await markCurrentGameAsEnded(cdp);
+
+      resetSnapshotTracking(snapshotTracking);
+      probeState.lastCaptureAt = 0;
+      clearSnapshotFile(snapshotPath);
+
+      console.log(`[browser] game session ended epoch=${gameEpoch}`);
+      console.log("[browser] cleared ended game cache; waiting for next game");
+    }
+
+    if (isTetrioGameEndedState(state)) {
+      await sleep(pollMs);
+      continue;
+    }
+
     if (!state.ok || !state.ready || !state.playing || state.countdown) {
       const reason =
         state.reason ??
@@ -101,19 +166,26 @@ async function main() {
       continue;
     }
 
+    if (shouldAdvanceGameEpoch(state, waitingForNextGame)) {
+      gameEpoch += 1;
+      waitingForNextGame = false;
+      endedHandled = false;
+      resetSnapshotTracking(snapshotTracking);
+      console.log(`[browser] new game detected epoch=${gameEpoch}`);
+    }
+
     lastReason = "";
     lastReasonAt = 0;
 
-    const queueText = state.queue.join(",");
-    const signature = `${state.pieceCounter}|${state.current}|${state.hold ?? "-"}|${queueText}|${state.activeX ?? "-"}|${state.activeY ?? "-"}|${state.activeRotation ?? "-"}`;
-    if (signature === stableSignature) {
-      stableCount += 1;
+    const signature = buildSnapshotSignature(gameEpoch, state);
+    if (signature === snapshotTracking.stableSignature) {
+      snapshotTracking.stableCount += 1;
     } else {
-      stableSignature = signature;
-      stableCount = 1;
+      snapshotTracking.stableSignature = signature;
+      snapshotTracking.stableCount = 1;
     }
 
-    if (stableCount < 2) {
+    if (snapshotTracking.stableCount < 2) {
       await sleep(pollMs);
       continue;
     }
@@ -129,7 +201,7 @@ async function main() {
       combo: state.combo,
       incoming: state.incoming,
       pieceCounter: state.pieceCounter,
-      token: `browser-${state.pieceCounter}`,
+      token: buildSnapshotToken(gameEpoch, state.pieceCounter),
       playing: state.playing,
       countdown: state.countdown,
       activeX: Number.isFinite(state.activeX) ? state.activeX : undefined,
@@ -137,11 +209,11 @@ async function main() {
       activeRotation: state.activeRotation ?? undefined
     };
 
-    if (signature !== lastWrittenSignature) {
+    if (signature !== snapshotTracking.lastWrittenSignature) {
       writeSnapshot(snapshotPath, snapshot);
-      lastWrittenSignature = signature;
-      if (snapshot.token !== lastLoggedToken) {
-        lastLoggedToken = snapshot.token;
+      snapshotTracking.lastWrittenSignature = signature;
+      if (snapshot.token !== snapshotTracking.lastLoggedToken) {
+        snapshotTracking.lastLoggedToken = snapshot.token;
         console.log(
           `[browser] page state ready pieceCounter=${state.pieceCounter} current=${snapshot.current} hold=${snapshot.hold ?? "-"} queue=${snapshot.queue.join(",")}`
         );
@@ -150,6 +222,23 @@ async function main() {
 
     await sleep(pollMs);
   }
+}
+
+async function markCurrentGameAsEnded(cdp) {
+  await safeRuntimeEvaluate(cdp, {
+    expression: `(() => {
+      if (window.__fusionTetrioGame) {
+        window.__fusionEndedTetrioGame = window.__fusionTetrioGame;
+      }
+
+      delete window.__fusionTetrioGame;
+      delete window.__fusionTetrioBridge;
+
+      return true;
+    })()`,
+    returnByValue: true,
+    awaitPromise: true
+  }).catch(() => undefined);
 }
 
 function parseArgs(argv) {
@@ -588,26 +677,7 @@ async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent) {
   for (const callFrame of pausedEvent.callFrames ?? []) {
     const result = await cdp.send("Debugger.evaluateOnCallFrame", {
       callFrameId: callFrame.callFrameId,
-      expression: `(() => {
-        try {
-          if (
-            typeof Ai !== "undefined" &&
-            Ai &&
-            typeof Ai.ejectState === "function" &&
-            typeof Ai.ejectBoardState === "function"
-          ) {
-            window.__fusionTetrioGame = Ai;
-            window.__fusionTetrioBridge = {
-              ok: true,
-              source: "closure:Ai",
-              at: Date.now(),
-              href: location.href
-            };
-            return window.__fusionTetrioBridge;
-          }
-        } catch {}
-        return { ok: false };
-      })()`,
+      expression: pausedFrameExposureExpression(),
       returnByValue: true,
       silent: true
     }).catch(() => null);
@@ -616,6 +686,46 @@ async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent) {
     if (value?.ok) return value;
   }
   return { ok: false, reason: "TETR.IO active game variable was not in paused scopes" };
+}
+
+export function pausedFrameExposureExpression() {
+  return `(() => {
+    try {
+      if (
+        typeof Ai !== "undefined" &&
+        Ai &&
+        typeof Ai.ejectState === "function" &&
+        typeof Ai.ejectBoardState === "function"
+      ) {
+        if (Ai === window.__fusionEndedTetrioGame) {
+          try {
+            const exported = Ai.ejectState();
+            const state =
+              exported && typeof exported === "object" && exported.game
+                ? exported.game
+                : exported;
+            if (state?.destroyed || state?.dead || state?.gameover) {
+              return { ok: false };
+            }
+          } catch {
+            return { ok: false };
+          }
+
+          delete window.__fusionEndedTetrioGame;
+        }
+
+        window.__fusionTetrioGame = Ai;
+        window.__fusionTetrioBridge = {
+          ok: true,
+          source: "closure:Ai",
+          at: Date.now(),
+          href: location.href
+        };
+        return window.__fusionTetrioBridge;
+      }
+    } catch {}
+    return { ok: false };
+  })()`;
 }
 
 function buildSeedFallbackState(network) {
@@ -680,7 +790,7 @@ function getCurrentAndNext(seed, pieceIndex, nextCount = DEFAULT_NEXT_COUNT) {
   };
 }
 
-function tetrioStateExpression() {
+export function tetrioStateExpression() {
   return `(() => {
     const pieceNames = ["i", "o", "t", "s", "z", "j", "l"];
     const normalizePiece = (value) => {
@@ -772,6 +882,38 @@ function tetrioStateExpression() {
       typeof value === "object" &&
       typeof value.ejectState === "function" &&
       typeof value.ejectBoardState === "function";
+    const candidateEnded = (candidate) => {
+      if (!looksLikeGame(candidate)) return false;
+
+      try {
+        const exported = candidate.ejectState();
+        const state =
+          exported && typeof exported === "object" && exported.game
+            ? exported.game
+            : exported;
+
+        return Boolean(
+          state?.destroyed ||
+          state?.dead ||
+          state?.gameover
+        );
+      } catch {
+        return false;
+      }
+    };
+    const usableGame = (candidate) => {
+      if (!looksLikeGame(candidate)) return false;
+
+      if (candidate === window.__fusionEndedTetrioGame) {
+        if (candidateEnded(candidate)) {
+          return false;
+        }
+
+        delete window.__fusionEndedTetrioGame;
+      }
+
+      return true;
+    };
     const scanObject = (root, limit = 200) => {
       if (!root || typeof root !== "object") return null;
       let names = [];
@@ -779,7 +921,7 @@ function tetrioStateExpression() {
       for (const name of names) {
         try {
           const value = root[name];
-          if (looksLikeGame(value)) return value;
+          if (usableGame(value)) return value;
         } catch {}
       }
       return null;
@@ -787,7 +929,7 @@ function tetrioStateExpression() {
     const findGame = () => {
       const direct = [window.__fusionTetrioGame, window.tetrioGame, window.TETRIO_GAME, window.game, window.app, window.tetrio];
       for (const candidate of direct) {
-        if (looksLikeGame(candidate)) return candidate;
+        if (usableGame(candidate)) return candidate;
         const nested = scanObject(candidate);
         if (nested) return nested;
       }
@@ -795,7 +937,7 @@ function tetrioStateExpression() {
       for (const name of names) {
         try {
           const value = window[name];
-          if (looksLikeGame(value)) return value;
+          if (usableGame(value)) return value;
         } catch {}
       }
       return null;
