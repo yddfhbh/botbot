@@ -286,15 +286,46 @@ test("observer stays inactive when msgpack unpack is unavailable", async () => {
   cleanup();
 });
 
-test("environment-variable gate exists in tetrio-cdp-source", () => {
+test("DDD WebSocket observer is installed by default", () => {
   const source = readFileSync(
     new URL("./tetrio-cdp-source.mjs", import.meta.url),
     "utf8"
   );
 
-  assert.match(source, /process\.env\.FUSION_DDD_WS_OBSERVER === "1"/);
-  assert.match(source, /if \(dddWsObserverEnabled\)/);
   assert.match(source, /await import\("\.\/ddd-ws-observer\.mjs"\)/);
+  assert.match(source, /installDddWsObserver\(cdp,\s*\{/);
+  assert.match(source, /unpack:\s*msgpack\?\.unpack\s*\?\?\s*null/);
+  assert.match(source, /log:\s*message\s*=>\s*console\.log\(message\)/);
+  assert.match(source, /\[ws-observer\] installed/);
+  assert.doesNotMatch(source, /FUSION_DDD_WS_OBSERVER/);
+  assert.doesNotMatch(source, /dddWsObserverEnabled/);
+
+  const pageEnableIndex = source.indexOf('cdp.send("Page.enable")');
+  const runtimeEnableIndex = source.indexOf('cdp.send("Runtime.enable")');
+  const observerIndex = source.indexOf('await import("./ddd-ws-observer.mjs")');
+  const bringToFrontIndex = source.indexOf('cdp.send("Page.bringToFront")');
+
+  assert.ok(pageEnableIndex >= 0);
+  assert.ok(runtimeEnableIndex > pageEnableIndex);
+  assert.ok(observerIndex > runtimeEnableIndex);
+  assert.ok(bringToFrontIndex > observerIndex);
+});
+
+test("DDD WebSocket observer cleanup runs before cdp close", () => {
+  const source = readFileSync(
+    new URL("./tetrio-cdp-source.mjs", import.meta.url),
+    "utf8"
+  );
+
+  const cleanupCallIndex = source.indexOf("dddWsObserverCleanup();");
+  const cleanupGuardIndex = source.indexOf(
+    'if (typeof dddWsObserverCleanup === "function")'
+  );
+  const closeIndex = source.indexOf("await cdp.close()");
+
+  assert.ok(cleanupGuardIndex >= 0);
+  assert.ok(cleanupCallIndex > cleanupGuardIndex);
+  assert.ok(closeIndex > cleanupCallIndex);
 });
 
 test("decodeGameOptionsCandidates inspects split87 chunks and raw payload", () => {
