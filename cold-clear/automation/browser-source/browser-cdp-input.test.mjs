@@ -333,70 +333,18 @@ test("safe BODY focus allows key input", async () => {
   assert.equal(responses[0].ok, true);
 });
 
-test("first route gate failure suppresses all key input", async () => {
-  const cdp = createFakeCdp({
-    runtimeResults: [
-      {
-        visibilityState: "visible",
-        actualVisibilityState: "visible",
-        hasFocus: true,
-        actualHasFocus: true,
-        activeTag: "BODY",
-        contentEditable: false
-      },
-      {
-        ok: false,
-        reason: "page_not_focused"
-      }
-    ]
-  });
-  const { context, responses } = createContext(cdp);
+test("browser input helper source does not include first-route gate command", () => {
+  const source = readFileSync(new URL("./browser-cdp-input.mjs", import.meta.url), "utf8");
 
-  await handleMessage({ id: 7, type: "firstRouteGate" }, context);
-
-  assert.equal(
-    cdp.events.filter((event) => event.type === "keyDown" || event.type === "keyUp").length,
-    0
-  );
-  assert.equal(responses.length, 1);
-  assert.equal(responses[0].ok, false);
-  assert.equal(responses[0].error, "first_route_gate_failed");
-  assert.equal(responses[0].reason, "page_not_focused");
+  assert.equal(source.includes("firstRouteGate"), false);
+  assert.equal(source.includes("first route gate"), false);
 });
 
-test("first route gate success reports readiness without sending keys", async () => {
-  const cdp = createFakeCdp({
-    runtimeResults: [
-      {
-        visibilityState: "visible",
-        actualVisibilityState: "visible",
-        hasFocus: true,
-        actualHasFocus: true,
-        activeTag: "BODY",
-        contentEditable: false
-      },
-      {
-        ok: true,
-        rafCount: 2,
-        elapsedMs: 48
-      }
-    ]
-  });
-  const { context, responses } = createContext(cdp);
+test("browser input helper source does not create requestAnimationFrame promise gates", () => {
+  const source = readFileSync(new URL("./browser-cdp-input.mjs", import.meta.url), "utf8");
 
-  await handleMessage({ id: 8, type: "firstRouteGate" }, context);
-
-  assert.equal(
-    cdp.events.filter((event) => event.type === "keyDown" || event.type === "keyUp").length,
-    0
-  );
-  assert.deepEqual(responses[0], {
-    ok: true,
-    id: 8,
-    type: "firstRouteGate",
-    rafCount: 2,
-    elapsedMs: 48
-  });
+  assert.equal(source.includes("requestAnimationFrame"), false);
+  assert.equal(source.includes("awaitPromise: true"), false);
 });
 
 test("stdout payloads remain parseable JSON even when stderr logs are emitted", async () => {

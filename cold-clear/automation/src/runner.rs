@@ -176,15 +176,6 @@ where
                             thread::sleep(poll_delay);
                             continue;
                         }
-                        if !guard_first_vs_route(
-                            &snapshot,
-                            driver,
-                            &mut vs_sim_controller,
-                            &mut log,
-                        )? {
-                            thread::sleep(poll_delay);
-                            continue;
-                        }
                         let input_started_at = Instant::now();
                         let executed_hold = prepared.execution_plan.hold;
                         if let Err(error) = execute_plan_until_hard_drop(
@@ -578,39 +569,6 @@ where
 
 fn should_use_browser_pre_hard_drop_probe(snapshot: &GameSnapshot) -> bool {
     snapshot.source != "browser_ws_sim"
-}
-
-fn guard_first_vs_route<B, F>(
-    snapshot: &GameSnapshot,
-    driver: &mut B,
-    vs_sim_controller: &mut VsSimulationController,
-    log: &mut F,
-) -> Result<bool>
-where
-    B: InputBackend + ?Sized,
-    F: FnMut(String),
-{
-    if snapshot.source != "browser_ws_sim" || snapshot.piece_counter != Some(0) {
-        return Ok(true);
-    }
-
-    match driver.gate_first_vs_route() {
-        Ok(Some(status)) => {
-            log(format!(
-                "[vs-sim] first route gate ready raf_count={} elapsed_ms={}",
-                status.raf_count, status.elapsed_ms
-            ));
-            Ok(true)
-        }
-        Ok(None) => Ok(true),
-        Err(error) => {
-            let reason = error.to_string();
-            log(format!("[vs-sim] first route gate failed reason={reason}"));
-            vs_sim_controller.invalidate_current_round("first route gate failed", log);
-            log("[vs-sim] input suppressed before route".to_owned());
-            Ok(false)
-        }
-    }
 }
 
 fn skip_snapshot_reason(
@@ -2120,8 +2078,6 @@ mod tests {
         hard_drop_sequences: u32,
         fail_when_route_contains_hold: bool,
         fail_hard_drop: bool,
-        first_route_gate_calls: u32,
-        fail_first_route_gate: bool,
     }
 
     impl InputBackend for RoutePhaseBackend {
@@ -2149,17 +2105,6 @@ mod tests {
                 self.route_sequences += 1;
             }
             Ok(())
-        }
-
-        fn gate_first_vs_route(&mut self) -> Result<Option<crate::driver::FirstRouteGateStatus>> {
-            self.first_route_gate_calls += 1;
-            if self.fail_first_route_gate {
-                anyhow::bail!("first route gate failed");
-            }
-            Ok(Some(crate::driver::FirstRouteGateStatus {
-                raf_count: 2,
-                elapsed_ms: 33,
-            }))
         }
 
         fn release_all_keys(&mut self) -> Result<()> {
@@ -2856,110 +2801,6 @@ mod tests {
 
         assert_eq!(backend.route_sequences, 1);
         assert_eq!(backend.hard_drop_sequences, 0);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn first_route_gate_failure_suppresses_all_vs_inputs() {
-        let dir = temp_bridge_dir("vs-first-route-gate-fail");
-        let bridge_path = dir.join("vs-ws-bridge.json");
-        write_runner_bridge(&bridge_path, "4382:2034120187", true, "[]");
-        let mut controller = VsSimulationController::with_settings(true, bridge_path);
-        let mut backend = RoutePhaseBackend {
-            fail_first_route_gate: true,
-            ..Default::default()
-        };
-        let snapshot = vs_validation_snapshot();
-        let mut logs = Vec::new();
-
-        assert!(controller
-            .validate_route_preflight(&snapshot, &mut |_| {})
-            .unwrap());
-        let allowed = guard_first_vs_route(&snapshot, &mut backend, &mut controller, &mut |line| {
-            logs.push(line)
-        })
-        .unwrap();
-
-        assert!(!allowed);
-        assert_eq!(backend.first_route_gate_calls, 1);
-        assert_eq!(backend.route_sequences, 0);
-        assert_eq!(backend.hard_drop_sequences, 0);
-        assert!(logs
-            .iter()
-            .any(|line| line.contains("[vs-sim] first route gate failed reason=")));
-        assert!(logs
-            .iter()
-            .any(|line| line == "[vs-sim] input suppressed before route"));
-        assert!(controller.next_snapshot(&mut |_| {}).unwrap().is_none());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn first_route_gate_success_allows_first_vs_sequence() {
-        let dir = temp_bridge_dir("vs-first-route-gate-pass");
-        let bridge_path = dir.join("vs-ws-bridge.json");
-        write_runner_bridge(&bridge_path, "4382:2034120187", true, "[]");
-        let mut controller = VsSimulationController::with_settings(true, bridge_path);
-        let mut backend = RoutePhaseBackend::default();
-        let snapshot = vs_validation_snapshot();
-        let mut logs = Vec::new();
-
-        assert!(controller
-            .validate_route_preflight(&snapshot, &mut |_| {})
-            .unwrap());
-        assert!(
-            guard_first_vs_route(&snapshot, &mut backend, &mut controller, &mut |line| {
-                logs.push(line)
-            })
-            .unwrap()
-        );
-        execute_plan_until_hard_drop(
-            &mut backend,
-            &vs_route_plan(),
-            &HandlingConfig::default(),
-            runner_test_timings(),
-            |_| {},
-        )
-        .unwrap();
-
-        assert_eq!(backend.first_route_gate_calls, 1);
-        assert_eq!(backend.route_sequences, 1);
-        assert!(logs.iter().any(|line| {
-            line.contains("[vs-sim] first route gate ready raf_count=2 elapsed_ms=33")
-        }));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn second_vs_piece_skips_first_route_gate() {
-        let dir = temp_bridge_dir("vs-first-route-gate-second-piece");
-        let bridge_path = dir.join("vs-ws-bridge.json");
-        write_runner_bridge(&bridge_path, "4382:2034120187", true, "[]");
-        let mut controller = VsSimulationController::with_settings(true, bridge_path);
-        let mut backend = RoutePhaseBackend::default();
-        let mut snapshot = vs_validation_snapshot();
-        snapshot.piece_counter = Some(1);
-
-        assert!(
-            guard_first_vs_route(&snapshot, &mut backend, &mut controller, &mut |_| {}).unwrap()
-        );
-        assert_eq!(backend.first_route_gate_calls, 0);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn solo_snapshot_skips_first_route_gate() {
-        let dir = temp_bridge_dir("solo-first-route-gate-skip");
-        let bridge_path = dir.join("vs-ws-bridge.json");
-        write_runner_bridge(&bridge_path, "4382:2034120187", true, "[]");
-        let mut controller = VsSimulationController::with_settings(true, bridge_path);
-        let mut backend = RoutePhaseBackend::default();
-        let snapshot = runner_test_snapshot("browser-1-0", 0);
-
-        assert!(
-            guard_first_vs_route(&snapshot, &mut backend, &mut controller, &mut |_| {}).unwrap()
-        );
-        assert_eq!(backend.first_route_gate_calls, 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
