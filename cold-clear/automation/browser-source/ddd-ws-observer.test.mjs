@@ -501,32 +501,32 @@ test("observer callback fires only when active state or roundId changes", async 
   cdp.emit("Network.webSocketClosed", { requestId: "req-vs-1" });
   cleanup();
 
-  assert.deepEqual(statuses, [
-    {
-      active: true,
-      roundId: "5449:1744077373",
-      localGameId: "5449",
-      localUserId: "local-id",
-      localUsername: "hebi_",
-      seed: "1744077373"
-    },
-    {
-      active: true,
-      roundId: "5451:1744077374",
-      localGameId: "5451",
-      localUserId: "local-id",
-      localUsername: "hebi_",
-      seed: "1744077374"
-    },
-    {
-      active: false,
-      roundId: "",
-      localGameId: "",
-      localUserId: "",
-      localUsername: "",
-      seed: ""
-    }
-  ]);
+  assert.equal(statuses.length, 3);
+  assert.equal(statuses[0]?.active, true);
+  assert.equal(statuses[0]?.roundId, "5449:1744077373");
+  assert.equal(statuses[0]?.localGameId, "5449");
+  assert.equal(statuses[0]?.localUserId, "local-id");
+  assert.equal(statuses[0]?.localUsername, "hebi_");
+  assert.equal(statuses[0]?.seed, "1744077373");
+  assert.ok(Number.isFinite(statuses[0]?.readyAt));
+  assert.ok(statuses[0].readyAt > 0);
+  assert.equal(statuses[1]?.active, true);
+  assert.equal(statuses[1]?.roundId, "5451:1744077374");
+  assert.equal(statuses[1]?.localGameId, "5451");
+  assert.equal(statuses[1]?.localUserId, "local-id");
+  assert.equal(statuses[1]?.localUsername, "hebi_");
+  assert.equal(statuses[1]?.seed, "1744077374");
+  assert.ok(Number.isFinite(statuses[1]?.readyAt));
+  assert.ok(statuses[1].readyAt > 0);
+  assert.deepEqual(statuses[2], {
+    active: false,
+    roundId: "",
+    localGameId: "",
+    localUserId: "",
+    localUsername: "",
+    seed: "",
+    readyAt: 0
+  });
 });
 
 test("observer callback enables VS bridge identity tracking even without VS sim env", async () => {

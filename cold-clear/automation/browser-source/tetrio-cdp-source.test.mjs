@@ -607,6 +607,8 @@ test("resetVsObjectTracking clears VS diagnostic state", () => {
     scopeCaptureLocked: false,
     scopeFailureLogged: false,
     scopeCaptureInFlight: false,
+    scopeLastScheduledAttempt: 0,
+    scopeLastCancelReason: "",
     scopeStats: {
       framesScanned: 0,
       scopesScanned: 0,
@@ -788,7 +790,8 @@ test("VS object diagnostics keep live snapshot empty when no local object is fou
       roundId: "5449:1744077373",
       localGameId: "5449",
       localUserId: "local-user",
-      localUsername: "hebi_"
+      localUsername: "hebi_",
+      readyAt: 100
     },
     tracking,
     liveSnapshotPath,
@@ -806,7 +809,8 @@ test("VS object diagnostics keep live snapshot empty when no local object is fou
       roundId: "5449:1744077373",
       localGameId: "5449",
       localUserId: "local-user",
-      localUsername: "hebi_"
+      localUsername: "hebi_",
+      readyAt: 100
     },
     tracking,
     liveSnapshotPath,
@@ -1151,6 +1155,173 @@ test("VS paused scope capture stays safe when watchdog and finally overlap", asy
   assert.ok(cdp.history.filter((entry) => entry.method === "Debugger.resume").length >= 1);
 });
 
+test("VS diagnostics do not pause before readyAt and start the first gameplay probe at readyAt plus 150ms", async () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "vs-scope-ready-schedule-"));
+  const liveSnapshotPath = path.join(tempDir, "live-snapshot.json");
+  const vsObjectSnapshotPath = path.join(tempDir, "vs-object-snapshot.json");
+  const tracking = createVsObjectTracking();
+  const logs = [];
+  let captureCalls = 0;
+
+  const beforeReady = await processVsObjectDiagnostics(null, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "4412:ready",
+      localGameId: "4412",
+      localUserId: "local-user",
+      localUsername: "hebi_",
+      readyAt: 100
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    log: (line) => logs.push(line),
+    nowFn: () => 200,
+    readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" }),
+    captureVsObjectFromPausedScopeFn: async () => {
+      captureCalls += 1;
+      return { ok: true, objectId: "cached", candidate: { board: [], queue: [], active: true }, stats: { framesScanned: 0, scopesScanned: 0, objectsScanned: 0 } };
+    }
+  });
+  const atReady = await processVsObjectDiagnostics(null, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "4412:ready",
+      localGameId: "4412",
+      localUserId: "local-user",
+      localUsername: "hebi_",
+      readyAt: 100
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    log: (line) => logs.push(line),
+    nowFn: () => 250,
+    readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" }),
+    captureVsObjectFromPausedScopeFn: async (_cdp, options) => {
+      captureCalls += 1;
+      return {
+        ok: true,
+        objectId: "cached",
+        candidate: {
+          ok: true,
+          objectId: "cached",
+          variablePath: "p",
+          score: 100,
+          board: [],
+          queue: [],
+          active: true,
+          gameid: options.identity.gameid,
+          userid: options.identity.userid,
+          username: options.identity.username,
+          current: "t",
+          hold: null,
+          capturedAt: 250
+        },
+        stats: { framesScanned: 0, scopesScanned: 0, objectsScanned: 0 }
+      };
+    }
+  });
+
+  assert.equal(beforeReady.found, false);
+  assert.equal(atReady.found, true);
+  assert.equal(captureCalls, 1);
+  assert.ok(logs.includes("[vs-scope] probe scheduled attempt=1 ready_in_ms=50"));
+  assert.ok(logs.includes("[vs-scope] gameplay probe started attempt=1 after_ready_ms=150"));
+});
+
+test("VS diagnostics cancel a scheduled gameplay probe when the round changes", async () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "vs-scope-round-cancel-"));
+  const liveSnapshotPath = path.join(tempDir, "live-snapshot.json");
+  const vsObjectSnapshotPath = path.join(tempDir, "vs-object-snapshot.json");
+  const tracking = createVsObjectTracking();
+  const logs = [];
+
+  await processVsObjectDiagnostics(null, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "4412:pending",
+      localGameId: "4412",
+      localUserId: "local-user",
+      localUsername: "hebi_",
+      readyAt: 1000
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    log: (line) => logs.push(line),
+    nowFn: () => 500,
+    readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" })
+  });
+  await processVsObjectDiagnostics(null, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "5500:next",
+      localGameId: "5500",
+      localUserId: "local-user",
+      localUsername: "hebi_",
+      readyAt: 2000
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    log: (line) => logs.push(line),
+    nowFn: () => 600,
+    readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" })
+  });
+
+  assert.ok(logs.includes("[vs-scope] probe cancelled reason=round_changed"));
+});
+
+test("VS diagnostics cancel a scheduled gameplay probe when the round becomes inactive", async () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "vs-scope-inactive-cancel-"));
+  const liveSnapshotPath = path.join(tempDir, "live-snapshot.json");
+  const vsObjectSnapshotPath = path.join(tempDir, "vs-object-snapshot.json");
+  const tracking = createVsObjectTracking();
+  const logs = [];
+
+  await processVsObjectDiagnostics(null, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "4412:pending",
+      localGameId: "4412",
+      localUserId: "local-user",
+      localUsername: "hebi_",
+      readyAt: 1000
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    log: (line) => logs.push(line),
+    nowFn: () => 500,
+    readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" })
+  });
+  await processVsObjectDiagnostics(null, {
+    vsRoundStatus: {
+      active: false,
+      roundId: "",
+      localGameId: "",
+      localUserId: "",
+      localUsername: "",
+      readyAt: 0
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    log: (line) => logs.push(line),
+    nowFn: () => 600,
+    readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" })
+  });
+
+  assert.ok(logs.includes("[vs-scope] probe cancelled reason=inactive"));
+});
+
 test("VS diagnostics caches paused-scope object handles and stops pausing after capture", async () => {
   const tempDir = mkdtempSync(path.join(os.tmpdir(), "vs-scope-cached-"));
   const liveSnapshotPath = path.join(tempDir, "live-snapshot.json");
@@ -1177,7 +1348,8 @@ test("VS diagnostics caches paused-scope object handles and stops pausing after 
       roundId: "4412:384296123",
       localGameId: "4412",
       localUserId: "local-user",
-      localUsername: "hebi_"
+      localUsername: "hebi_",
+      readyAt: 100
     },
     tracking,
     liveSnapshotPath,
@@ -1195,7 +1367,8 @@ test("VS diagnostics caches paused-scope object handles and stops pausing after 
       roundId: "4412:384296123",
       localGameId: "4412",
       localUserId: "local-user",
-      localUsername: "hebi_"
+      localUsername: "hebi_",
+      readyAt: 100
     },
     tracking,
     liveSnapshotPath,
@@ -1213,7 +1386,8 @@ test("VS diagnostics caches paused-scope object handles and stops pausing after 
       roundId: "4412:384296123",
       localGameId: "4412",
       localUserId: "local-user",
-      localUsername: "hebi_"
+      localUsername: "hebi_",
+      readyAt: 100
     },
     tracking,
     liveSnapshotPath,
@@ -1257,7 +1431,8 @@ test("VS diagnostics discard cached objectIds on round change and capture again 
       roundId: "4412:1",
       localGameId: "4412",
       localUserId: "local-user",
-      localUsername: "hebi_"
+      localUsername: "hebi_",
+      readyAt: 100
     },
     tracking,
     liveSnapshotPath,
@@ -1272,7 +1447,8 @@ test("VS diagnostics discard cached objectIds on round change and capture again 
       roundId: "4412:1",
       localGameId: "4412",
       localUserId: "local-user",
-      localUsername: "hebi_"
+      localUsername: "hebi_",
+      readyAt: 100
     },
     tracking,
     liveSnapshotPath,
@@ -1296,7 +1472,8 @@ test("VS diagnostics discard cached objectIds on round change and capture again 
       roundId: "5500:2",
       localGameId: "5500",
       localUserId: "local-user",
-      localUsername: "hebi_"
+      localUsername: "hebi_",
+      readyAt: 1150
     },
     tracking,
     liveSnapshotPath,
@@ -1313,7 +1490,8 @@ test("VS diagnostics discard cached objectIds on round change and capture again 
       roundId: "5500:2",
       localGameId: "5500",
       localUserId: "local-user",
-      localUsername: "hebi_"
+      localUsername: "hebi_",
+      readyAt: 1150
     },
     tracking,
     liveSnapshotPath,
@@ -1347,7 +1525,8 @@ test("VS diagnostics wait for the next round after an invalid cached objectId", 
       roundId: "4412:1",
       localGameId: "4412",
       localUserId: "local-user",
-      localUsername: "hebi_"
+      localUsername: "hebi_",
+      readyAt: 100
     },
     tracking,
     liveSnapshotPath,
@@ -1362,7 +1541,8 @@ test("VS diagnostics wait for the next round after an invalid cached objectId", 
       roundId: "4412:1",
       localGameId: "4412",
       localUserId: "local-user",
-      localUsername: "hebi_"
+      localUsername: "hebi_",
+      readyAt: 100
     },
     tracking,
     liveSnapshotPath,
@@ -1381,7 +1561,8 @@ test("VS diagnostics wait for the next round after an invalid cached objectId", 
       roundId: "4412:1",
       localGameId: "4412",
       localUserId: "local-user",
-      localUsername: "hebi_"
+      localUsername: "hebi_",
+      readyAt: 100
     },
     tracking,
     liveSnapshotPath,
@@ -1396,7 +1577,8 @@ test("VS diagnostics wait for the next round after an invalid cached objectId", 
       roundId: "4412:1",
       localGameId: "4412",
       localUserId: "local-user",
-      localUsername: "hebi_"
+      localUsername: "hebi_",
+      readyAt: 100
     },
     tracking,
     liveSnapshotPath,
@@ -1427,7 +1609,8 @@ test("VS diagnostics stop after three paused-scope attempts and log the final fa
         roundId: "4412:1",
         localGameId: "4412",
         localUserId: "local-user",
-        localUsername: "hebi_"
+        localUsername: "hebi_",
+        readyAt: 50
       },
       tracking,
       liveSnapshotPath,

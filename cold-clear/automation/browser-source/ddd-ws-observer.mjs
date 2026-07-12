@@ -358,7 +358,8 @@ function emitVsRoundStatusIfChanged(observerState, onVsRoundStatus) {
   const localUserId = active ? String(current?.local?.userid ?? "") : "";
   const localUsername = active ? String(current?.local?.username ?? "") : "";
   const seed = active ? String(current?.options?.seed ?? "") : "";
-  const nextKey = `${active ? 1 : 0}|${roundId}|${localGameId}|${localUserId}|${localUsername}|${seed}`;
+  const readyAt = active ? Number(current?.readyAt ?? 0) || 0 : 0;
+  const nextKey = `${active ? 1 : 0}|${roundId}|${localGameId}|${localUserId}|${localUsername}|${seed}|${readyAt}`;
   if (nextKey === observerState.lastVsRoundStatusKey) {
     return;
   }
@@ -370,7 +371,8 @@ function emitVsRoundStatusIfChanged(observerState, onVsRoundStatus) {
       localGameId,
       localUserId,
       localUsername,
-      seed
+      seed,
+      readyAt
     });
   } catch {}
 }

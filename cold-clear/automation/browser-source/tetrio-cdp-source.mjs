@@ -23,6 +23,7 @@ const MAX_VS_SCOPE_PAUSE_BUDGET_MS = 500;
 const VS_SCOPE_INITIAL_DELAY_MS = 200;
 const VS_SCOPE_RETRY_DELAY_MS = 500;
 const VS_SCOPE_MAX_ATTEMPTS = 3;
+const VS_SCOPE_GAMEPLAY_ATTEMPT_OFFSETS_MS = [150, 700, 1500];
 const VS_SCOPE_MAX_DEPTH = 2;
 const VS_SCOPE_MAX_OBJECTS = 200;
 const VS_SCOPE_MAX_PROPERTIES = 80;
@@ -63,6 +64,8 @@ export function createVsObjectTracking() {
     scopeCaptureLocked: false,
     scopeFailureLogged: false,
     scopeCaptureInFlight: false,
+    scopeLastScheduledAttempt: 0,
+    scopeLastCancelReason: "",
     scopeStats: createVsScopeStats()
   };
 }
@@ -92,6 +95,8 @@ export function resetVsObjectTracking(tracking) {
   tracking.scopeCaptureLocked = false;
   tracking.scopeFailureLogged = false;
   tracking.scopeCaptureInFlight = false;
+  tracking.scopeLastScheduledAttempt = 0;
+  tracking.scopeLastCancelReason = "";
   tracking.scopeStats = createVsScopeStats();
   return tracking;
 }
@@ -280,7 +285,8 @@ async function main() {
     localGameId: "",
     localUserId: "",
     localUsername: "",
-    seed: ""
+    seed: "",
+    readyAt: 0
   };
   let lastPerfLoggedAt = Date.now();
   let loopStartedAt = Date.now();
@@ -305,7 +311,8 @@ async function main() {
           localGameId: nextActive ? String(status?.localGameId ?? "") : "",
           localUserId: nextActive ? String(status?.localUserId ?? "") : "",
           localUsername: nextActive ? String(status?.localUsername ?? "") : "",
-          seed: nextActive ? String(status?.seed ?? "") : ""
+          seed: nextActive ? String(status?.seed ?? "") : "",
+          readyAt: nextActive ? Number(status?.readyAt ?? 0) || 0 : 0
         };
         if (!changed) {
           return;
@@ -352,6 +359,7 @@ async function main() {
   };
 
   const stop = async () => {
+    clearVsScopeSchedule(vsObjectTracking, "browser_closed", (message) => console.log(message));
     if (typeof dddWsObserverCleanup === "function") {
       try {
         dddWsObserverCleanup();
@@ -376,6 +384,9 @@ async function main() {
 
     if (vsRoundStatus.active) {
       if (vsObjectTracking.lastActiveRoundId !== vsRoundStatus.roundId) {
+        if (vsObjectTracking.lastActiveRoundId) {
+          clearVsScopeSchedule(vsObjectTracking, "round_changed", (message) => console.log(message));
+        }
         vsObjectTracking.lastActiveRoundId = vsRoundStatus.roundId;
         resetSnapshotTracking(snapshotTracking);
         probeState.lastCaptureAt = 0;
@@ -408,6 +419,7 @@ async function main() {
     }
 
     if (vsObjectTracking.lastActiveRoundId) {
+      clearVsScopeSchedule(vsObjectTracking, "inactive", (message) => console.log(message));
       resetVsObjectTracking(vsObjectTracking);
       clearSnapshotFile(vsObjectSnapshotPath);
       clearSnapshotFile(snapshotPath);
@@ -912,6 +924,8 @@ function resetVsScopeRoundState(tracking, now) {
   tracking.scopeCaptureLocked = false;
   tracking.scopeFailureLogged = false;
   tracking.scopeCaptureInFlight = false;
+  tracking.scopeLastScheduledAttempt = 0;
+  tracking.scopeLastCancelReason = "";
   tracking.scopeStats = createVsScopeStats();
 }
 
@@ -994,6 +1008,22 @@ function logVsScopeNotFound(roundId, attempt, stats, log = (message) => console.
   log(`objects_scanned=${stats.objectsScanned}`);
 }
 
+function logVsScopeScheduled(attempt, readyInMs, log = (message) => console.log(message)) {
+  log(`[vs-scope] probe scheduled attempt=${attempt} ready_in_ms=${Math.max(0, readyInMs)}`);
+}
+
+function logVsScopeGameplayProbeStarted(
+  attempt,
+  afterReadyMs,
+  log = (message) => console.log(message)
+) {
+  log(`[vs-scope] gameplay probe started attempt=${attempt} after_ready_ms=${Math.max(0, afterReadyMs)}`);
+}
+
+function logVsScopeProbeCancelled(reason, log = (message) => console.log(message)) {
+  log(`[vs-scope] probe cancelled reason=${reason}`);
+}
+
 function measureVsPauseElapsedMs(pauseStartedAt, budgetMs, nowFn = () => Date.now()) {
   if (!pauseStartedAt) {
     return 0;
@@ -1002,6 +1032,33 @@ function measureVsPauseElapsedMs(pauseStartedAt, budgetMs, nowFn = () => Date.no
     budgetMs,
     Math.max(0, nowFn() - pauseStartedAt)
   );
+}
+
+function resolveVsScopeAttemptAt(readyAt, attempt) {
+  const readyTime = Number(readyAt);
+  if (!Number.isFinite(readyTime) || readyTime <= 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const offsetMs =
+    VS_SCOPE_GAMEPLAY_ATTEMPT_OFFSETS_MS[Math.max(0, attempt - 1)] ??
+    VS_SCOPE_GAMEPLAY_ATTEMPT_OFFSETS_MS[VS_SCOPE_GAMEPLAY_ATTEMPT_OFFSETS_MS.length - 1];
+  return readyTime + offsetMs;
+}
+
+function clearVsScopeSchedule(tracking, reason, log = (message) => console.log(message)) {
+  const hadPendingProbe =
+    Boolean(tracking.lastActiveRoundId) &&
+    !tracking.cachedObjectId &&
+    !tracking.scopeCaptureLocked &&
+    tracking.scopeAttempts < VS_SCOPE_MAX_ATTEMPTS &&
+    (tracking.scopeLastScheduledAttempt > 0 || tracking.scopeCaptureInFlight);
+  if (hadPendingProbe && tracking.scopeLastCancelReason !== reason) {
+    logVsScopeProbeCancelled(reason, log);
+  }
+  tracking.nextScopeAttemptAt = 0;
+  tracking.scopeCaptureInFlight = false;
+  tracking.scopeLastScheduledAttempt = 0;
+  tracking.scopeLastCancelReason = reason;
 }
 
 function formatVsRootPath(name) {
@@ -1793,6 +1850,7 @@ export async function captureVsLocalGameObjectFromPausedScope(
     log = (message) => console.log(message),
     getVsRoundStatus = () => ({ active: true, roundId }),
     attempt = 1,
+    afterReadyMs = 0,
     pauseBudgetMs = resolveVsScopePauseBudgetMs(),
     nowFn = () => Date.now()
   }
@@ -1826,7 +1884,9 @@ export async function captureVsLocalGameObjectFromPausedScope(
     await cdp.send("Debugger.enable").catch(() => undefined);
     debuggerEnabled = true;
     pauseStartedAt = nowFn();
-    log(`[vs-scope] pause started attempt=${attempt}`);
+    log(
+      `[vs-scope] pause started roundId=${roundId} attempt=${attempt} after_ready_ms=${Math.max(0, afterReadyMs)}`
+    );
     watchdog = setTimeout(() => {
       const elapsedMs = measureVsPauseElapsedMs(pauseStartedAt, budgetMs, nowFn);
       log(`[vs-scope] resume watchdog fired elapsed_ms=${elapsedMs}`);
@@ -2006,13 +2066,23 @@ export async function processVsObjectDiagnostics(
     nowFn = () => Date.now()
   }
 ) {
+  if (!scopeTraceEnabled && tracking.lastActiveRoundId) {
+    clearVsScopeSchedule(tracking, "trace_disabled", log);
+  }
   if (!vsRoundStatus?.active) {
+    if (tracking.lastActiveRoundId) {
+      clearVsScopeSchedule(tracking, "inactive", log);
+    }
     return { handled: false, found: false };
   }
 
   const roundId = String(vsRoundStatus.roundId ?? "");
   const now = nowFn();
+  tracking.lastActiveRoundId = roundId;
   if (tracking.roundId !== roundId) {
+    if (tracking.roundId) {
+      clearVsScopeSchedule(tracking, "round_changed", log);
+    }
     tracking.roundId = roundId;
     tracking.lastSnapshotSignature = "";
     tracking.lastCandidateLogSignature = "";
@@ -2028,6 +2098,7 @@ export async function processVsObjectDiagnostics(
     userid: vsRoundStatus.localUserId,
     username: vsRoundStatus.localUsername
   };
+  const readyAt = Number(vsRoundStatus.readyAt ?? 0) || 0;
 
   if (tracking.cachedObjectId) {
     const cachedCandidate = await readVsCachedObjectStateFn(cdp, {
@@ -2068,19 +2139,36 @@ export async function processVsObjectDiagnostics(
     !tracking.scopeCaptureLocked &&
     !tracking.scopeCaptureInFlight
   ) {
+    const nextAttempt = tracking.scopeAttempts + 1;
+    const nextAttemptAt = resolveVsScopeAttemptAt(readyAt, nextAttempt);
+    tracking.nextScopeAttemptAt = nextAttemptAt;
+    if (
+      Number.isFinite(nextAttemptAt) &&
+      nextAttempt <= VS_SCOPE_MAX_ATTEMPTS &&
+      tracking.scopeLastScheduledAttempt !== nextAttempt
+    ) {
+      logVsScopeScheduled(nextAttempt, nextAttemptAt - now, log);
+      tracking.scopeLastScheduledAttempt = nextAttempt;
+      tracking.scopeLastCancelReason = "";
+    }
     const readyForScopeAttempt =
       tracking.scopeAttempts < VS_SCOPE_MAX_ATTEMPTS &&
-      now >= tracking.nextScopeAttemptAt &&
+      Number.isFinite(nextAttemptAt) &&
+      now >= nextAttemptAt &&
       isVsRoundStillActive(roundId, getVsRoundStatus);
     if (readyForScopeAttempt) {
       tracking.scopeAttempts += 1;
+      const afterReadyMs = Math.max(0, now - readyAt);
+      logVsScopeGameplayProbeStarted(tracking.scopeAttempts, afterReadyMs, log);
       tracking.scopeCaptureInFlight = true;
       const scopeCapture = await captureVsObjectFromPausedScopeFn(cdp, {
         roundId,
         identity,
         log,
         getVsRoundStatus,
-        attempt: tracking.scopeAttempts
+        attempt: tracking.scopeAttempts,
+        afterReadyMs,
+        nowFn
       }).finally(() => {
         tracking.scopeCaptureInFlight = false;
       });
@@ -2092,7 +2180,10 @@ export async function processVsObjectDiagnostics(
         candidate = scopeCapture.candidate;
         snapshotSource = "paused_scope";
       } else {
-        tracking.nextScopeAttemptAt = nowFn() + VS_SCOPE_RETRY_DELAY_MS;
+        tracking.nextScopeAttemptAt = resolveVsScopeAttemptAt(
+          readyAt,
+          tracking.scopeAttempts + 1
+        );
         if (scopeCapture.cancelled) {
           return { handled: true, found: false, candidate: null };
         }
