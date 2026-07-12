@@ -1,10 +1,11 @@
 import { appendFileSync, mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import {
+  DEFAULT_BRIDGE_PATH,
   createVsBridgeState,
+  ingestVsBridgeRoot,
   isVsWsSimEnabled,
   markVsBridgeInactive,
-  updateVsBridgeState
 } from "./vs-ws-bridge.mjs";
 
 const MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
@@ -14,7 +15,7 @@ const MAX_TRACE_RECORDS = 500;
 const MAX_TRACE_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_TRACE_RECORD_BYTES = 32 * 1024;
 const DEFAULT_TRACE_FILE_PATH = path.join("automation", "ws-live-candidates.jsonl");
-const DEFAULT_VS_BRIDGE_PATH = path.join("automation", "vs-ws-bridge.json");
+const DEFAULT_VS_BRIDGE_PATH = DEFAULT_BRIDGE_PATH;
 const SENSITIVE_KEYS = new Set([
   "token",
   "auth",
@@ -169,6 +170,17 @@ export async function installDddWsObserver(
     return () => {};
   }
 
+  let vsBridge = null;
+  if (vsSimEnabled) {
+    try {
+      vsBridge = createVsBridgeState(vsBridgePath, log);
+    } catch (error) {
+      log?.(
+        `[vs-bridge] initialization failed: ${error?.message ?? String(error)}`
+      );
+    }
+  }
+
   const observerState = {
     requestUrls: new Map(),
     lastOptionsSignature: "",
@@ -177,7 +189,7 @@ export async function installDddWsObserver(
     decodeAttempts: 0,
     optionsCaptured: 0,
     trace: null,
-    vsBridge: vsSimEnabled ? createVsBridgeState(vsBridgePath, log) : null
+    vsBridge
   };
   if (traceEnabled) {
     try {
@@ -231,12 +243,27 @@ export async function installDddWsObserver(
         }
         const decodedRoots = collectDecodedRoots(payload, unpack);
         const candidates = collectOptionCandidates(decodedRoots);
+        const timestamp = Date.now();
+        const urlHost = resolveTraceUrlHost(event?.requestId, observerState);
         observerState.decodeAttempts += decodeAttemptCount(payload);
         for (const chunk of split87Frame(payload)) {
           observerState.decodeAttempts += decodeAttemptCount(chunk);
         }
         logCapturedCandidates(candidates, event?.requestId, observerState, log);
-        updateVsBridgeState(observerState.vsBridge, decodedRoots, log);
+        for (const decodedRoot of decodedRoots) {
+          try {
+            ingestVsBridgeRoot(
+              observerState.vsBridge,
+              decodedRoot,
+              {
+                timestamp,
+                urlHost,
+                requestId: event?.requestId ?? null
+              },
+              log
+            );
+          } catch {}
+        }
         traceDecodedRoots(decodedRoots, event, observerState, log);
         return;
       }
@@ -256,8 +283,23 @@ export async function installDddWsObserver(
         }
         const decodedRoots = collectDecodedRoots(parsed, unpack);
         const candidates = collectOptionCandidates(decodedRoots);
+        const timestamp = Date.now();
+        const urlHost = resolveTraceUrlHost(event?.requestId, observerState);
         logCapturedCandidates(candidates, event?.requestId, observerState, log);
-        updateVsBridgeState(observerState.vsBridge, decodedRoots, log);
+        for (const decodedRoot of decodedRoots) {
+          try {
+            ingestVsBridgeRoot(
+              observerState.vsBridge,
+              decodedRoot,
+              {
+                timestamp,
+                urlHost,
+                requestId: event?.requestId ?? null
+              },
+              log
+            );
+          } catch {}
+        }
         traceDecodedRoots(decodedRoots, event, observerState, log);
       }
     } catch {}

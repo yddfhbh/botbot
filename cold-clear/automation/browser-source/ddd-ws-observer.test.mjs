@@ -338,6 +338,79 @@ test("observer stays inactive when msgpack unpack is unavailable", async () => {
   cleanup();
 });
 
+test("VS sim OFF leaves bridge logging and files untouched", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const { dir, filePath } = makeTempTraceFile("vs-ws-bridge.json");
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: (buffer) => JSON.parse(buffer.toString("utf8")),
+      log: (line) => logs.push(line),
+      vsSimEnabled: false,
+      vsBridgePath: filePath
+    });
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      requestId: "req-1",
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify({
+          user: { _id: "local-id", username: "hebi_" },
+          players: [
+            {
+              userid: "local-id",
+              gameid: 5449,
+              options: {
+                seed: 1744077373,
+                bagtype: "7-bag",
+                nextcount: 5,
+                boardwidth: 10,
+                boardheight: 20
+              }
+            },
+            {
+              userid: "guest-id",
+              gameid: 5450,
+              options: {
+                seed: 1744077373,
+                bagtype: "7-bag",
+                nextcount: 5,
+                boardwidth: 10,
+                boardheight: 20
+              }
+            }
+          ]
+        })
+      }
+    });
+
+    cleanup();
+
+    assert.equal(existsSync(filePath), false);
+    assert.equal(logs.some((line) => line.startsWith("[vs-bridge]")), false);
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("VS bridge initialization failure does not stop the observer", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+
+  const cleanup = await installDddWsObserver(cdp, {
+    unpack: () => ({ seed: 1, bagtype: "7-bag" }),
+    log: (line) => logs.push(line),
+    vsSimEnabled: true,
+    vsBridgePath: Symbol("bad-path")
+  });
+
+  assert.equal(typeof cleanup, "function");
+  assert.ok(
+    logs.some((line) => line.startsWith("[vs-bridge] initialization failed:"))
+  );
+});
+
 test("trace file is not created when trace env is absent", async () => {
   const cdp = new FakeCdp();
   const { dir, filePath } = makeTempTraceFile();
