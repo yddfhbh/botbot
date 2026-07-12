@@ -291,7 +291,7 @@ function tryBuildBridge(state, capturedAt, log) {
 
   if (safeWriteBridgeFile(state, log)) {
     log?.(
-      `[vs-bridge] readyAt offset_ms=${built.bridge.readyOffsetMs ?? 0} source=precountdown`
+      `[vs-bridge] readyAt offset_ms=${built.bridge.readyOffsetMs ?? 0} source=${built.bridge.readyOffsetSource ?? "precountdown_fallback"}`
     );
     log?.(`[vs-bridge] written roundId=${state.current.roundId}`);
   }
@@ -356,7 +356,8 @@ function buildBridgeFromState(state, capturedAt) {
     return null;
   }
 
-  const readyOffsetMs = normalizeDuration(options.precountdown ?? 0);
+  const readyTiming = resolveReadyTiming(options);
+  const readyOffsetMs = readyTiming.offsetMs;
   const readyAt = (state.roundObservedAt || capturedAt) + readyOffsetMs;
 
   return {
@@ -365,6 +366,7 @@ function buildBridgeFromState(state, capturedAt) {
       roundId: `${localGameId}:${roundSeed}`,
       readyAt,
       readyOffsetMs,
+      readyOffsetSource: readyTiming.source,
       local: summarizeBridgePlayer(localPlayer, state.selfUser),
       opponents: opponents.map((player) => summarizeBridgePlayer(player, null)),
       options
@@ -566,6 +568,22 @@ function pickBridgeOptions(roomOptions, localOptions, roundSeed) {
     }
   }
   return options;
+}
+
+function resolveReadyTiming(options) {
+  const countdownCount = normalizeCount(options?.countdown_count);
+  const countdownIntervalMs = normalizeDuration(options?.countdown_interval);
+  if (countdownCount > 0 && countdownIntervalMs > 0) {
+    return {
+      offsetMs: countdownCount * countdownIntervalMs,
+      source: "countdown"
+    };
+  }
+
+  return {
+    offsetMs: normalizeDuration(options?.precountdown ?? 0),
+    source: "precountdown_fallback"
+  };
 }
 
 function maybeLogResolvedLocalPlayer(state, local, log) {

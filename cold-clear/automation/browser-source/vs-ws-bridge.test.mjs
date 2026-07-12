@@ -189,8 +189,29 @@ test("deriveVsRoundBridge computes readyAt from room countdown options", () => {
   const result = deriveVsRoundBridge(combinedRoundRoot(), capturedAt);
 
   assert.ok(result);
+  assert.equal(result.bridge.readyAt, capturedAt + 3000);
+  assert.equal(result.bridge.readyOffsetMs, 3000);
+  assert.equal(result.bridge.readyOffsetSource, "countdown");
+});
+
+test("deriveVsRoundBridge falls back to precountdown when countdown metadata is invalid", () => {
+  const capturedAt = 1783780572968;
+  const result = deriveVsRoundBridge(
+    combinedRoundRoot({
+      options: {
+        seed: 187156,
+        precountdown: 5000,
+        countdown_count: 0,
+        countdown_interval: "bad"
+      }
+    }),
+    capturedAt
+  );
+
+  assert.ok(result);
   assert.equal(result.bridge.readyAt, capturedAt + 5000);
   assert.equal(result.bridge.readyOffsetMs, 5000);
+  assert.equal(result.bridge.readyOffsetSource, "precountdown_fallback");
 });
 
 test("writeVsBridgeFile writes atomically without leaving a temp file", () => {
@@ -355,13 +376,13 @@ test("room options arriving later update readyAt without changing the round seed
     const bridge = readJson(filePath);
     assert.equal(bridge.options.seed, 1744077373);
     assert.equal(bridge.roomSeed, 187156);
-    assert.equal(bridge.readyAt, 1000 + 5000);
+    assert.equal(bridge.readyAt, 1000 + 3000);
   } finally {
     cleanupTempDir(dir);
   }
 });
 
-test("readyAt log uses precountdown only even when countdown metadata is present", () => {
+test("readyAt log prefers countdown and does not add precountdown on top", () => {
   const { dir, filePath } = makeTempBridgeFile();
   const logs = [];
 
@@ -372,7 +393,35 @@ test("readyAt log uses precountdown only even when countdown metadata is present
     );
 
     assert.ok(
-      logs.includes("[vs-bridge] readyAt offset_ms=5000 source=precountdown")
+      logs.includes("[vs-bridge] readyAt offset_ms=3000 source=countdown")
+    );
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("readyAt log falls back to precountdown when countdown metadata is missing", () => {
+  const { dir, filePath } = makeTempBridgeFile();
+  const logs = [];
+
+  try {
+    const state = createVsBridgeState(filePath, (line) => logs.push(line));
+    ingestVsBridgeRoot(
+      state,
+      combinedRoundRoot({
+        options: {
+          seed: 187156,
+          precountdown: 5000
+        }
+      }),
+      { timestamp: 1000 },
+      (line) => logs.push(line)
+    );
+
+    assert.ok(
+      logs.includes(
+        "[vs-bridge] readyAt offset_ms=5000 source=precountdown_fallback"
+      )
     );
   } finally {
     cleanupTempDir(dir);
