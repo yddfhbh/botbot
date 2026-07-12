@@ -13,6 +13,9 @@ import {
 
 const DEFAULT_NEXT_COUNT = 6;
 const DEFAULT_STATUS_MS = 2500;
+const DEFAULT_CAPTURE_COOLDOWN_MS = 2000;
+const DEFAULT_SUPPRESSED_REASON = "VS WebSocket simulation owns live state";
+const PERF_LOG_INTERVAL_MS = 2000;
 
 export function determineChromiumOwnership({ connectOnly, alreadyOpen }) {
   return !connectOnly && !alreadyOpen;
@@ -61,6 +64,60 @@ export function resolveUseSeedSimulationFallback(
   return requestedValue && env?.FUSION_VS_WS_SIM !== "1";
 }
 
+export function isVsWsSimEnvEnabled(env = process.env) {
+  return env?.FUSION_VS_WS_SIM === "1";
+}
+
+export function shouldAttemptClosureCapture({
+  probePageState,
+  suppressClosureCapture,
+  stateOk,
+  lastCaptureAt = 0,
+  lastPageProbeAt = 0,
+  now = Date.now(),
+  cooldownMs = DEFAULT_CAPTURE_COOLDOWN_MS
+}) {
+  return Boolean(
+    probePageState &&
+      !suppressClosureCapture &&
+      !stateOk &&
+      now - lastCaptureAt >= cooldownMs &&
+      now - lastPageProbeAt >= cooldownMs
+  );
+}
+
+export function shouldLogStateReason({
+  reason,
+  lastReason,
+  lastReasonAt,
+  now = Date.now(),
+  statusMs = DEFAULT_STATUS_MS,
+  suppressRepeatedReason = false
+}) {
+  if (reason !== lastReason) {
+    return true;
+  }
+  if (suppressRepeatedReason) {
+    return false;
+  }
+  return now - lastReasonAt >= statusMs;
+}
+
+function maybeLogBrowserPerf({
+  browserPerfEnabled,
+  lastPerfLoggedAt,
+  maxEventLoopDelayMs
+}) {
+  if (!browserPerfEnabled || Date.now() - lastPerfLoggedAt < PERF_LOG_INTERVAL_MS) {
+    return null;
+  }
+  console.log(`[browser-perf] max_event_loop_delay_ms=${maxEventLoopDelayMs}`);
+  return {
+    lastPerfLoggedAt: Date.now(),
+    maxEventLoopDelayMs: 0
+  };
+}
+
 export function isTetrioGameEndedState(state) {
   return Boolean(state?.ok && state.ready === false && state.reason === "TETR.IO game ended");
 }
@@ -94,6 +151,8 @@ async function main() {
   const useSeedSimulationFallback = resolveUseSeedSimulationFallback(
     args.useSeedSimulationFallback !== "0"
   );
+  const vsWsSimEnabled = isVsWsSimEnvEnabled();
+  const browserPerfEnabled = process.env.FUSION_BROWSER_PERF === "1";
   const chromePath = process.env.CHROME_PATH || "";
   const msgpack = await loadOptionalMsgpack();
 
@@ -117,6 +176,11 @@ async function main() {
   console.log(`[browser] connected to ${target.title || target.url} on port ${port}`);
 
   let dddWsObserverCleanup = null;
+  let vsRoundActive = false;
+  let vsRoundId = "";
+  let lastPerfLoggedAt = Date.now();
+  let loopStartedAt = Date.now();
+  let maxEventLoopDelayMs = 0;
   try {
     const { installDddWsObserver } =
       await import("./ddd-ws-observer.mjs");
@@ -124,6 +188,25 @@ async function main() {
     dddWsObserverCleanup = await installDddWsObserver(cdp, {
       unpack: msgpack?.unpack ?? null,
       log: message => console.log(message),
+      onVsRoundStatus: (status) => {
+        const nextActive = Boolean(status?.active);
+        const nextRoundId = nextActive ? String(status?.roundId ?? "") : "";
+        const changed =
+          nextActive !== vsRoundActive || nextRoundId !== vsRoundId;
+        vsRoundActive = nextActive;
+        vsRoundId = nextRoundId;
+        if (!changed || !vsWsSimEnabled) {
+          return;
+        }
+        if (vsRoundActive) {
+          console.log(
+            `[browser] VS round active; closure capture probe suspended roundId=${vsRoundId}`
+          );
+        } else {
+          console.log("[browser] VS round inactive; closure capture probe restored");
+        }
+      },
+      perfEnabled: browserPerfEnabled
     });
 
     console.log("[ws-observer] installed");
@@ -171,11 +254,20 @@ async function main() {
   process.on("SIGTERM", () => stop().finally(() => process.exit(0)));
 
   while (true) {
+    const loopNow = Date.now();
+    maxEventLoopDelayMs = Math.max(
+      maxEventLoopDelayMs,
+      Math.max(0, loopNow - (loopStartedAt + pollMs))
+    );
+    loopStartedAt = loopNow;
     const state = await readTetrioState(cdp, {
       probePageState,
       useSeedSimulationFallback,
       network,
-      probeState
+      probeState,
+      suppressClosureCapture: vsWsSimEnabled && vsRoundActive,
+      suppressedReason: DEFAULT_SUPPRESSED_REASON,
+      perfEnabled: browserPerfEnabled
     });
 
     if (shouldHandleEndedGame(state, endedHandled)) {
@@ -193,6 +285,15 @@ async function main() {
     }
 
     if (isTetrioGameEndedState(state)) {
+      const perfUpdate = maybeLogBrowserPerf({
+        browserPerfEnabled,
+        lastPerfLoggedAt,
+        maxEventLoopDelayMs
+      });
+      if (perfUpdate) {
+        lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
+        maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+      }
       await sleep(pollMs);
       continue;
     }
@@ -201,10 +302,26 @@ async function main() {
       const reason =
         state.reason ??
         (!state.playing ? "page is not playing" : state.countdown ? "countdown active" : "state not ready");
-      if (reason !== lastReason || Date.now() - lastReasonAt >= DEFAULT_STATUS_MS) {
+      const now = Date.now();
+      if (shouldLogStateReason({
+        reason,
+        lastReason,
+        lastReasonAt,
+        now,
+        suppressRepeatedReason: state.reason === DEFAULT_SUPPRESSED_REASON
+      })) {
         console.log(`[browser] ${reason}`);
         lastReason = reason;
-        lastReasonAt = Date.now();
+        lastReasonAt = now;
+      }
+      const perfUpdate = maybeLogBrowserPerf({
+        browserPerfEnabled,
+        lastPerfLoggedAt,
+        maxEventLoopDelayMs
+      });
+      if (perfUpdate) {
+        lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
+        maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
       }
       await sleep(pollMs);
       continue;
@@ -267,9 +384,11 @@ async function main() {
         pieceKey !== snapshotTracking.lastPerfLoggedPieceKey
       ) {
         snapshotTracking.lastPerfLoggedPieceKey = pieceKey;
-        console.log(
-          `[browser-perf] piece_change_to_snapshot_ms=${Math.max(0, Date.now() - snapshotTracking.pendingPieceDetectedAt)}`
-        );
+        if (browserPerfEnabled) {
+          console.log(
+            `[browser-perf] piece_change_to_snapshot_ms=${Math.max(0, Date.now() - snapshotTracking.pendingPieceDetectedAt)}`
+          );
+        }
       }
       if (snapshot.token !== snapshotTracking.lastLoggedToken) {
         snapshotTracking.lastLoggedToken = snapshot.token;
@@ -277,6 +396,16 @@ async function main() {
           `[browser] page state ready pieceCounter=${state.pieceCounter} current=${snapshot.current} hold=${snapshot.hold ?? "-"} queue=${snapshot.queue.join(",")}`
         );
       }
+    }
+
+    const perfUpdate = maybeLogBrowserPerf({
+      browserPerfEnabled,
+      lastPerfLoggedAt,
+      maxEventLoopDelayMs
+    });
+    if (perfUpdate) {
+      lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
+      maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
     }
 
     await sleep(pollMs);
@@ -596,7 +725,7 @@ function finiteNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
-async function readTetrioState(cdp, options) {
+export async function readTetrioState(cdp, options) {
   const read = async () => {
     const raw = await safeRuntimeEvaluate(cdp, {
       expression: tetrioStateExpression(),
@@ -615,21 +744,32 @@ async function readTetrioState(cdp, options) {
   };
 
   let state = await read();
-  const shouldCapture =
-    options.probePageState &&
-    !state.ok &&
-    Date.now() - (options.probeState?.lastCaptureAt ?? 0) >= 2000 &&
-    Date.now() - (options.network?.lastPageProbeAt ?? 0) >= 2000;
+  const now = Date.now();
+  const shouldCapture = shouldAttemptClosureCapture({
+    probePageState: options.probePageState,
+    suppressClosureCapture: options.suppressClosureCapture,
+    stateOk: state.ok,
+    lastCaptureAt: options.probeState?.lastCaptureAt ?? 0,
+    lastPageProbeAt: options.network?.lastPageProbeAt ?? 0,
+    now
+  });
 
   if (shouldCapture) {
-    options.probeState.lastCaptureAt = Date.now();
+    const captureStartedAt = Date.now();
+    options.probeState.lastCaptureAt = captureStartedAt;
     if (options.network) {
-      options.network.lastPageProbeAt = Date.now();
+      options.network.lastPageProbeAt = captureStartedAt;
     }
-    const capture = await captureTetrioGame(cdp).catch((error) => ({
+    const captureFn = options.captureGameFn ?? captureTetrioGame;
+    const capture = await captureFn(cdp).catch((error) => ({
       ok: false,
       reason: error?.message ?? String(error)
     }));
+    if (options.perfEnabled) {
+      console.log(
+        `[browser-perf] closure_capture elapsed_ms=${Math.max(0, Date.now() - captureStartedAt)}`
+      );
+    }
     if (capture.ok) {
       console.log(`[browser] page probe exposed game object via ${capture.source}`);
       state = await read();
@@ -639,6 +779,13 @@ async function readTetrioState(cdp, options) {
         reason: `${state.reason}; page probe: ${capture.reason}`
       };
     }
+  }
+
+  if (options.suppressClosureCapture && !state.ok) {
+    return {
+      ...state,
+      reason: options.suppressedReason ?? DEFAULT_SUPPRESSED_REASON
+    };
   }
 
   if (state.ok) {

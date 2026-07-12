@@ -91,6 +91,56 @@ function readJsonLines(filePath) {
   return content.split("\n").map((line) => JSON.parse(line));
 }
 
+function vsRoundPayload({
+  localGameId = 5449,
+  opponentGameId = 5450,
+  seed = 1744077373
+} = {}) {
+  return {
+    user: {
+      _id: "local-id",
+      username: "hebi_"
+    },
+    players: [
+      {
+        userid: "local-id",
+        _id: "local-id",
+        username: "hebi_",
+        gameid: localGameId,
+        options: {
+          gameid: localGameId,
+          seed,
+          bagtype: "7-bag",
+          nextcount: 5,
+          boardwidth: 10,
+          boardheight: 20
+        }
+      },
+      {
+        userid: "guest-id",
+        _id: "guest-id",
+        username: "guest-e00651",
+        gameid: opponentGameId,
+        options: {
+          gameid: opponentGameId,
+          seed,
+          bagtype: "7-bag",
+          nextcount: 5,
+          boardwidth: 10,
+          boardheight: 20
+        }
+      }
+    ],
+    options: {
+      seed: 187156,
+      precountdown: 5000,
+      countdown_count: 3,
+      countdown_interval: 1000,
+      garbagemultiplier: 0
+    }
+  };
+}
+
 async function withTraceEnv(value, run) {
   const previous = process.env.FUSION_DDD_WS_TRACE;
   if (value === undefined) {
@@ -409,6 +459,96 @@ test("VS bridge initialization failure does not stop the observer", async () => 
   assert.ok(
     logs.some((line) => line.startsWith("[vs-bridge] initialization failed:"))
   );
+});
+
+test("observer callback fires only when active state or roundId changes", async () => {
+  const cdp = new FakeCdp();
+  const statuses = [];
+  const cleanup = await installDddWsObserver(cdp, {
+    unpack: () => {
+      throw new Error("unused");
+    },
+    log: () => {},
+    vsSimEnabled: true,
+    onVsRoundStatus: (status) => statuses.push(status)
+  });
+
+  cdp.emit("Network.webSocketCreated", {
+    requestId: "req-vs-1",
+    url: "wss://spool.tetr.io/socket"
+  });
+  cdp.emit("Network.webSocketFrameReceived", {
+    requestId: "req-vs-1",
+    response: {
+      opcode: 1,
+      payloadData: JSON.stringify(vsRoundPayload())
+    }
+  });
+  cdp.emit("Network.webSocketFrameReceived", {
+    requestId: "req-vs-1",
+    response: {
+      opcode: 1,
+      payloadData: JSON.stringify(vsRoundPayload())
+    }
+  });
+  cdp.emit("Network.webSocketFrameReceived", {
+    requestId: "req-vs-1",
+    response: {
+      opcode: 1,
+      payloadData: JSON.stringify(vsRoundPayload({ localGameId: 5451, seed: 1744077374 }))
+    }
+  });
+  cdp.emit("Network.webSocketClosed", { requestId: "req-vs-1" });
+  cleanup();
+
+  assert.deepEqual(statuses, [
+    {
+      active: true,
+      roundId: "5449:1744077373",
+      localGameId: "5449",
+      seed: "1744077373"
+    },
+    {
+      active: true,
+      roundId: "5451:1744077374",
+      localGameId: "5451",
+      seed: "1744077374"
+    },
+    {
+      active: false,
+      roundId: "",
+      localGameId: "",
+      seed: ""
+    }
+  ]);
+});
+
+test("observer callback errors do not stop frame handling", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const cleanup = await installDddWsObserver(cdp, {
+    unpack: () => {
+      throw new Error("unused");
+    },
+    log: (line) => logs.push(line),
+    vsSimEnabled: true,
+    onVsRoundStatus: () => {
+      throw new Error("status callback failure");
+    }
+  });
+
+  assert.doesNotThrow(() => {
+    cdp.emit("Network.webSocketFrameReceived", {
+      requestId: "req-vs-throw",
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify(vsRoundPayload())
+      }
+    });
+  });
+
+  cleanup();
+  assert.ok(logs.some((line) => line.startsWith("[vs-bridge] written roundId=")));
 });
 
 test("trace file is not created when trace env is absent", async () => {

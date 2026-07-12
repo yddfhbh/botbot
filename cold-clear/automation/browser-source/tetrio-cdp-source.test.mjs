@@ -11,11 +11,15 @@ import {
   clearSnapshotFile,
   createSnapshotTracking,
   determineChromiumOwnership,
+  isVsWsSimEnvEnabled,
   isTetrioGameEndedState,
   pausedFrameExposureExpression,
+  readTetrioState,
   resolvePollMs,
   resolveUseSeedSimulationFallback,
   resetSnapshotTracking,
+  shouldAttemptClosureCapture,
+  shouldLogStateReason,
   shouldAdvanceGameEpoch,
   shouldHandleEndedGame,
   tetrioStateExpression
@@ -115,6 +119,26 @@ function evaluateInWindow(expression, windowOverrides = {}, extraContext = {}) {
   };
 }
 
+function createReadStateCdp(values) {
+  const queue = [...values];
+  return {
+    async send(method) {
+      if (method !== "Runtime.evaluate") {
+        throw new Error(`Unhandled method ${method}`);
+      }
+      return {
+        result: {
+          value: queue.shift() ?? {
+            ok: false,
+            ready: false,
+            reason: "mock state missing"
+          }
+        }
+      };
+    }
+  };
+}
+
 test("game ended handling is triggered only once per ended session", () => {
   const endedState = {
     ok: true,
@@ -166,6 +190,53 @@ test("VS WebSocket simulation disables browser seed fallback only when enabled",
   );
   assert.equal(
     resolveUseSeedSimulationFallback(false, { FUSION_VS_WS_SIM: "1" }),
+    false
+  );
+});
+
+test("VS sim env detection only enables suppression for env value 1", () => {
+  assert.equal(isVsWsSimEnvEnabled({}), false);
+  assert.equal(isVsWsSimEnvEnabled({ FUSION_VS_WS_SIM: "0" }), false);
+  assert.equal(isVsWsSimEnvEnabled({ FUSION_VS_WS_SIM: "1" }), true);
+});
+
+test("closure capture probe is attempted when VS sim is off and cooldown elapsed", () => {
+  assert.equal(
+    shouldAttemptClosureCapture({
+      probePageState: true,
+      suppressClosureCapture: false,
+      stateOk: false,
+      lastCaptureAt: 0,
+      lastPageProbeAt: 0,
+      now: 10_000
+    }),
+    true
+  );
+});
+
+test("closure capture probe is suppressed while VS round is active", () => {
+  assert.equal(
+    shouldAttemptClosureCapture({
+      probePageState: true,
+      suppressClosureCapture: true,
+      stateOk: false,
+      lastCaptureAt: 0,
+      lastPageProbeAt: 0,
+      now: 10_000
+    }),
+    false
+  );
+});
+
+test("suppressed VS reason is not periodically re-logged", () => {
+  assert.equal(
+    shouldLogStateReason({
+      reason: "VS WebSocket simulation owns live state",
+      lastReason: "VS WebSocket simulation owns live state",
+      lastReasonAt: 1_000,
+      now: 20_000,
+      suppressRepeatedReason: true
+    }),
     false
   );
 });
@@ -273,6 +344,122 @@ test("tetrioStateExpression extracts optional lines cleared stats", () => {
 
   assert.equal(result.ok, true);
   assert.equal(result.linesCleared, 24);
+});
+
+test("VS sim OFF reads state then probes once after cooldown", async () => {
+  const cdp = createReadStateCdp([
+    { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" },
+    {
+      ok: true,
+      ready: true,
+      playing: true,
+      countdown: false,
+      pieceCounter: 0,
+      current: "t",
+      hold: null,
+      queue: ["i", "o"]
+    }
+  ]);
+  let captureCalls = 0;
+
+  const state = await readTetrioState(cdp, {
+    probePageState: true,
+    suppressClosureCapture: false,
+    network: { lastPageProbeAt: 0 },
+    probeState: { lastCaptureAt: 0 },
+    captureGameFn: async () => {
+      captureCalls += 1;
+      return { ok: true, source: "closure:Ai" };
+    }
+  });
+
+  assert.equal(captureCalls, 1);
+  assert.equal(state.ok, true);
+});
+
+test("VS sim ON but round inactive still probes after cooldown", async () => {
+  const cdp = createReadStateCdp([
+    { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" },
+    {
+      ok: true,
+      ready: true,
+      playing: true,
+      countdown: false,
+      pieceCounter: 1,
+      current: "o",
+      hold: null,
+      queue: ["s", "z"]
+    }
+  ]);
+  let captureCalls = 0;
+
+  const state = await readTetrioState(cdp, {
+    probePageState: true,
+    suppressClosureCapture: false,
+    network: { lastPageProbeAt: 0 },
+    probeState: { lastCaptureAt: 0 },
+    captureGameFn: async () => {
+      captureCalls += 1;
+      return { ok: true, source: "closure:Ai" };
+    }
+  });
+
+  assert.equal(captureCalls, 1);
+  assert.equal(state.ok, true);
+});
+
+test("VS sim ON with active round suppresses closure capture for ten seconds", async () => {
+  const cdp = createReadStateCdp([
+    { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" }
+  ]);
+  let captureCalls = 0;
+
+  const state = await readTetrioState(cdp, {
+    probePageState: true,
+    suppressClosureCapture: true,
+    suppressedReason: "VS WebSocket simulation owns live state",
+    network: { lastPageProbeAt: 0 },
+    probeState: { lastCaptureAt: 0 },
+    captureGameFn: async () => {
+      captureCalls += 1;
+      return { ok: true, source: "closure:Ai" };
+    }
+  });
+
+  assert.equal(captureCalls, 0);
+  assert.equal(state.reason, "VS WebSocket simulation owns live state");
+});
+
+test("suppression keeps cheap state reads active", async () => {
+  let reads = 0;
+  const cdp = {
+    async send(method) {
+      assert.equal(method, "Runtime.evaluate");
+      reads += 1;
+      return {
+        result: {
+          value: {
+            ok: false,
+            ready: false,
+            reason: "TETR.IO game instance not captured yet"
+          }
+        }
+      };
+    }
+  };
+
+  await readTetrioState(cdp, {
+    probePageState: true,
+    suppressClosureCapture: true,
+    suppressedReason: "VS WebSocket simulation owns live state",
+    network: { lastPageProbeAt: 0 },
+    probeState: { lastCaptureAt: 0 },
+    captureGameFn: async () => {
+      throw new Error("should not capture");
+    }
+  });
+
+  assert.equal(reads, 1);
 });
 
 test("ended cached game is not selected again when a fresh game is available", () => {

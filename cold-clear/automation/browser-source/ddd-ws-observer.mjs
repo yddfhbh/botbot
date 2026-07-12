@@ -168,7 +168,9 @@ export async function installDddWsObserver(
     traceEnabled = process.env.FUSION_DDD_WS_TRACE === "1",
     traceFilePath = DEFAULT_TRACE_FILE_PATH,
     vsSimEnabled = isVsWsSimEnabled(),
-    vsBridgePath = DEFAULT_VS_BRIDGE_PATH
+    vsBridgePath = DEFAULT_VS_BRIDGE_PATH,
+    onVsRoundStatus = null,
+    perfEnabled = process.env.FUSION_BROWSER_PERF === "1"
   } = {}
 ) {
   const logger = (message) => safeLog(log, message);
@@ -198,7 +200,15 @@ export async function installDddWsObserver(
     decodeAttempts: 0,
     optionsCaptured: 0,
     trace: null,
-    vsBridge
+    vsBridge,
+    lastVsRoundStatusKey: "",
+    perf: perfEnabled
+      ? {
+          lastLoggedAt: Date.now(),
+          wsFrames: 0,
+          wsFrameElapsedTotalMs: 0
+        }
+      : null
   };
   if (traceEnabled) {
     try {
@@ -233,14 +243,17 @@ export async function installDddWsObserver(
         observerState.requestUrls.delete(event.requestId);
       }
       markVsBridgeInactive(observerState.vsBridge, logger);
+      emitVsRoundStatusIfChanged(observerState, onVsRoundStatus);
     } catch {}
   });
 
   const offReceived = cdp.on("Network.webSocketFrameReceived", (event) => {
     try {
+      const frameStartedAt = Date.now();
       observerState.framesReceived += 1;
       const payloadData = event?.response?.payloadData;
       if (typeof payloadData !== "string" || payloadData.length === 0) {
+        recordPerfFrame(observerState, frameStartedAt, logger);
         return;
       }
 
@@ -274,7 +287,9 @@ export async function installDddWsObserver(
             );
           } catch {}
         }
+        emitVsRoundStatusIfChanged(observerState, onVsRoundStatus);
         traceDecodedRoots(decodedRoots, event, observerState, log);
+        recordPerfFrame(observerState, frameStartedAt, logger);
         return;
       }
 
@@ -310,19 +325,63 @@ export async function installDddWsObserver(
             );
           } catch {}
         }
+        emitVsRoundStatusIfChanged(observerState, onVsRoundStatus);
         traceDecodedRoots(decodedRoots, event, observerState, log);
       }
+      recordPerfFrame(observerState, frameStartedAt, logger);
     } catch {}
   });
 
   return () => {
     markVsBridgeInactive(observerState.vsBridge, logger);
+    emitVsRoundStatusIfChanged(observerState, onVsRoundStatus);
     offCreated();
     offClosed();
     offReceived();
     observerState.requestUrls.clear();
     finalizeTrace(observerState, logger);
   };
+}
+
+function emitVsRoundStatusIfChanged(observerState, onVsRoundStatus) {
+  if (typeof onVsRoundStatus !== "function") {
+    return;
+  }
+
+  const current = observerState?.vsBridge?.current ?? null;
+  const active = Boolean(current?.active);
+  const roundId = active ? String(current?.roundId ?? "") : "";
+  const localGameId = active ? String(current?.local?.gameid ?? "") : "";
+  const seed = active ? String(current?.options?.seed ?? "") : "";
+  const nextKey = `${active ? 1 : 0}|${roundId}|${localGameId}|${seed}`;
+  if (nextKey === observerState.lastVsRoundStatusKey) {
+    return;
+  }
+  observerState.lastVsRoundStatusKey = nextKey;
+  try {
+    onVsRoundStatus({
+      active,
+      roundId,
+      localGameId,
+      seed
+    });
+  } catch {}
+}
+
+function recordPerfFrame(observerState, frameStartedAt, log) {
+  const perf = observerState?.perf;
+  if (!perf) {
+    return;
+  }
+  perf.wsFrames += 1;
+  perf.wsFrameElapsedTotalMs += Math.max(0, Date.now() - frameStartedAt);
+  if (Date.now() - perf.lastLoggedAt < 2000) {
+    return;
+  }
+  safeLog(log, `[browser-perf] ws_frame elapsed_ms=${perf.wsFrameElapsedTotalMs}`);
+  perf.lastLoggedAt = Date.now();
+  perf.wsFrames = 0;
+  perf.wsFrameElapsedTotalMs = 0;
 }
 
 export function split87Frame(buf) {
