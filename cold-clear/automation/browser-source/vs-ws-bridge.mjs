@@ -290,6 +290,9 @@ function tryBuildBridge(state, capturedAt, log) {
   }
 
   if (safeWriteBridgeFile(state, log)) {
+    log?.(
+      `[vs-bridge] readyAt offset_ms=${built.bridge.readyOffsetMs ?? 0} source=precountdown`
+    );
     log?.(`[vs-bridge] written roundId=${state.current.roundId}`);
   }
   return state.current;
@@ -353,17 +356,15 @@ function buildBridgeFromState(state, capturedAt) {
     return null;
   }
 
-  const readyAt =
-    (state.roundObservedAt || capturedAt) +
-    normalizeDuration(options.precountdown ?? 0) +
-    normalizeCount(options.countdown_count ?? 0) *
-      normalizeDuration(options.countdown_interval ?? 0);
+  const readyOffsetMs = normalizeDuration(options.precountdown ?? 0);
+  const readyAt = (state.roundObservedAt || capturedAt) + readyOffsetMs;
 
   return {
     roomSeed: sanitizeScalar(state.roomOptions.seed),
     bridge: {
       roundId: `${localGameId}:${roundSeed}`,
       readyAt,
+      readyOffsetMs,
       local: summarizeBridgePlayer(localPlayer, state.selfUser),
       opponents: opponents.map((player) => summarizeBridgePlayer(player, null)),
       options

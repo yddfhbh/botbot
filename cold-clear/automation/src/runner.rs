@@ -177,6 +177,7 @@ where
                             continue;
                         }
                         let input_started_at = Instant::now();
+                        let executed_hold = prepared.execution_plan.hold;
                         if let Err(error) = execute_plan_until_hard_drop(
                             driver,
                             &prepared.execution_plan,
@@ -264,11 +265,16 @@ where
                                             .context("failed to execute hard drop input");
                                     }
                                     if snapshot.source == "browser_ws_sim" {
-                                        vs_sim_controller.commit_hard_drop(
+                                        let committed = vs_sim_controller.commit_hard_drop(
                                             &snapshot,
                                             &prepared.planned_move,
+                                            executed_hold,
                                             &mut log,
                                         )?;
+                                        if !committed {
+                                            thread::sleep(poll_delay);
+                                            continue;
+                                        }
                                     }
                                     last_hard_drop_started_at = Some(hard_drop_started_at);
                                     if snapshot.piece_counter.is_some() {
@@ -2070,6 +2076,8 @@ mod tests {
     struct RoutePhaseBackend {
         route_sequences: u32,
         hard_drop_sequences: u32,
+        fail_when_route_contains_hold: bool,
+        fail_hard_drop: bool,
     }
 
     impl InputBackend for RoutePhaseBackend {
@@ -2082,8 +2090,18 @@ mod tests {
 
         fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
             if actions.len() == 1 && actions[0].action == GameAction::HardDrop {
+                if self.fail_hard_drop {
+                    anyhow::bail!("simulated hard drop failure");
+                }
                 self.hard_drop_sequences += 1;
             } else if !actions.is_empty() {
+                if self.fail_when_route_contains_hold
+                    && actions
+                        .iter()
+                        .any(|action| action.action == GameAction::Hold)
+                {
+                    anyhow::bail!("simulated hold failure");
+                }
                 self.route_sequences += 1;
             }
             Ok(())
@@ -2700,6 +2718,14 @@ mod tests {
         }
     }
 
+    fn vs_hold_route_plan() -> ExecutionPlan {
+        ExecutionPlan {
+            hold: true,
+            movement_actions: vec![GameAction::Left],
+            hard_drop: true,
+        }
+    }
+
     fn runner_test_timings() -> ExecutionTimings {
         ExecutionTimings {
             tap_duration: Duration::from_millis(60),
@@ -2822,6 +2848,80 @@ mod tests {
         assert!(!valid);
         assert_eq!(backend.route_sequences, 1);
         assert_eq!(backend.hard_drop_sequences, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hold_failure_invalidates_vs_session_before_hard_drop() {
+        let dir = temp_bridge_dir("vs-hold-fail");
+        let bridge_path = dir.join("vs-ws-bridge.json");
+        write_runner_bridge(&bridge_path, "4382:2034120187", true, "[]");
+        let mut controller = VsSimulationController::with_settings(true, bridge_path);
+        let mut backend = RoutePhaseBackend {
+            fail_when_route_contains_hold: true,
+            ..Default::default()
+        };
+        let snapshot = vs_validation_snapshot();
+
+        assert!(controller
+            .validate_route_preflight(&snapshot, &mut |_| {})
+            .unwrap());
+        let result = execute_plan_until_hard_drop(
+            &mut backend,
+            &vs_hold_route_plan(),
+            &HandlingConfig::default(),
+            runner_test_timings(),
+            |_| {},
+        );
+        if result.is_err() {
+            controller.invalidate_current_round("input error before hard drop", &mut |_| {});
+        }
+
+        assert!(result.is_err());
+        assert_eq!(backend.route_sequences, 0);
+        assert_eq!(backend.hard_drop_sequences, 0);
+        assert!(controller.next_snapshot(&mut |_| {}).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hard_drop_failure_invalidates_vs_session_without_commit() {
+        let dir = temp_bridge_dir("vs-hard-drop-fail");
+        let bridge_path = dir.join("vs-ws-bridge.json");
+        write_runner_bridge(&bridge_path, "4382:2034120187", true, "[]");
+        let mut controller = VsSimulationController::with_settings(true, bridge_path);
+        let mut backend = RoutePhaseBackend {
+            fail_hard_drop: true,
+            ..Default::default()
+        };
+        let snapshot = vs_validation_snapshot();
+
+        assert!(controller
+            .validate_route_preflight(&snapshot, &mut |_| {})
+            .unwrap());
+        execute_plan_until_hard_drop(
+            &mut backend,
+            &vs_route_plan(),
+            &HandlingConfig::default(),
+            runner_test_timings(),
+            |_| {},
+        )
+        .unwrap();
+        let result = execute_hard_drop_action(
+            &mut backend,
+            &vs_route_plan().movement_actions,
+            &HandlingConfig::default(),
+            runner_test_timings(),
+            |_| {},
+        );
+        if result.is_err() {
+            controller.invalidate_current_round("hard drop input failed", &mut |_| {});
+        }
+
+        assert!(result.is_err());
+        assert_eq!(backend.route_sequences, 1);
+        assert_eq!(backend.hard_drop_sequences, 0);
+        assert!(controller.next_snapshot(&mut |_| {}).unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -189,7 +189,8 @@ test("deriveVsRoundBridge computes readyAt from room countdown options", () => {
   const result = deriveVsRoundBridge(combinedRoundRoot(), capturedAt);
 
   assert.ok(result);
-  assert.equal(result.bridge.readyAt, capturedAt + 8000);
+  assert.equal(result.bridge.readyAt, capturedAt + 5000);
+  assert.equal(result.bridge.readyOffsetMs, 5000);
 });
 
 test("writeVsBridgeFile writes atomically without leaving a temp file", () => {
@@ -354,7 +355,25 @@ test("room options arriving later update readyAt without changing the round seed
     const bridge = readJson(filePath);
     assert.equal(bridge.options.seed, 1744077373);
     assert.equal(bridge.roomSeed, 187156);
-    assert.equal(bridge.readyAt, 1000 + 8000);
+    assert.equal(bridge.readyAt, 1000 + 5000);
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("readyAt log uses precountdown only even when countdown metadata is present", () => {
+  const { dir, filePath } = makeTempBridgeFile();
+  const logs = [];
+
+  try {
+    const state = createVsBridgeState(filePath, (line) => logs.push(line));
+    ingestVsBridgeRoot(state, combinedRoundRoot(), { timestamp: 1000 }, (line) =>
+      logs.push(line)
+    );
+
+    assert.ok(
+      logs.includes("[vs-bridge] readyAt offset_ms=5000 source=precountdown")
+    );
   } finally {
     cleanupTempDir(dir);
   }

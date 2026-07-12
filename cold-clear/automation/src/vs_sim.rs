@@ -38,7 +38,7 @@ struct VsSimulationSession {
     board: Board,
     hold: Option<Piece>,
     piece_index: usize,
-    processed_pieces: usize,
+    committed_locks: usize,
     next_snapshot_ready_at_ms: u64,
     paused_pending_verification: bool,
     logged_focus_grace_wait: bool,
@@ -221,60 +221,112 @@ impl VsSimulationController {
         &mut self,
         snapshot: &GameSnapshot,
         planned_move: &Move,
+        executed_hold: bool,
         log: &mut F,
-    ) -> Result<()>
+    ) -> Result<bool>
     where
         F: FnMut(String),
     {
         if !self.enabled || snapshot.source != "browser_ws_sim" {
-            return Ok(());
+            return Ok(true);
         }
 
-        let Some(session) = self.session.as_mut() else {
-            return Ok(());
-        };
-        if snapshot.token != session.token() {
-            self.invalidate_current_round(
-                "snapshot token no longer matched current VS session",
-                log,
-            );
-            return Ok(());
-        }
+        let max_pieces = self.max_pieces;
+        let outcome = (|| -> Result<CommitOutcome> {
+            let Some(session) = self.session.as_mut() else {
+                return Ok(CommitOutcome::Suppressed("session_missing".to_owned()));
+            };
 
-        let execution = session
-            .execution_state(planned_move.hold)
-            .context("failed to derive VS simulation execution piece")?;
-        let target_piece = planned_move.expected_location.kind.0;
-        if execution.placed_piece != target_piece {
-            self.invalidate_current_round(
-                &format!(
+            let expected_token = session.token();
+            if snapshot.token != expected_token {
+                return Ok(CommitOutcome::Suppressed(
+                    "snapshot token no longer matched current VS session".to_owned(),
+                ));
+            }
+            if snapshot.round_id.as_deref() != Some(session.round_id.as_str()) {
+                return Ok(CommitOutcome::Suppressed(format!(
+                    "round mismatch expected={} actual={}",
+                    snapshot.round_id.as_deref().unwrap_or("-"),
+                    session.round_id
+                )));
+            }
+            if planned_move.hold != executed_hold {
+                return Ok(CommitOutcome::Suppressed(format!(
+                    "executed_hold_mismatch planned={} executed={}",
+                    planned_move.hold, executed_hold
+                )));
+            }
+
+            let current_before = session
+                .current_piece()
+                .context("failed to derive current VS simulation piece before commit")?;
+            log(format!(
+                "[vs-sim] commit before token={} current={} hold={} executed_hold={}",
+                session.piece_index,
+                piece_label(current_before),
+                hold_label(session.hold),
+                executed_hold
+            ));
+
+            let execution = session
+                .execution_state(executed_hold)
+                .context("failed to derive VS simulation execution piece")?;
+            let target_piece = planned_move.expected_location.kind.0;
+            if execution.placed_piece != target_piece {
+                return Ok(CommitOutcome::Suppressed(format!(
                     "planned piece {:?} did not match simulated piece {:?}",
                     target_piece, execution.placed_piece
-                ),
-                log,
-            );
-            return Ok(());
-        }
+                )));
+            }
 
-        let lock = session.board.lock_piece(planned_move.expected_location);
-        if lock.locked_out {
-            self.invalidate_current_round("simulated hard drop locked out the board", log);
-            return Ok(());
-        }
+            let lock = session.board.lock_piece(planned_move.expected_location);
+            if lock.locked_out {
+                return Ok(CommitOutcome::Suppressed(
+                    "simulated hard drop locked out the board".to_owned(),
+                ));
+            }
 
-        session.hold = execution.next_hold;
-        session.piece_index = execution.next_piece_index;
-        session.processed_pieces = session.processed_pieces.saturating_add(1);
-        session.next_snapshot_ready_at_ms = current_time_ms().saturating_add(POST_DROP_SETTLE_MS);
-        if self.max_pieces > 0 && session.processed_pieces >= self.max_pieces {
-            session.paused_pending_verification = true;
+            session.hold = execution.next_hold;
+            session.piece_index = execution.next_piece_index;
+            session.committed_locks = session.committed_locks.saturating_add(1);
+            session.next_snapshot_ready_at_ms =
+                current_time_ms().saturating_add(POST_DROP_SETTLE_MS);
+
+            let current_after = session
+                .current_piece()
+                .context("failed to derive current VS simulation piece after commit")?;
             log(format!(
-                "[vs-sim] validation piece limit reached count={}",
-                session.processed_pieces
+                "[vs-sim] commit after token={} current={} hold={}",
+                session.piece_index,
+                piece_label(current_after),
+                hold_label(session.hold)
             ));
-            log("[vs-sim] paused pending verification".to_owned());
+            log(format!(
+                "[vs-sim] committed_locks={}",
+                session.committed_locks
+            ));
+            if max_pieces > 0 && session.committed_locks >= max_pieces {
+                session.paused_pending_verification = true;
+                log(format!(
+                    "[vs-sim] validation piece limit reached count={}",
+                    session.committed_locks
+                ));
+                log("[vs-sim] paused pending verification".to_owned());
+            }
+
+            Ok(CommitOutcome::Committed)
+        })()?;
+
+        match outcome {
+            CommitOutcome::Committed => Ok(true),
+            CommitOutcome::Suppressed(reason) => {
+                log(format!("[vs-sim] commit suppressed reason={reason}"));
+                if reason != "session_missing" {
+                    self.invalidate_current_round(&reason, log);
+                }
+                Ok(false)
+            }
         }
-        Ok(())
     }
 
     pub fn invalidate_current_round<F>(&mut self, reason: &str, log: &mut F)
@@ -490,7 +542,7 @@ impl VsSimulationSession {
             board: Board::new(),
             hold: None,
             piece_index: 0,
-            processed_pieces: 0,
+            committed_locks: 0,
             next_snapshot_ready_at_ms: 0,
             paused_pending_verification: false,
             logged_focus_grace_wait: false,
@@ -506,7 +558,7 @@ impl VsSimulationSession {
     }
 
     fn snapshot(&self) -> Result<GameSnapshot> {
-        let current = generated_piece(&self.seed, self.piece_index)?;
+        let current = self.current_piece()?;
         let queue = generated_queue(&self.seed, self.piece_index, self.next_count)?;
         let mut queue_tokens = Vec::with_capacity(1 + queue.len());
         queue_tokens.push(piece_to_token(current));
@@ -531,7 +583,7 @@ impl VsSimulationSession {
     }
 
     fn execution_state(&self, use_hold: bool) -> Result<ExecutionState> {
-        let current = generated_piece(&self.seed, self.piece_index)?;
+        let current = self.current_piece()?;
         if !use_hold {
             return Ok(ExecutionState {
                 placed_piece: current,
@@ -560,6 +612,10 @@ impl VsSimulationSession {
     fn matches_identity(&self, round_id: &str, local_game_id: &str, seed: &str) -> bool {
         self.round_id == round_id && self.local_game_id == local_game_id && self.seed == seed
     }
+
+    fn current_piece(&self) -> Result<Piece> {
+        generated_piece(&self.seed, self.piece_index)
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -567,6 +623,11 @@ struct ExecutionState {
     placed_piece: Piece,
     next_hold: Option<Piece>,
     next_piece_index: usize,
+}
+
+enum CommitOutcome {
+    Committed,
+    Suppressed(String),
 }
 
 fn read_bridge_wire(path: &Path) -> Result<Option<VsBridgeWire>> {
@@ -748,11 +809,28 @@ fn piece_to_token(piece: Piece) -> PieceToken {
     }
 }
 
+fn piece_label(piece: Piece) -> &'static str {
+    match piece {
+        Piece::I => "I",
+        Piece::O => "O",
+        Piece::T => "T",
+        Piece::L => "L",
+        Piece::J => "J",
+        Piece::S => "S",
+        Piece::Z => "Z",
+    }
+}
+
+fn hold_label(hold: Option<Piece>) -> &'static str {
+    hold.map(piece_label).unwrap_or("-")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
     use std::fs::write;
+    const HOLD_TEST_SEED: &str = "18645";
 
     fn temp_bridge_path(name: &str) -> PathBuf {
         let unique = current_time_ms();
@@ -825,6 +903,31 @@ mod tests {
         write_bridge(path, &sample_bridge(round_id, sequence, 0, "[]"));
     }
 
+    fn build_test_session(
+        seed: &str,
+        piece_index: usize,
+        hold: Option<Piece>,
+        committed_locks: usize,
+    ) -> VsSimulationSession {
+        VsSimulationSession {
+            round_id: format!("4382:{seed}"),
+            local_game_id: "4382".to_owned(),
+            seed: seed.to_owned(),
+            next_count: DEFAULT_NEXT_COUNT,
+            countdown_ready_at_ms: 0,
+            input_allowed_at_ms: 0,
+            last_bridge_sequence: 1,
+            board: Board::new(),
+            hold,
+            piece_index,
+            committed_locks,
+            next_snapshot_ready_at_ms: 0,
+            paused_pending_verification: false,
+            logged_focus_grace_wait: false,
+            logged_input_grace_complete: false,
+        }
+    }
+
     fn simple_lock_move(piece: Piece) -> Move {
         let board: Board = Board::new();
         let mut target = FallingPiece {
@@ -895,7 +998,7 @@ mod tests {
         assert_eq!(before.piece_counter, Some(0));
 
         controller
-            .commit_hard_drop(&before, &simple_lock_move(Piece::O), &mut |_| {})
+            .commit_hard_drop(&before, &simple_lock_move(Piece::O), false, &mut |_| {})
             .unwrap();
         if let Some(session) = controller.session.as_mut() {
             session.next_snapshot_ready_at_ms = 0;
@@ -911,72 +1014,118 @@ mod tests {
     }
 
     #[test]
-    fn hold_without_existing_hold_advances_piece_index_by_two() {
+    fn hold_without_existing_hold_commits_using_executed_hold() {
         let path = temp_bridge_path("vs-sim-hold-first");
-        write_ready_bridge(&path, "4382:2034120187", 1);
         let mut controller = VsSimulationController::with_settings(true, path.clone());
+        controller.session = Some(build_test_session(HOLD_TEST_SEED, 0, None, 0));
         let snapshot = controller
-            .next_snapshot(&mut |_| {})
-            .unwrap()
+            .session
+            .as_ref()
+            .expect("session")
+            .snapshot()
             .expect("simulated snapshot");
-        let mut move_after_hold = simple_lock_move(Piece::S);
+        assert_eq!(snapshot.queue[0], PieceToken::J);
+        assert_eq!(snapshot.queue[1], PieceToken::Z);
+        assert_eq!(snapshot.queue[2], PieceToken::I);
+        assert_eq!(snapshot.queue[3], PieceToken::O);
+        let mut logs = Vec::new();
+        let mut move_after_hold = simple_lock_move(Piece::Z);
         move_after_hold.hold = true;
 
-        controller
-            .commit_hard_drop(&snapshot, &move_after_hold, &mut |_| {})
+        let committed = controller
+            .commit_hard_drop(&snapshot, &move_after_hold, true, &mut |line| {
+                logs.push(line)
+            })
             .unwrap();
-        if let Some(session) = controller.session.as_mut() {
-            session.next_snapshot_ready_at_ms = 0;
-        }
+        assert!(committed);
 
-        let next = controller
-            .next_snapshot(&mut |_| {})
-            .unwrap()
-            .expect("next simulated snapshot");
+        let session = controller.session.as_ref().expect("session after commit");
+        assert_eq!(session.hold, Some(Piece::J));
+        assert_eq!(session.piece_index, 2);
+        assert_eq!(session.committed_locks, 1);
+        let next = session.snapshot().expect("next simulated snapshot");
         assert_eq!(next.piece_counter, Some(2));
-        assert_eq!(next.hold, Some(PieceToken::O));
+        assert_eq!(next.hold, Some(PieceToken::J));
         assert_eq!(next.queue[0], PieceToken::I);
+        assert!(logs.iter().any(|line| {
+            line.contains("[vs-sim] commit before token=0 current=J hold=- executed_hold=true")
+        }));
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("[vs-sim] commit after token=2 current=I hold=J")));
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("[vs-sim] committed_locks=1")));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn hold_with_existing_hold_advances_piece_index_by_one() {
+    fn hold_with_existing_hold_commits_using_executed_hold() {
         let path = temp_bridge_path("vs-sim-hold-swap");
-        write_ready_bridge(&path, "4382:2034120187", 1);
         let mut controller = VsSimulationController::with_settings(true, path.clone());
+        controller.session = Some(build_test_session(HOLD_TEST_SEED, 1, Some(Piece::J), 0));
         let snapshot = controller
-            .next_snapshot(&mut |_| {})
-            .unwrap()
+            .session
+            .as_ref()
+            .expect("session")
+            .snapshot()
             .expect("simulated snapshot");
-        let mut first_hold_move = simple_lock_move(Piece::S);
-        first_hold_move.hold = true;
-        controller
-            .commit_hard_drop(&snapshot, &first_hold_move, &mut |_| {})
-            .unwrap();
-        if let Some(session) = controller.session.as_mut() {
-            session.next_snapshot_ready_at_ms = 0;
-        }
+        assert_eq!(snapshot.queue[0], PieceToken::Z);
+        assert_eq!(snapshot.hold, Some(PieceToken::J));
+        let mut logs = Vec::new();
+        let mut hold_swap_move = simple_lock_move(Piece::J);
+        hold_swap_move.hold = true;
 
-        let swapped_snapshot = controller
-            .next_snapshot(&mut |_| {})
-            .unwrap()
-            .expect("swapped snapshot");
-        let mut second_hold_move = simple_lock_move(Piece::O);
-        second_hold_move.hold = true;
-        controller
-            .commit_hard_drop(&swapped_snapshot, &second_hold_move, &mut |_| {})
+        let committed = controller
+            .commit_hard_drop(&snapshot, &hold_swap_move, true, &mut |line| {
+                logs.push(line)
+            })
             .unwrap();
-        if let Some(session) = controller.session.as_mut() {
-            session.next_snapshot_ready_at_ms = 0;
-        }
+        assert!(committed);
 
-        let next = controller
-            .next_snapshot(&mut |_| {})
-            .unwrap()
-            .expect("next simulated snapshot");
-        assert_eq!(next.piece_counter, Some(3));
-        assert_eq!(next.hold, Some(PieceToken::I));
-        assert_eq!(next.queue[0], PieceToken::Z);
+        let session = controller.session.as_ref().expect("session after commit");
+        assert_eq!(session.hold, Some(Piece::Z));
+        assert_eq!(session.piece_index, 2);
+        assert_eq!(session.committed_locks, 1);
+        let next = session.snapshot().expect("next simulated snapshot");
+        assert_eq!(next.piece_counter, Some(2));
+        assert_eq!(next.hold, Some(PieceToken::Z));
+        assert_eq!(next.queue[0], PieceToken::I);
+        assert!(logs.iter().any(|line| {
+            line.contains("[vs-sim] commit before token=1 current=Z hold=J executed_hold=true")
+        }));
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("[vs-sim] commit after token=2 current=I hold=Z")));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn executed_hold_mismatch_invalidates_the_round() {
+        let path = temp_bridge_path("vs-sim-hold-mismatch");
+        let mut controller = VsSimulationController::with_settings(true, path.clone());
+        controller.session = Some(build_test_session(HOLD_TEST_SEED, 0, None, 0));
+        let snapshot = controller
+            .session
+            .as_ref()
+            .expect("session")
+            .snapshot()
+            .expect("simulated snapshot");
+        let mut logs = Vec::new();
+        let mut move_after_hold = simple_lock_move(Piece::Z);
+        move_after_hold.hold = true;
+
+        let committed = controller
+            .commit_hard_drop(&snapshot, &move_after_hold, false, &mut |line| {
+                logs.push(line)
+            })
+            .unwrap();
+
+        assert!(!committed);
+        assert!(controller.session.is_none());
+        assert!(logs.iter().any(|line| {
+            line.contains("[vs-sim] commit suppressed reason=executed_hold_mismatch planned=true executed=false")
+        }));
         let _ = fs::remove_file(path);
     }
 
@@ -1016,7 +1165,7 @@ mod tests {
             .unwrap()
             .expect("first snapshot");
         controller
-            .commit_hard_drop(&first, &simple_lock_move(Piece::O), &mut |_| {})
+            .commit_hard_drop(&first, &simple_lock_move(Piece::O), false, &mut |_| {})
             .unwrap();
 
         write_bridge(
@@ -1351,6 +1500,7 @@ mod tests {
                 .commit_hard_drop(
                     &snapshot,
                     &simple_lock_move(snapshot.queue_pieces()[0]),
+                    false,
                     &mut |line| logs.push(line),
                 )
                 .unwrap();
@@ -1362,10 +1512,48 @@ mod tests {
         assert!(controller.next_snapshot(&mut |_| {}).unwrap().is_none());
         assert!(logs
             .iter()
+            .any(|line| line.contains("[vs-sim] committed_locks=10")));
+        assert!(logs
+            .iter()
             .any(|line| line.contains("validation piece limit reached count=10")));
         assert!(logs
             .iter()
             .any(|line| line.contains("paused pending verification")));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn committed_locks_nine_does_not_pause_validation() {
+        let path = temp_bridge_path("vs-sim-piece-limit-nine");
+        write_ready_bridge(&path, "4382:2034120187", 1);
+        let mut logs = Vec::new();
+        let mut controller = VsSimulationController::with_validation_limit(true, path.clone(), 10);
+
+        for _ in 0..9 {
+            let snapshot = controller
+                .next_snapshot(&mut |_| {})
+                .unwrap()
+                .expect("simulated snapshot");
+            controller
+                .commit_hard_drop(
+                    &snapshot,
+                    &simple_lock_move(snapshot.queue_pieces()[0]),
+                    false,
+                    &mut |line| logs.push(line),
+                )
+                .unwrap();
+            if let Some(session) = controller.session.as_mut() {
+                session.next_snapshot_ready_at_ms = 0;
+            }
+        }
+
+        assert!(controller.next_snapshot(&mut |_| {}).unwrap().is_some());
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("[vs-sim] committed_locks=9")));
+        assert!(!logs
+            .iter()
+            .any(|line| line.contains("validation piece limit reached count=10")));
         let _ = fs::remove_file(path);
     }
 }
