@@ -36,7 +36,7 @@ async function main() {
 
   const rl = readline.createInterface({
     input: process.stdin,
-    output: process.stdout,
+    output: process.stderr,
     terminal: false
   });
 
@@ -301,7 +301,11 @@ function logFocusStateOnce(focusLogState, nextKey, message) {
     return;
   }
   focusLogState.lastKey = nextKey;
-  console.log(message);
+  inputLog(message);
+}
+
+function inputLog(message) {
+  process.stderr.write(`${message}\n`);
 }
 
 async function dispatchKey(cdp, spec, type) {

@@ -33,7 +33,8 @@ struct VsSimulationSession {
     local_game_id: String,
     seed: String,
     next_count: usize,
-    ready_at_ms: u64,
+    countdown_ready_at_ms: u64,
+    input_allowed_at_ms: u64,
     captured_at_ms: u64,
     last_bridge_sequence: u64,
     board: Board,
@@ -43,6 +44,7 @@ struct VsSimulationSession {
     next_snapshot_ready_at_ms: u64,
     paused_pending_verification: bool,
     logged_focus_grace_wait: bool,
+    logged_input_grace_complete: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,10 +147,16 @@ impl VsSimulationController {
             return Ok(None);
         };
         let now = current_time_ms();
-        if session.paused_pending_verification {
+        let paused_pending_verification = session.paused_pending_verification;
+        let piece_index = session.piece_index;
+        let input_allowed_at_ms = session.input_allowed_at_ms;
+        let countdown_ready_at_ms = session.countdown_ready_at_ms;
+        let next_snapshot_ready_at_ms = session.next_snapshot_ready_at_ms;
+        let logged_input_grace_complete = session.logged_input_grace_complete;
+        if paused_pending_verification {
             return Ok(None);
         }
-        if session.piece_index == 0 && now < session.ready_at_ms {
+        if initial_input_grace_active(piece_index, now, input_allowed_at_ms) {
             if let Some(session) = self.session.as_mut() {
                 if !session.logged_focus_grace_wait {
                     log(format!(
@@ -160,11 +168,27 @@ impl VsSimulationController {
             }
             return Ok(None);
         }
-        if now < session.next_snapshot_ready_at_ms {
+        if piece_index == 0 && !logged_input_grace_complete {
+            if let Some(session) = self.session.as_mut() {
+                if !session.logged_input_grace_complete {
+                    let elapsed_ms = now.saturating_sub(countdown_ready_at_ms);
+                    log(format!(
+                        "[vs-sim] input grace complete elapsed_ms={elapsed_ms}"
+                    ));
+                    session.logged_input_grace_complete = true;
+                }
+            }
+        }
+        if now < next_snapshot_ready_at_ms {
             return Ok(None);
         }
 
-        Ok(Some(session.snapshot()?))
+        Ok(Some(
+            self.session
+                .as_ref()
+                .expect("session should still exist")
+                .snapshot()?,
+        ))
     }
 
     pub fn validate_pre_hard_drop<F>(
@@ -333,7 +357,10 @@ impl VsSimulationController {
 
         match &mut self.session {
             Some(session) if session.round_id == bridge.round_id => {
-                session.ready_at_ms = bridge.ready_at;
+                session.countdown_ready_at_ms = bridge.ready_at;
+                session.input_allowed_at_ms = bridge
+                    .ready_at
+                    .saturating_add(POST_COUNTDOWN_FOCUS_GRACE_MS);
                 session.captured_at_ms = bridge.captured_at;
                 session.last_bridge_sequence = bridge.sequence;
             }
@@ -367,7 +394,8 @@ impl VsSimulationSession {
             local_game_id,
             seed,
             next_count,
-            ready_at_ms: bridge
+            countdown_ready_at_ms: bridge.ready_at,
+            input_allowed_at_ms: bridge
                 .ready_at
                 .saturating_add(POST_COUNTDOWN_FOCUS_GRACE_MS),
             captured_at_ms: bridge.captured_at,
@@ -379,6 +407,7 @@ impl VsSimulationSession {
             next_snapshot_ready_at_ms: 0,
             paused_pending_verification: false,
             logged_focus_grace_wait: false,
+            logged_input_grace_complete: false,
         })
     }
 
@@ -485,6 +514,10 @@ fn current_time_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn initial_input_grace_active(piece_index: usize, now: u64, input_allowed_at_ms: u64) -> bool {
+    piece_index == 0 && now < input_allowed_at_ms
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
@@ -956,8 +989,19 @@ mod tests {
     }
 
     #[test]
-    fn first_snapshot_waits_for_post_countdown_focus_grace() {
-        let path = temp_bridge_path("vs-sim-focus-grace");
+    fn input_grace_is_active_at_ready_at_plus_499ms() {
+        assert!(initial_input_grace_active(0, 1_499, 1_500));
+        assert!(!initial_input_grace_active(1, 1_499, 1_500));
+    }
+
+    #[test]
+    fn input_grace_is_inactive_at_ready_at_plus_500ms() {
+        assert!(!initial_input_grace_active(0, 1_500, 1_500));
+    }
+
+    #[test]
+    fn first_snapshot_wait_logs_while_grace_is_active() {
+        let path = temp_bridge_path("vs-sim-focus-grace-wait");
         let ready_at = current_time_ms().saturating_add(250);
         write_bridge(&path, &sample_bridge("4382:2034120187", 1, ready_at, "[]"));
         let mut logs = Vec::new();
@@ -971,6 +1015,33 @@ mod tests {
         assert!(logs
             .iter()
             .any(|line| line.contains("waiting post-countdown focus grace 500ms")));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn first_snapshot_is_allowed_at_ready_at_plus_500ms() {
+        let path = temp_bridge_path("vs-sim-focus-grace-allowed");
+        write_ready_bridge(&path, "4382:2034120187", 1);
+        let mut logs = Vec::new();
+        let mut controller = VsSimulationController::with_settings(true, path.clone());
+        controller.next_snapshot(&mut |_| {}).unwrap();
+        if let Some(session) = controller.session.as_mut() {
+            session.countdown_ready_at_ms = current_time_ms().saturating_sub(500);
+            session.input_allowed_at_ms = current_time_ms();
+            session.logged_input_grace_complete = false;
+        }
+
+        let snapshot = controller
+            .next_snapshot(&mut |line| logs.push(line))
+            .unwrap();
+
+        assert!(snapshot.is_some());
+        assert!(logs.iter().any(|line| {
+            line.strip_prefix("[vs-sim] input grace complete elapsed_ms=")
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|elapsed| elapsed >= 500)
+                .unwrap_or(false)
+        }));
         let _ = fs::remove_file(path);
     }
 

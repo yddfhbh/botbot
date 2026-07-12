@@ -46,7 +46,7 @@ function createFakeCdp({ failDispatch, focusResult } = {}) {
   };
 }
 
-function createContext(cdp, pressedKeys = new Set()) {
+function createContext(cdp, pressedKeys = new Set(), options = {}) {
   const responses = [];
   return {
     cdp,
@@ -61,6 +61,9 @@ function createContext(cdp, pressedKeys = new Set()) {
       focusLogState: { lastKey: "" },
       writeResponse(payload) {
         responses.push(payload);
+        if (Array.isArray(options.stdoutLines)) {
+          options.stdoutLines.push(`${JSON.stringify(payload)}\n`);
+        }
       }
     }
   };
@@ -70,6 +73,27 @@ function keyEventCodes(events) {
   return events
     .filter((event) => event.type === "keyDown" || event.type === "keyUp")
     .map((event) => `${event.type}:${event.code}`);
+}
+
+async function captureProcessStreams(run) {
+  const stderrLines = [];
+  const originalStderrWrite = process.stderr.write;
+
+  process.stderr.write = ((chunk, encoding, callback) => {
+    stderrLines.push(String(chunk));
+    if (typeof encoding === "function") {
+      encoding();
+    } else if (typeof callback === "function") {
+      callback();
+    }
+    return true;
+  });
+
+  try {
+    await run({ stderrLines });
+  } finally {
+    process.stderr.write = originalStderrWrite;
+  }
 }
 
 test("sequence preserves action order and responds once", async () => {
@@ -182,6 +206,30 @@ test("tap prepares focus before dispatching keys", async () => {
   assert.equal(responses[0].ok, true);
 });
 
+test("focus success logs go to stderr and stdout responses stay valid JSON", async () => {
+  const cdp = createFakeCdp();
+  const stdoutLines = [];
+  const { context } = createContext(cdp, new Set(), { stdoutLines });
+
+  await captureProcessStreams(async ({ stderrLines }) => {
+    await handleMessage(
+      {
+        id: 41,
+        type: "sequence",
+        actions: [{ key: "moveLeft", durationMs: 8 }]
+      },
+      context
+    );
+
+    const jsonLines = stdoutLines.filter((line) => line.trim());
+    assert.ok(stderrLines.some((line) => line.includes("[input] focus prepared active=BODY")));
+    assert.equal(jsonLines.length, 1);
+    for (const line of jsonLines) {
+      assert.doesNotThrow(() => JSON.parse(line));
+    }
+  });
+});
+
 test("unsafe active elements block all key input", async () => {
   const blockedFocusCases = [
     { activeTag: "BUTTON", contentEditable: false },
@@ -214,6 +262,37 @@ test("unsafe active elements block all key input", async () => {
   }
 });
 
+test("focus failure logs stay off stdout and error responses remain valid JSON", async () => {
+  const cdp = createFakeCdp({
+    focusResult: {
+      visibilityState: "visible",
+      activeTag: "BUTTON",
+      contentEditable: false
+    }
+  });
+  const stdoutLines = [];
+  const { context } = createContext(cdp, new Set(), { stdoutLines });
+
+  await captureProcessStreams(async ({ stderrLines }) => {
+    await handleMessage(
+      {
+        id: 42,
+        type: "tap",
+        key: "moveLeft",
+        durationMs: 8
+      },
+      context
+    );
+
+    const jsonLines = stdoutLines.filter((line) => line.trim());
+    assert.ok(stderrLines.some((line) => line.includes("[input] blocked unsafe active element tag=BUTTON")));
+    assert.equal(jsonLines.length, 1);
+    for (const line of jsonLines) {
+      assert.doesNotThrow(() => JSON.parse(line));
+    }
+  });
+});
+
 test("safe BODY focus allows key input", async () => {
   const cdp = createFakeCdp({
     focusResult: {
@@ -238,6 +317,29 @@ test("safe BODY focus allows key input", async () => {
     ["keyDown:KeyX", "keyUp:KeyX"]
   );
   assert.equal(responses[0].ok, true);
+});
+
+test("stdout payloads remain parseable JSON even when stderr logs are emitted", async () => {
+  const cdp = createFakeCdp();
+  const stdoutLines = [];
+  const { context } = createContext(cdp, new Set(), { stdoutLines });
+
+  await captureProcessStreams(async ({ stderrLines }) => {
+    await handleMessage(
+      {
+        id: 43,
+        type: "tap",
+        key: "hardDrop",
+        durationMs: 8
+      },
+      context
+    );
+
+    assert.ok(stderrLines.some((line) => line.includes("[input] focus prepared active=BODY")));
+    for (const line of stdoutLines.filter((line) => line.trim())) {
+      assert.doesNotThrow(() => JSON.parse(line));
+    }
+  });
 });
 
 test("sequence normalization preserves the original action order", () => {
