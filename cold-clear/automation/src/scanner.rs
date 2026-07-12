@@ -18,6 +18,8 @@ pub struct GameSnapshot {
     #[serde(default = "default_snapshot_source")]
     pub source: String,
     pub token: String,
+    #[serde(default)]
+    pub round_id: Option<String>,
     pub field: Vec<[bool; 10]>,
     pub queue: Vec<PieceToken>,
     #[serde(default)]
@@ -391,6 +393,7 @@ mod tests {
         GameSnapshot {
             source: "browser_cdp".to_owned(),
             token: token.to_owned(),
+            round_id: None,
             field: vec![[false; 10]; 40],
             queue: vec![PieceToken::T, PieceToken::I, PieceToken::O],
             hold: None,
@@ -417,6 +420,7 @@ mod tests {
         let raw = serde_json::json!({
             "source": snapshot.source,
             "token": snapshot.token,
+            "round_id": snapshot.round_id,
             "field": snapshot.field,
             "queue": snapshot.queue,
             "hold": snapshot.hold,

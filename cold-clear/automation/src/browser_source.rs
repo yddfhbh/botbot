@@ -268,6 +268,7 @@ impl BrowserSnapshotWire {
         Ok(Some(GameSnapshot {
             source: self.source,
             token: self.token,
+            round_id: None,
             field: self.field,
             queue,
             hold: self.hold,

@@ -15,7 +15,6 @@ const DEFAULT_NEXT_COUNT: usize = 6;
 const DEFAULT_VALIDATION_MAX_PIECES: usize = 10;
 const POST_COUNTDOWN_FOCUS_GRACE_MS: u64 = 500;
 const POST_DROP_SETTLE_MS: u64 = 80;
-const MAX_BRIDGE_AGE_MS: u64 = 10_000;
 const VS_WS_SIM_ENV: &str = "FUSION_VS_WS_SIM";
 const VS_WS_SIM_MAX_PIECES_ENV: &str = "FUSION_VS_WS_SIM_MAX_PIECES";
 
@@ -35,7 +34,6 @@ struct VsSimulationSession {
     next_count: usize,
     countdown_ready_at_ms: u64,
     input_allowed_at_ms: u64,
-    captured_at_ms: u64,
     last_bridge_sequence: u64,
     board: Board,
     hold: Option<Piece>,
@@ -45,6 +43,12 @@ struct VsSimulationSession {
     paused_pending_verification: bool,
     logged_focus_grace_wait: bool,
     logged_input_grace_complete: bool,
+}
+
+#[derive(Copy, Clone)]
+enum ValidationStage {
+    RoutePreflight,
+    PreHardDrop,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,6 +195,17 @@ impl VsSimulationController {
         ))
     }
 
+    pub fn validate_route_preflight<F>(
+        &mut self,
+        snapshot: &GameSnapshot,
+        log: &mut F,
+    ) -> Result<bool>
+    where
+        F: FnMut(String),
+    {
+        self.validate_snapshot_stage(snapshot, ValidationStage::RoutePreflight, log)
+    }
+
     pub fn validate_pre_hard_drop<F>(
         &mut self,
         snapshot: &GameSnapshot,
@@ -199,49 +214,7 @@ impl VsSimulationController {
     where
         F: FnMut(String),
     {
-        if !self.enabled || snapshot.source != "browser_ws_sim" {
-            return Ok(true);
-        }
-
-        let Some(bridge) = read_bridge_wire(&self.bridge_path)? else {
-            log("[vs-sim] pre-drop validation failed reason=bridge_unavailable".to_owned());
-            return Ok(false);
-        };
-        self.sync_bridge(bridge, log)?;
-
-        let Some(session) = &self.session else {
-            log("[vs-sim] pre-drop validation failed reason=session_missing".to_owned());
-            return Ok(false);
-        };
-        if session.paused_pending_verification {
-            log("[vs-sim] pre-drop validation failed reason=validation_paused".to_owned());
-            return Ok(false);
-        }
-        if snapshot.token != session.token() {
-            log(format!(
-                "[vs-sim] pre-drop validation failed reason=token_mismatch expected={} actual={}",
-                snapshot.token,
-                session.token()
-            ));
-            return Ok(false);
-        }
-        if snapshot.piece_counter != Some(session.piece_index as u32) {
-            log(format!(
-                "[vs-sim] pre-drop validation failed reason=piece_index_mismatch expected={} actual={}",
-                snapshot.piece_counter.unwrap_or_default(),
-                session.piece_index
-            ));
-            return Ok(false);
-        }
-        let bridge_age_ms = current_time_ms().saturating_sub(session.captured_at_ms);
-        if bridge_age_ms > MAX_BRIDGE_AGE_MS {
-            log(format!(
-                "[vs-sim] pre-drop validation failed reason=bridge_stale age_ms={bridge_age_ms}"
-            ));
-            return Ok(false);
-        }
-
-        Ok(true)
+        self.validate_snapshot_stage(snapshot, ValidationStage::PreHardDrop, log)
     }
 
     pub fn commit_hard_drop<F>(
@@ -317,6 +290,107 @@ impl VsSimulationController {
         }
     }
 
+    fn validate_snapshot_stage<F>(
+        &mut self,
+        snapshot: &GameSnapshot,
+        stage: ValidationStage,
+        log: &mut F,
+    ) -> Result<bool>
+    where
+        F: FnMut(String),
+    {
+        if !self.enabled || snapshot.source != "browser_ws_sim" {
+            return Ok(true);
+        }
+
+        let Some(bridge) = read_bridge_wire(&self.bridge_path)? else {
+            log_validation_failure(stage, "bridge_unavailable", log);
+            return Ok(false);
+        };
+
+        let bridge_round_id = bridge.round_id.clone();
+        let bridge_active = bridge.active;
+        let bridge_has_garbage = !bridge.incoming_garbage.is_empty();
+        let bridge_local_game_id = match value_to_string(&bridge.local.gameid) {
+            Some(value) => value,
+            None => {
+                log_validation_failure(stage, "bridge_local_gameid_invalid", log);
+                return Ok(false);
+            }
+        };
+        let bridge_seed = match value_to_string(&bridge.options.seed) {
+            Some(value) => value,
+            None => {
+                log_validation_failure(stage, "bridge_seed_invalid", log);
+                return Ok(false);
+            }
+        };
+
+        self.sync_bridge(bridge, log)?;
+
+        if !bridge_active {
+            log_validation_failure(stage, "bridge_inactive", log);
+            return Ok(false);
+        }
+        if bridge_has_garbage {
+            log_validation_failure(stage, "incoming_garbage", log);
+            return Ok(false);
+        }
+
+        let Some(session) = &self.session else {
+            log_validation_failure(stage, "session_missing", log);
+            return Ok(false);
+        };
+        if session.paused_pending_verification {
+            log_validation_failure(stage, "validation_paused", log);
+            return Ok(false);
+        }
+        if !session.matches_identity(&bridge_round_id, &bridge_local_game_id, &bridge_seed) {
+            log_validation_failure(stage, "bridge_identity_mismatch", log);
+            return Ok(false);
+        }
+        if snapshot.round_id.as_deref() != Some(session.round_id.as_str()) {
+            log_validation_failure(
+                stage,
+                &format!(
+                    "round_mismatch expected={} actual={}",
+                    snapshot.round_id.as_deref().unwrap_or("-"),
+                    session.round_id
+                ),
+                log,
+            );
+            return Ok(false);
+        }
+        if snapshot.token != session.token() {
+            log_validation_failure(
+                stage,
+                &format!(
+                    "token_mismatch expected={} actual={}",
+                    snapshot.token,
+                    session.token()
+                ),
+                log,
+            );
+            return Ok(false);
+        }
+        if matches!(stage, ValidationStage::RoutePreflight)
+            && snapshot.piece_counter != Some(session.piece_index as u32)
+        {
+            log_validation_failure(
+                stage,
+                &format!(
+                    "piece_index_mismatch expected={} actual={}",
+                    snapshot.piece_counter.unwrap_or_default(),
+                    session.piece_index
+                ),
+                log,
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
     fn sync_bridge<F>(&mut self, bridge: VsBridgeWire, log: &mut F) -> Result<()>
     where
         F: FnMut(String),
@@ -355,13 +429,27 @@ impl VsSimulationController {
             return Ok(());
         }
 
+        let bridge_local_game_id = match value_to_string(&bridge.local.gameid) {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+        let bridge_seed = match value_to_string(&bridge.options.seed) {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+
         match &mut self.session {
-            Some(session) if session.round_id == bridge.round_id => {
+            Some(session)
+                if session.matches_identity(
+                    &bridge.round_id,
+                    &bridge_local_game_id,
+                    &bridge_seed,
+                ) =>
+            {
                 session.countdown_ready_at_ms = bridge.ready_at;
                 session.input_allowed_at_ms = bridge
                     .ready_at
                     .saturating_add(POST_COUNTDOWN_FOCUS_GRACE_MS);
-                session.captured_at_ms = bridge.captured_at;
                 session.last_bridge_sequence = bridge.sequence;
             }
             _ => {
@@ -398,7 +486,6 @@ impl VsSimulationSession {
             input_allowed_at_ms: bridge
                 .ready_at
                 .saturating_add(POST_COUNTDOWN_FOCUS_GRACE_MS),
-            captured_at_ms: bridge.captured_at,
             last_bridge_sequence: bridge.sequence,
             board: Board::new(),
             hold: None,
@@ -428,6 +515,7 @@ impl VsSimulationSession {
         Ok(GameSnapshot {
             source: "browser_ws_sim".to_owned(),
             token: self.token(),
+            round_id: Some(self.round_id.clone()),
             field: self.board.get_field().into_iter().collect(),
             queue: queue_tokens,
             hold: self.hold.map(piece_to_token),
@@ -467,6 +555,10 @@ impl VsSimulationSession {
             next_hold: Some(current),
             next_piece_index: self.piece_index + 2,
         })
+    }
+
+    fn matches_identity(&self, round_id: &str, local_game_id: &str, seed: &str) -> bool {
+        self.round_id == round_id && self.local_game_id == local_game_id && self.seed == seed
     }
 }
 
@@ -518,6 +610,20 @@ fn current_time_ms() -> u64 {
 
 fn initial_input_grace_active(piece_index: usize, now: u64, input_allowed_at_ms: u64) -> bool {
     piece_index == 0 && now < input_allowed_at_ms
+}
+
+fn log_validation_failure<F>(stage: ValidationStage, reason: &str, log: &mut F)
+where
+    F: FnMut(String),
+{
+    match stage {
+        ValidationStage::RoutePreflight => {
+            log(format!("[vs-sim] route preflight failed reason={reason}"))
+        }
+        ValidationStage::PreHardDrop => log(format!(
+            "[vs-sim] pre-drop validation failed reason={reason}"
+        )),
+    }
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
@@ -657,25 +763,28 @@ mod tests {
         write(path, body).unwrap();
     }
 
-    fn sample_bridge(
+    fn sample_bridge_with_state(
         round_id: &str,
         sequence: u64,
         ready_at: u64,
         incoming_garbage: &str,
+        active: bool,
+        local_game_id: &str,
+        seed: &str,
+        captured_at: u64,
     ) -> String {
-        let captured_at = current_time_ms();
         format!(
             r#"{{
   "version": 1,
   "sequence": {sequence},
   "roundId": "{round_id}",
-  "active": true,
+  "active": {active},
   "capturedAt": {captured_at},
   "readyAt": {ready_at},
   "local": {{
     "username": "hebi_",
     "userid": "63b3ad2b1103e5097025feba",
-    "gameid": 4382
+    "gameid": {local_game_id}
   }},
   "opponents": [
     {{
@@ -685,12 +794,30 @@ mod tests {
     }}
   ],
   "options": {{
-    "seed": 2034120187,
+    "seed": {seed},
     "bagtype": "7-bag",
     "nextcount": 6
   }},
   "incomingGarbage": {incoming_garbage}
 }}"#
+        )
+    }
+
+    fn sample_bridge(
+        round_id: &str,
+        sequence: u64,
+        ready_at: u64,
+        incoming_garbage: &str,
+    ) -> String {
+        sample_bridge_with_state(
+            round_id,
+            sequence,
+            ready_at,
+            incoming_garbage,
+            true,
+            "4382",
+            "2034120187",
+            current_time_ms(),
         )
     }
 
@@ -918,6 +1045,7 @@ mod tests {
         let browser_snapshot = GameSnapshot {
             source: "browser_cdp".to_owned(),
             token: "browser-10-1".to_owned(),
+            round_id: None,
             field: vec![[false; 10]; 40],
             queue: vec![PieceToken::T, PieceToken::I, PieceToken::O],
             hold: None,
@@ -985,6 +1113,168 @@ mod tests {
         assert!(logs
             .iter()
             .any(|line| line.contains("reason=token_mismatch")));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_captured_at_does_not_invalidate_an_active_session() {
+        let path = temp_bridge_path("vs-sim-old-captured-at");
+        write_bridge(
+            &path,
+            &sample_bridge_with_state(
+                "4382:2034120187",
+                1,
+                0,
+                "[]",
+                true,
+                "4382",
+                "2034120187",
+                current_time_ms().saturating_sub(60_000),
+            ),
+        );
+        let mut controller = VsSimulationController::with_settings(true, path.clone());
+
+        let snapshot = controller
+            .next_snapshot(&mut |_| {})
+            .unwrap()
+            .expect("simulated snapshot");
+        let valid = controller
+            .validate_route_preflight(&snapshot, &mut |_| {})
+            .unwrap();
+
+        assert!(valid);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn unchanged_bridge_sequence_does_not_invalidate_an_active_session() {
+        let path = temp_bridge_path("vs-sim-static-sequence");
+        write_ready_bridge(&path, "4382:2034120187", 7);
+        let mut controller = VsSimulationController::with_settings(true, path.clone());
+        let snapshot = controller
+            .next_snapshot(&mut |_| {})
+            .unwrap()
+            .expect("simulated snapshot");
+        write_bridge(
+            &path,
+            &sample_bridge_with_state(
+                "4382:2034120187",
+                7,
+                0,
+                "[]",
+                true,
+                "4382",
+                "2034120187",
+                current_time_ms().saturating_sub(60_000),
+            ),
+        );
+
+        let valid = controller
+            .validate_route_preflight(&snapshot, &mut |_| {})
+            .unwrap();
+
+        assert!(valid);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn route_preflight_rejects_inactive_bridge() {
+        let path = temp_bridge_path("vs-sim-inactive-bridge");
+        write_ready_bridge(&path, "4382:2034120187", 1);
+        let mut controller = VsSimulationController::with_settings(true, path.clone());
+        let snapshot = controller
+            .next_snapshot(&mut |_| {})
+            .unwrap()
+            .expect("simulated snapshot");
+        let mut logs = Vec::new();
+        write_bridge(
+            &path,
+            &sample_bridge_with_state(
+                "4382:2034120187",
+                2,
+                0,
+                "[]",
+                false,
+                "4382",
+                "2034120187",
+                current_time_ms(),
+            ),
+        );
+
+        let valid = controller
+            .validate_route_preflight(&snapshot, &mut |line| logs.push(line))
+            .unwrap();
+
+        assert!(!valid);
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("reason=bridge_inactive")));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn route_preflight_rejects_round_change() {
+        let path = temp_bridge_path("vs-sim-round-change");
+        write_ready_bridge(&path, "4382:2034120187", 1);
+        let mut controller = VsSimulationController::with_settings(true, path.clone());
+        let snapshot = controller
+            .next_snapshot(&mut |_| {})
+            .unwrap()
+            .expect("simulated snapshot");
+        let mut logs = Vec::new();
+        write_bridge(
+            &path,
+            &sample_bridge_with_state(
+                "4382:2034120188",
+                2,
+                0,
+                "[]",
+                true,
+                "4382",
+                "2034120187",
+                current_time_ms(),
+            ),
+        );
+
+        let valid = controller
+            .validate_route_preflight(&snapshot, &mut |line| logs.push(line))
+            .unwrap();
+
+        assert!(!valid);
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("reason=round_mismatch")));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn route_preflight_rejects_incoming_garbage() {
+        let path = temp_bridge_path("vs-sim-route-garbage");
+        write_ready_bridge(&path, "4382:2034120187", 1);
+        let mut controller = VsSimulationController::with_settings(true, path.clone());
+        let snapshot = controller
+            .next_snapshot(&mut |_| {})
+            .unwrap()
+            .expect("simulated snapshot");
+        let mut logs = Vec::new();
+        write_bridge(
+            &path,
+            &sample_bridge(
+                "4382:2034120187",
+                2,
+                0,
+                r#"[{"ownerGameId":4383,"eventType":"interaction","data":{"amt":2}}]"#,
+            ),
+        );
+
+        let valid = controller
+            .validate_route_preflight(&snapshot, &mut |line| logs.push(line))
+            .unwrap();
+
+        assert!(!valid);
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("reason=incoming_garbage")));
         let _ = fs::remove_file(path);
     }
 

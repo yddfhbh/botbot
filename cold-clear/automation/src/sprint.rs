@@ -542,6 +542,7 @@ mod tests {
         GameSnapshot {
             source: "test".to_owned(),
             token: "browser-1-0".to_owned(),
+            round_id: None,
             field: field.into_iter().collect(),
             queue: vec![PieceToken::I, PieceToken::T, PieceToken::O, PieceToken::L],
             hold: None,

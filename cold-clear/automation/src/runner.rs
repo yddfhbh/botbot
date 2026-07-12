@@ -169,6 +169,13 @@ where
                 match prepare_execution(config, &snapshot, &sprint_state, &mut log)? {
                     Some(prepared) => {
                         emit_move_logs(config, &snapshot, &prepared, &mut log);
+                        if snapshot.source == "browser_ws_sim"
+                            && !vs_sim_controller.validate_route_preflight(&snapshot, &mut log)?
+                        {
+                            log("[vs-sim] input suppressed before route".to_owned());
+                            thread::sleep(poll_delay);
+                            continue;
+                        }
                         let input_started_at = Instant::now();
                         if let Err(error) = execute_plan_until_hard_drop(
                             driver,
@@ -2008,8 +2015,11 @@ mod tests {
     use crate::scanner::PieceToken;
     use libtetris::{PieceState, RotationState, Statistics, TspinStatus};
     use std::collections::VecDeque;
+    use std::fs::write;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct ScriptedScanner {
         snapshots: VecDeque<(GameSnapshot, Option<Duration>)>,
@@ -2056,10 +2066,84 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RoutePhaseBackend {
+        route_sequences: u32,
+        hard_drop_sequences: u32,
+    }
+
+    impl InputBackend for RoutePhaseBackend {
+        fn tap(&mut self, action: GameAction, _: Duration) -> Result<()> {
+            if action == GameAction::HardDrop {
+                self.hard_drop_sequences += 1;
+            }
+            Ok(())
+        }
+
+        fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
+            if actions.len() == 1 && actions[0].action == GameAction::HardDrop {
+                self.hard_drop_sequences += 1;
+            } else if !actions.is_empty() {
+                self.route_sequences += 1;
+            }
+            Ok(())
+        }
+
+        fn release_all_keys(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn supports_batched_sequences(&self) -> bool {
+            true
+        }
+    }
+
+    fn temp_bridge_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("automation-runner-{name}-{unique}"))
+    }
+
+    fn write_runner_bridge(path: &Path, round_id: &str, active: bool, incoming_garbage: &str) {
+        let raw = format!(
+            r#"{{
+  "version": 1,
+  "sequence": 1,
+  "roundId": "{round_id}",
+  "active": {active},
+  "capturedAt": 1,
+  "readyAt": 0,
+  "local": {{
+    "username": "hebi_",
+    "userid": "u1",
+    "gameid": 4382
+  }},
+  "opponents": [
+    {{
+      "username": "guest",
+      "userid": "u2",
+      "gameid": 4383
+    }}
+  ],
+  "options": {{
+    "seed": 2034120187,
+    "bagtype": "7-bag",
+    "nextcount": 6
+  }},
+  "incomingGarbage": {incoming_garbage}
+}}"#
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write(path, raw).unwrap();
+    }
+
     fn runner_test_snapshot(token: &str, piece_counter: u32) -> GameSnapshot {
         GameSnapshot {
             source: "browser_cdp".to_owned(),
             token: token.to_owned(),
+            round_id: None,
             field: vec![[false; 10]; 40],
             queue: vec![PieceToken::J, PieceToken::O, PieceToken::T, PieceToken::L],
             hold: None,
@@ -2079,6 +2163,7 @@ mod tests {
         let snapshot = GameSnapshot {
             source: "test".to_owned(),
             token: "t0".to_owned(),
+            round_id: None,
             field: vec![[false; 10]; 40],
             queue: vec![],
             hold: None,
@@ -2100,6 +2185,7 @@ mod tests {
         let snapshot = GameSnapshot {
             source: "test".to_owned(),
             token: "t1".to_owned(),
+            round_id: None,
             field: vec![[false; 10]; 40],
             queue: vec![PieceToken::I, PieceToken::O, PieceToken::T, PieceToken::L],
             hold: None,
@@ -2121,6 +2207,7 @@ mod tests {
         let snapshot = GameSnapshot {
             source: "test".to_owned(),
             token: "t2".to_owned(),
+            round_id: None,
             field: vec![[false; 10]; 40],
             queue: vec![PieceToken::J, PieceToken::O, PieceToken::T, PieceToken::L],
             hold: None,
@@ -2163,6 +2250,7 @@ mod tests {
         let snapshot = GameSnapshot {
             source: "test".to_owned(),
             token: "t3".to_owned(),
+            round_id: None,
             field: vec![[false; 10]; 40],
             queue: vec![PieceToken::T, PieceToken::O, PieceToken::I, PieceToken::L],
             hold: None,
@@ -2346,6 +2434,7 @@ mod tests {
         let snapshot = GameSnapshot {
             source: "test".to_owned(),
             token: "browser-1-0".to_owned(),
+            round_id: None,
             field: vec![[false; 10]; 40],
             queue: vec![PieceToken::I, PieceToken::O, PieceToken::T],
             hold: None,
@@ -2470,6 +2559,7 @@ mod tests {
         let snapshot = GameSnapshot {
             source: "browser_cdp".to_owned(),
             token: "browser-12-repeat".to_owned(),
+            round_id: None,
             field: vec![[false; 10]; 40],
             queue: vec![PieceToken::T, PieceToken::I, PieceToken::O],
             hold: None,
@@ -2494,6 +2584,7 @@ mod tests {
         let mut snapshot = GameSnapshot {
             source: "browser_cdp".to_owned(),
             token: "browser-3".to_owned(),
+            round_id: None,
             field: vec![[false; 10]; 40],
             queue: vec![PieceToken::T, PieceToken::I, PieceToken::O],
             hold: None,
@@ -2592,6 +2683,146 @@ mod tests {
         assert!(should_use_browser_pre_hard_drop_probe(
             &runner_test_snapshot("browser-1-0", 0)
         ));
+    }
+
+    fn vs_validation_snapshot() -> GameSnapshot {
+        let mut snapshot = runner_test_snapshot("vs-4382-2034120187-0", 0);
+        snapshot.source = "browser_ws_sim".to_owned();
+        snapshot.round_id = Some("4382:2034120187".to_owned());
+        snapshot
+    }
+
+    fn vs_route_plan() -> ExecutionPlan {
+        ExecutionPlan {
+            hold: false,
+            movement_actions: vec![GameAction::Left],
+            hard_drop: true,
+        }
+    }
+
+    fn runner_test_timings() -> ExecutionTimings {
+        ExecutionTimings {
+            tap_duration: Duration::from_millis(60),
+            movement_tap_duration: Duration::from_millis(10),
+            rotate_tap_duration: Duration::from_millis(10),
+            hold_tap_duration: Duration::from_millis(10),
+            hard_drop_tap_duration: Duration::from_millis(8),
+            soft_drop_tap_duration: Duration::from_millis(10),
+            movement_interval: Duration::ZERO,
+            rotation_interval: Duration::ZERO,
+            piece_interval: Duration::ZERO,
+            hard_drop_interval: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn route_preflight_failure_suppresses_all_vs_inputs() {
+        let dir = temp_bridge_dir("vs-route-preflight-fail");
+        let bridge_path = dir.join("vs-ws-bridge.json");
+        write_runner_bridge(&bridge_path, "4382:2034120187", false, "[]");
+        let mut controller = VsSimulationController::with_settings(true, bridge_path);
+        let mut backend = RoutePhaseBackend::default();
+        let snapshot = vs_validation_snapshot();
+        let valid = controller
+            .validate_route_preflight(&snapshot, &mut |_| {})
+            .unwrap();
+
+        if valid {
+            execute_plan_until_hard_drop(
+                &mut backend,
+                &vs_route_plan(),
+                &HandlingConfig::default(),
+                runner_test_timings(),
+                |_| {},
+            )
+            .unwrap();
+            execute_hard_drop_action(
+                &mut backend,
+                &vs_route_plan().movement_actions,
+                &HandlingConfig::default(),
+                runner_test_timings(),
+                |_| {},
+            )
+            .unwrap();
+        }
+
+        assert!(!valid);
+        assert_eq!(backend.route_sequences, 0);
+        assert_eq!(backend.hard_drop_sequences, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn route_preflight_success_allows_route_input() {
+        let dir = temp_bridge_dir("vs-route-preflight-pass");
+        let bridge_path = dir.join("vs-ws-bridge.json");
+        write_runner_bridge(&bridge_path, "4382:2034120187", true, "[]");
+        let mut controller = VsSimulationController::with_settings(true, bridge_path);
+        let mut backend = RoutePhaseBackend::default();
+        let snapshot = vs_validation_snapshot();
+
+        assert!(controller
+            .validate_route_preflight(&snapshot, &mut |_| {})
+            .unwrap());
+        execute_plan_until_hard_drop(
+            &mut backend,
+            &vs_route_plan(),
+            &HandlingConfig::default(),
+            runner_test_timings(),
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(backend.route_sequences, 1);
+        assert_eq!(backend.hard_drop_sequences, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pre_drop_failure_blocks_hard_drop_and_commit() {
+        let dir = temp_bridge_dir("vs-pre-drop-fail");
+        let bridge_path = dir.join("vs-ws-bridge.json");
+        write_runner_bridge(&bridge_path, "4382:2034120187", true, "[]");
+        let mut controller = VsSimulationController::with_settings(true, bridge_path.clone());
+        let mut backend = RoutePhaseBackend::default();
+        let snapshot = vs_validation_snapshot();
+
+        assert!(controller
+            .validate_route_preflight(&snapshot, &mut |_| {})
+            .unwrap());
+        execute_plan_until_hard_drop(
+            &mut backend,
+            &vs_route_plan(),
+            &HandlingConfig::default(),
+            runner_test_timings(),
+            |_| {},
+        )
+        .unwrap();
+        write_runner_bridge(
+            &bridge_path,
+            "4382:2034120187",
+            true,
+            r#"[{"ownerGameId":4383,"eventType":"interaction","data":{"amt":2}}]"#,
+        );
+
+        let valid = controller
+            .validate_pre_hard_drop(&snapshot, &mut |_| {})
+            .unwrap();
+        if valid {
+            execute_hard_drop_action(
+                &mut backend,
+                &vs_route_plan().movement_actions,
+                &HandlingConfig::default(),
+                runner_test_timings(),
+                |_| {},
+            )
+            .unwrap();
+        }
+
+        assert!(!valid);
+        assert_eq!(backend.route_sequences, 1);
+        assert_eq!(backend.hard_drop_sequences, 0);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2761,6 +2992,7 @@ mod tests {
         GameSnapshot {
             source: "benchmark".to_owned(),
             token: format!("browser-{epoch}-{piece_counter}"),
+            round_id: None,
             field: board.get_field().into_iter().collect(),
             queue: board.next_queue().take(6).map(piece_to_token).collect(),
             hold: board.hold_piece.map(piece_to_token),
