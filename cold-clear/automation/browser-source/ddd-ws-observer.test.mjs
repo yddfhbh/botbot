@@ -506,21 +506,53 @@ test("observer callback fires only when active state or roundId changes", async 
       active: true,
       roundId: "5449:1744077373",
       localGameId: "5449",
+      localUserId: "local-id",
+      localUsername: "hebi_",
       seed: "1744077373"
     },
     {
       active: true,
       roundId: "5451:1744077374",
       localGameId: "5451",
+      localUserId: "local-id",
+      localUsername: "hebi_",
       seed: "1744077374"
     },
     {
       active: false,
       roundId: "",
       localGameId: "",
+      localUserId: "",
+      localUsername: "",
       seed: ""
     }
   ]);
+});
+
+test("observer callback enables VS bridge identity tracking even without VS sim env", async () => {
+  const cdp = new FakeCdp();
+  const statuses = [];
+  const cleanup = await installDddWsObserver(cdp, {
+    unpack: () => {
+      throw new Error("unused");
+    },
+    log: () => {},
+    vsSimEnabled: false,
+    onVsRoundStatus: (status) => statuses.push(status)
+  });
+
+  cdp.emit("Network.webSocketFrameReceived", {
+    requestId: "req-vs-bridge-only",
+    response: {
+      opcode: 1,
+      payloadData: JSON.stringify(vsRoundPayload())
+    }
+  });
+  cleanup();
+
+  assert.equal(statuses[0]?.active, true);
+  assert.equal(statuses[0]?.localGameId, "5449");
+  assert.equal(statuses[0]?.localUserId, "local-id");
 });
 
 test("observer callback errors do not stop frame handling", async () => {

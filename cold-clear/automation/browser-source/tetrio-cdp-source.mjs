@@ -15,6 +15,7 @@ const DEFAULT_NEXT_COUNT = 6;
 const DEFAULT_STATUS_MS = 2500;
 const DEFAULT_CAPTURE_COOLDOWN_MS = 2000;
 const DEFAULT_SUPPRESSED_REASON = "VS WebSocket simulation owns live state";
+const DEFAULT_VS_OBJECT_SNAPSHOT_PATH = "automation/vs-object-snapshot.json";
 const PERF_LOG_INTERVAL_MS = 2000;
 
 export function determineChromiumOwnership({ connectOnly, alreadyOpen }) {
@@ -33,6 +34,16 @@ export function createSnapshotTracking() {
   };
 }
 
+export function createVsObjectTracking() {
+  return {
+    roundId: "",
+    lastSnapshotSignature: "",
+    lastCandidateLogSignature: "",
+    lastNotFoundRoundId: "",
+    lastActiveRoundId: ""
+  };
+}
+
 export function resetSnapshotTracking(tracking) {
   tracking.stableSignature = "";
   tracking.stableCount = 0;
@@ -44,6 +55,15 @@ export function resetSnapshotTracking(tracking) {
   return tracking;
 }
 
+export function resetVsObjectTracking(tracking) {
+  tracking.roundId = "";
+  tracking.lastSnapshotSignature = "";
+  tracking.lastCandidateLogSignature = "";
+  tracking.lastNotFoundRoundId = "";
+  tracking.lastActiveRoundId = "";
+  return tracking;
+}
+
 export function buildSnapshotSignature(gameEpoch, state) {
   const queueText = state.queue.join(",");
   return `${gameEpoch}|${state.pieceCounter}|${state.current}|${state.hold ?? "-"}|${queueText}|${state.activeX ?? "-"}|${state.activeY ?? "-"}|${state.activeRotation ?? "-"}`;
@@ -51,6 +71,24 @@ export function buildSnapshotSignature(gameEpoch, state) {
 
 export function buildSnapshotToken(gameEpoch, pieceCounter) {
   return `browser-${gameEpoch}-${pieceCounter}`;
+}
+
+export function buildVsObjectSnapshotSignature(snapshot) {
+  const boardText = Array.isArray(snapshot?.board)
+    ? snapshot.board
+        .map((row) => row.map((cell) => (cell ? "1" : "0")).join(""))
+        .join("|")
+    : "";
+  const queueText = Array.isArray(snapshot?.queue) ? snapshot.queue.join(",") : "";
+  return [
+    snapshot?.roundId ?? "",
+    snapshot?.gameid ?? "",
+    boardText,
+    snapshot?.current ?? "",
+    snapshot?.hold ?? "",
+    queueText,
+    snapshot?.active ?? ""
+  ].join("|");
 }
 
 export function resolvePollMs(args) {
@@ -141,6 +179,8 @@ export function clearSnapshotFile(snapshotPath) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const snapshotPath = args.snapshotPath ?? "automation/live-snapshot.json";
+  const vsObjectSnapshotPath =
+    args.vsObjectSnapshotPath ?? DEFAULT_VS_OBJECT_SNAPSHOT_PATH;
   const url = args.url ?? DEFAULT_URL;
   const port = numberArg(args.port, DEFAULT_PORT);
   const targetHint = args.target ?? "TETR.IO";
@@ -152,6 +192,7 @@ async function main() {
     args.useSeedSimulationFallback !== "0"
   );
   const vsWsSimEnabled = isVsWsSimEnvEnabled();
+  const vsObjectTraceEnabled = process.env.FUSION_VS_OBJECT_TRACE === "1";
   const browserPerfEnabled = process.env.FUSION_BROWSER_PERF === "1";
   const chromePath = process.env.CHROME_PATH || "";
   const msgpack = await loadOptionalMsgpack();
@@ -178,6 +219,14 @@ async function main() {
   let dddWsObserverCleanup = null;
   let vsRoundActive = false;
   let vsRoundId = "";
+  let vsRoundStatus = {
+    active: false,
+    roundId: "",
+    localGameId: "",
+    localUserId: "",
+    localUsername: "",
+    seed: ""
+  };
   let lastPerfLoggedAt = Date.now();
   let loopStartedAt = Date.now();
   let maxEventLoopDelayMs = 0;
@@ -195,15 +244,23 @@ async function main() {
           nextActive !== vsRoundActive || nextRoundId !== vsRoundId;
         vsRoundActive = nextActive;
         vsRoundId = nextRoundId;
-        if (!changed || !vsWsSimEnabled) {
+        vsRoundStatus = {
+          active: nextActive,
+          roundId: nextRoundId,
+          localGameId: nextActive ? String(status?.localGameId ?? "") : "",
+          localUserId: nextActive ? String(status?.localUserId ?? "") : "",
+          localUsername: nextActive ? String(status?.localUsername ?? "") : "",
+          seed: nextActive ? String(status?.seed ?? "") : ""
+        };
+        if (!changed) {
           return;
         }
         if (vsRoundActive) {
           console.log(
-            `[browser] VS round active; closure capture probe suspended roundId=${vsRoundId}`
+            `[browser] VS round active; live snapshot capture suspended roundId=${vsRoundId}`
           );
         } else {
-          console.log("[browser] VS round inactive; closure capture probe restored");
+          console.log("[browser] VS round inactive; live snapshot capture restored");
         }
       },
       perfEnabled: browserPerfEnabled
@@ -234,6 +291,7 @@ async function main() {
   let lastReason = "";
   let lastReasonAt = 0;
   const snapshotTracking = createSnapshotTracking();
+  const vsObjectTracking = createVsObjectTracking();
   const probeState = {
     lastCaptureAt: 0
   };
@@ -260,6 +318,46 @@ async function main() {
       Math.max(0, loopNow - (loopStartedAt + pollMs))
     );
     loopStartedAt = loopNow;
+
+    if (vsRoundStatus.active) {
+      if (vsObjectTracking.lastActiveRoundId !== vsRoundStatus.roundId) {
+        vsObjectTracking.lastActiveRoundId = vsRoundStatus.roundId;
+        resetSnapshotTracking(snapshotTracking);
+        probeState.lastCaptureAt = 0;
+        clearSnapshotFile(snapshotPath);
+      }
+
+      await processVsObjectDiagnostics(cdp, {
+        vsRoundStatus,
+        tracking: vsObjectTracking,
+        liveSnapshotPath: snapshotPath,
+        vsObjectSnapshotPath,
+        traceEnabled: vsObjectTraceEnabled
+      });
+
+      lastReason = "";
+      lastReasonAt = 0;
+      const perfUpdate = maybeLogBrowserPerf({
+        browserPerfEnabled,
+        lastPerfLoggedAt,
+        maxEventLoopDelayMs
+      });
+      if (perfUpdate) {
+        lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
+        maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+      }
+      await sleep(pollMs);
+      continue;
+    }
+
+    if (vsObjectTracking.lastActiveRoundId) {
+      resetVsObjectTracking(vsObjectTracking);
+      clearSnapshotFile(vsObjectSnapshotPath);
+      clearSnapshotFile(snapshotPath);
+      resetSnapshotTracking(snapshotTracking);
+      probeState.lastCaptureAt = 0;
+    }
+
     const state = await readTetrioState(cdp, {
       probePageState,
       useSeedSimulationFallback,
@@ -725,6 +823,115 @@ function finiteNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+export async function readVsLocalGameObject(cdp, identity) {
+  const raw = await safeRuntimeEvaluate(cdp, {
+    expression: vsObjectStateExpression(identity),
+    returnByValue: true,
+    awaitPromise: true
+  }, {
+    result: {
+      value: {
+        ok: false,
+        reason: "browser execution context not ready yet"
+      }
+    }
+  });
+  return raw.result?.value ?? {
+    ok: false,
+    reason: "VS object probe returned empty"
+  };
+}
+
+export async function processVsObjectDiagnostics(
+  cdp,
+  {
+    vsRoundStatus,
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath = DEFAULT_VS_OBJECT_SNAPSHOT_PATH,
+    traceEnabled = false,
+    log = (message) => console.log(message),
+    readVsObjectStateFn = readVsLocalGameObject
+  }
+) {
+  if (!vsRoundStatus?.active) {
+    return { handled: false, found: false };
+  }
+
+  const roundId = String(vsRoundStatus.roundId ?? "");
+  if (tracking.roundId !== roundId) {
+    tracking.roundId = roundId;
+    tracking.lastSnapshotSignature = "";
+    tracking.lastCandidateLogSignature = "";
+    tracking.lastNotFoundRoundId = "";
+    clearSnapshotFile(liveSnapshotPath);
+    clearSnapshotFile(vsObjectSnapshotPath);
+  }
+
+  const candidate = await readVsObjectStateFn(cdp, {
+    roundId,
+    gameid: vsRoundStatus.localGameId,
+    userid: vsRoundStatus.localUserId,
+    username: vsRoundStatus.localUsername
+  });
+
+  if (!candidate?.ok) {
+    if (tracking.lastSnapshotSignature) {
+      clearSnapshotFile(vsObjectSnapshotPath);
+      tracking.lastSnapshotSignature = "";
+      tracking.lastCandidateLogSignature = "";
+    }
+    if (tracking.lastNotFoundRoundId !== roundId) {
+      tracking.lastNotFoundRoundId = roundId;
+      log("[vs-object] local game object not found");
+    }
+    return { handled: true, found: false, candidate: null };
+  }
+
+  tracking.lastNotFoundRoundId = "";
+
+  const snapshot = {
+    roundId,
+    gameid: String(candidate.gameid ?? vsRoundStatus.localGameId ?? ""),
+    board: candidate.board,
+    current: candidate.current ? String(candidate.current).toUpperCase() : null,
+    hold: candidate.hold ? String(candidate.hold).toUpperCase() : null,
+    queue: Array.isArray(candidate.queue)
+      ? candidate.queue.map((piece) => String(piece).toUpperCase())
+      : [],
+    active: Boolean(candidate.active),
+    capturedAt: candidate.capturedAt ?? Date.now()
+  };
+  const signature = buildVsObjectSnapshotSignature(snapshot);
+  if (signature !== tracking.lastSnapshotSignature) {
+    writeSnapshot(vsObjectSnapshotPath, snapshot);
+    tracking.lastSnapshotSignature = signature;
+  }
+
+  if (traceEnabled && signature !== tracking.lastCandidateLogSignature) {
+    tracking.lastCandidateLogSignature = signature;
+    logVsObjectCandidate(candidate, log);
+  }
+
+  return { handled: true, found: true, candidate, snapshot };
+}
+
+function logVsObjectCandidate(candidate, log = (message) => console.log(message)) {
+  log("[vs-object] candidate");
+  log(`path=${candidate.path ?? ""}`);
+  log(`gameid=${candidate.gameid ?? ""}`);
+  log(`userid=${candidate.userid ?? ""}`);
+  log(`board_width=${candidate.boardWidth ?? 0}`);
+  log(`board_height=${candidate.boardHeight ?? 0}`);
+  log(`occupied_cells=${candidate.occupiedCells ?? 0}`);
+  log(`current=${candidate.current ? String(candidate.current).toUpperCase() : "null"}`);
+  log(`hold=${candidate.hold ? String(candidate.hold).toUpperCase() : "null"}`);
+  log(
+    `queue_first5=${Array.isArray(candidate.queue) ? candidate.queue.slice(0, 5).map((piece) => String(piece).toUpperCase()).join(",") : ""}`
+  );
+  log(`active=${candidate.active ?? false}`);
+}
+
 export async function readTetrioState(cdp, options) {
   const read = async () => {
     const raw = await safeRuntimeEvaluate(cdp, {
@@ -994,6 +1201,482 @@ function getCurrentAndNext(seed, pieceIndex, nextCount = DEFAULT_NEXT_COUNT) {
     current: queue[pieceIndex] ?? null,
     queue: queue.slice(pieceIndex + 1, pieceIndex + 1 + nextCount)
   };
+}
+
+export function vsObjectStateExpression(identity) {
+  const requestJson = JSON.stringify({
+    roundId: String(identity?.roundId ?? ""),
+    gameid: identity?.gameid ?? identity?.localGameId ?? "",
+    userid: identity?.userid ?? identity?.localUserId ?? "",
+    username: identity?.username ?? identity?.localUsername ?? ""
+  });
+
+  return `(() => {
+    const request = ${requestJson};
+    const MAX_DEPTH = 8;
+    const MAX_VISITED = 5000;
+    const MAX_CHILDREN = 120;
+    const pieceNames = ["i", "o", "t", "s", "z", "j", "l"];
+    const safeScalar = (value) => {
+      if (value === null || value === undefined) return null;
+      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        const text = String(value).trim();
+        return text.length > 0 ? text : null;
+      }
+      return null;
+    };
+    const normalizedIdentity = {
+      roundId: safeScalar(request.roundId) ?? "",
+      gameid: safeScalar(request.gameid),
+      userid: safeScalar(request.userid),
+      username: safeScalar(request.username)
+    };
+    const lower = (value) => safeScalar(value)?.toLowerCase() ?? null;
+    const isObjectLike = (value) =>
+      (typeof value === "object" && value !== null) || typeof value === "function";
+    const isDomLike = (value) =>
+      !!value &&
+      typeof value === "object" &&
+      (typeof value.nodeType === "number" || typeof value.ownerDocument === "object");
+    const isTypedArray = (value) =>
+      typeof ArrayBuffer !== "undefined" &&
+      typeof ArrayBuffer.isView === "function" &&
+      ArrayBuffer.isView(value);
+    const isSkippable = (value) =>
+      !isObjectLike(value) ||
+      isDomLike(value) ||
+      isTypedArray(value) ||
+      value instanceof Date ||
+      value instanceof RegExp ||
+      value === window ||
+      (typeof document !== "undefined" && value === document);
+    const descriptorEntries = (value) => {
+      try {
+        return Object.entries(Object.getOwnPropertyDescriptors(value));
+      } catch {
+        return [];
+      }
+    };
+    const ownValueEntries = (value, pathLabel, limit = MAX_CHILDREN) => {
+      if (!isObjectLike(value)) return [];
+      if (Array.isArray(value)) {
+        const entries = [];
+        for (let index = 0; index < Math.min(value.length, limit); index++) {
+          entries.push({
+            key: String(index),
+            value: value[index],
+            path: \`\${pathLabel}[\${index}]\`
+          });
+        }
+        return entries;
+      }
+      if (value instanceof Map) {
+        const entries = [];
+        let index = 0;
+        for (const [key, child] of value.entries()) {
+          entries.push({
+            key: String(key),
+            value: child,
+            path: \`\${pathLabel}[map:\${index}]\`
+          });
+          index += 1;
+          if (index >= limit) break;
+        }
+        return entries;
+      }
+      if (value instanceof Set) {
+        const entries = [];
+        let index = 0;
+        for (const child of value.values()) {
+          entries.push({
+            key: String(index),
+            value: child,
+            path: \`\${pathLabel}[set:\${index}]\`
+          });
+          index += 1;
+          if (index >= limit) break;
+        }
+        return entries;
+      }
+      const entries = [];
+      for (const [key, descriptor] of descriptorEntries(value)) {
+        if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+          continue;
+        }
+        if (key === "length") {
+          continue;
+        }
+        const child = descriptor.value;
+        const keyLabel =
+          /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key)
+            ? \`.\${key}\`
+            : \`[\${JSON.stringify(key)}]\`;
+        entries.push({
+          key,
+          value: child,
+          path: \`\${pathLabel}\${keyLabel}\`
+        });
+        if (entries.length >= limit) {
+          break;
+        }
+      }
+      return entries;
+    };
+    const ownValue = (value, keys) => {
+      for (const key of keys) {
+        try {
+          const descriptor = Object.getOwnPropertyDescriptor(value, key);
+          if (descriptor && Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+            return descriptor.value;
+          }
+        } catch {}
+      }
+      return undefined;
+    };
+    const rowCells = (row) => {
+      if (Array.isArray(row)) return row;
+      if (!row || typeof row !== "object") return null;
+      const direct = ownValue(row, ["cells", "row", "data", "cols", "entries"]);
+      return Array.isArray(direct) ? direct : null;
+    };
+    const filled = (cell) => {
+      if (cell === null || cell === undefined || cell === false || cell === 0 || cell === "") {
+        return false;
+      }
+      if (typeof cell === "string") {
+        const text = cell.trim().toLowerCase();
+        return text !== "" && text !== "." && text !== "0" && text !== "empty";
+      }
+      if (typeof cell === "object") {
+        const empty = ownValue(cell, ["empty"]);
+        if (typeof empty === "boolean") return !empty;
+        const type = ownValue(cell, ["type", "mino", "value", "id", "cell"]);
+        if (type !== undefined) return filled(type);
+      }
+      return true;
+    };
+    const boardFromMatrix = (value) => {
+      if (Array.isArray(value)) {
+        if ((value.length === 20 || value.length === 40) && value.every((row) => {
+          const cells = rowCells(row);
+          return Array.isArray(cells) && cells.length === 10;
+        })) {
+          return value.map((row) => rowCells(row).slice(0, 10).map(filled));
+        }
+        if (
+          value.length === 10 &&
+          value.every((column) => {
+            const cells = rowCells(column);
+            return Array.isArray(cells) && (cells.length === 20 || cells.length === 40);
+          })
+        ) {
+          const height = rowCells(value[0]).length;
+          return Array.from({ length: height }, (_, y) =>
+            Array.from({ length: 10 }, (_, x) => filled(rowCells(value[x])[y]))
+          );
+        }
+      }
+      if (value && typeof value === "object") {
+        for (const key of ["board", "field", "rows", "grid", "matrix", "cells", "entries", "b"]) {
+          const nested = ownValue(value, [key]);
+          if (nested !== undefined) {
+            const board = boardFromMatrix(nested);
+            if (board) return board;
+          }
+        }
+      }
+      return null;
+    };
+    const normalizePiece = (value) => {
+      if (value === null || value === undefined || value === false) return null;
+      if (typeof value === "number" && Number.isFinite(value)) {
+        return pieceNames[Math.floor(value)] ?? null;
+      }
+      if (typeof value === "string") {
+        const text = value.trim().toLowerCase();
+        if (!text) return null;
+        if (pieceNames.includes(text)) return text;
+        for (const token of text.split(/[^a-z0-9]+/)) {
+          if (pieceNames.includes(token)) return token;
+        }
+        return null;
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          const piece = normalizePiece(item);
+          if (piece) return piece;
+        }
+        return null;
+      }
+      if (typeof value === "object") {
+        for (const key of ["type", "symbol", "piece", "name", "mino", "id", "value", "kind"]) {
+          const piece = normalizePiece(ownValue(value, [key]));
+          if (piece) return piece;
+        }
+      }
+      return null;
+    };
+    const queueFrom = (value) => {
+      if (!Array.isArray(value)) return [];
+      return value.map((item) => normalizePiece(item)).filter(Boolean).slice(0, 12);
+    };
+    const collectIdentity = (source, target) => {
+      if (!source || !isObjectLike(source)) return target;
+      const assign = (key, value) => {
+        const scalar = safeScalar(value);
+        if (scalar !== null && target[key] === null) {
+          target[key] = scalar;
+        }
+      };
+      assign("gameid", ownValue(source, ["gameid", "game_id"]));
+      assign("userid", ownValue(source, ["userid", "user_id", "_id"]));
+      assign("username", ownValue(source, ["username", "name"]));
+      for (const key of ["local", "self", "player", "user", "owner", "profile", "meta"]) {
+        const nested = ownValue(source, [key]);
+        if (!nested || !isObjectLike(nested)) continue;
+        assign("gameid", ownValue(nested, ["gameid", "game_id"]));
+        assign("userid", ownValue(nested, ["userid", "user_id", "_id"]));
+        assign("username", ownValue(nested, ["username", "name"]));
+      }
+      return target;
+    };
+    const extractShape = (source) => {
+      const board = boardFromMatrix(source);
+      if (!board) return null;
+      const current = normalizePiece(
+        ownValue(source, ["current", "active", "falling", "piece", "tetromino"])
+      );
+      if (!current) return null;
+      const hold = normalizePiece(ownValue(source, ["hold", "held", "reserve"]));
+      const queue = queueFrom(
+        ownValue(source, ["queue", "next", "preview", "previews", "pieces", "bag", "nextQueue"])
+      );
+      let active = ownValue(source, ["active", "alive", "playing"]);
+      if (typeof active !== "boolean") {
+        const dead = ownValue(source, ["dead", "destroyed", "gameover", "gameOver"]);
+        if (typeof dead === "boolean") {
+          active = !dead;
+        }
+      }
+      if (typeof active !== "boolean") {
+        const status = ownValue(source, ["state", "status", "phase"]);
+        if (typeof status === "string") {
+          const text = status.trim().toLowerCase();
+          if (["active", "alive", "playing", "running", "go"].includes(text)) {
+            active = true;
+          } else if (["dead", "destroyed", "ended", "gameover", "finished", "over"].includes(text)) {
+            active = false;
+          }
+        }
+      }
+      if (typeof active !== "boolean") {
+        active = true;
+      }
+      const occupiedCells = board.reduce(
+        (sum, row) => sum + row.filter(Boolean).length,
+        0
+      );
+      return {
+        board,
+        boardWidth: board[0]?.length ?? 0,
+        boardHeight: board.length,
+        occupiedCells,
+        current,
+        hold,
+        queue,
+        active
+      };
+    };
+    const matchIdentity = (candidateIdentity) => {
+      let score = 0;
+      let matched = false;
+      if (normalizedIdentity.gameid) {
+        if (candidateIdentity.gameid) {
+          if (candidateIdentity.gameid !== normalizedIdentity.gameid) return null;
+          score += 100;
+          matched = true;
+        }
+      }
+      if (normalizedIdentity.userid) {
+        if (candidateIdentity.userid) {
+          if (candidateIdentity.userid !== normalizedIdentity.userid) return null;
+          score += 40;
+          matched = true;
+        }
+      }
+      if (normalizedIdentity.username) {
+        if (candidateIdentity.username) {
+          if (lower(candidateIdentity.username) !== lower(normalizedIdentity.username)) {
+            return null;
+          }
+          score += 10;
+          matched = true;
+        }
+      }
+      return matched ? score : null;
+    };
+    const candidateFromShape = (shapeEntry, contextRefs) => {
+      const shape = extractShape(shapeEntry.value);
+      if (!shape) return null;
+      if (shape.boardWidth !== 10 || (shape.boardHeight !== 20 && shape.boardHeight !== 40)) {
+        return null;
+      }
+      const identityValues = { gameid: null, userid: null, username: null };
+      for (const ref of contextRefs) {
+        collectIdentity(ref, identityValues);
+      }
+      const score = matchIdentity(identityValues);
+      if (score === null) return null;
+      return {
+        ok: true,
+        path: shapeEntry.path,
+        gameid: identityValues.gameid,
+        userid: identityValues.userid,
+        username: identityValues.username,
+        board: shape.board,
+        boardWidth: shape.boardWidth,
+        boardHeight: shape.boardHeight,
+        occupiedCells: shape.occupiedCells,
+        current: shape.current,
+        hold: shape.hold,
+        queue: shape.queue,
+        active: shape.active,
+        score,
+        shapeRef: shapeEntry.value,
+        contextRefs
+      };
+    };
+    const inspectNode = (value, pathLabel, lineage) => {
+      const contextRefs = [...lineage, value].filter(isObjectLike).slice(-6);
+      const direct = candidateFromShape({ value, path: pathLabel }, contextRefs);
+      if (direct) return direct;
+      for (const child of ownValueEntries(value, pathLabel, 24)) {
+        if (!isObjectLike(child.value)) continue;
+        const nested = candidateFromShape(child, contextRefs);
+        if (nested) return nested;
+      }
+      return null;
+    };
+    const ensureCache = () => {
+      if (!window.__fusionVsObjectCache || typeof window.__fusionVsObjectCache !== "object") {
+        window.__fusionVsObjectCache = {
+          roundId: "",
+          winnerPath: "",
+          winnerShapeRef: null,
+          winnerContextRefs: [],
+          objectMeta: new WeakMap(),
+          nextObjectId: 1
+        };
+      }
+      const cache = window.__fusionVsObjectCache;
+      if (!(cache.objectMeta instanceof WeakMap)) {
+        cache.objectMeta = new WeakMap();
+      }
+      return cache;
+    };
+    const cache = ensureCache();
+    if (cache.roundId !== normalizedIdentity.roundId) {
+      cache.roundId = normalizedIdentity.roundId;
+      cache.winnerPath = "";
+      cache.winnerShapeRef = null;
+      cache.winnerContextRefs = [];
+    }
+    const serializeCandidate = (candidate) => {
+      if (!candidate) {
+        return {
+          ok: false,
+          reason: "TETR.IO VS local game object not found"
+        };
+      }
+      return {
+        ok: true,
+        path: candidate.path,
+        gameid: candidate.gameid,
+        userid: candidate.userid,
+        username: candidate.username,
+        board: candidate.board,
+        boardWidth: candidate.boardWidth,
+        boardHeight: candidate.boardHeight,
+        occupiedCells: candidate.occupiedCells,
+        current: candidate.current,
+        hold: candidate.hold,
+        queue: candidate.queue,
+        active: candidate.active,
+        capturedAt: Date.now()
+      };
+    };
+    const touchMeta = (value) => {
+      if (!isObjectLike(value)) return;
+      const current = cache.objectMeta.get(value);
+      if (current) return current;
+      const meta = { id: cache.nextObjectId++ };
+      cache.objectMeta.set(value, meta);
+      return meta;
+    };
+    if (cache.winnerShapeRef && Array.isArray(cache.winnerContextRefs)) {
+      const cached = candidateFromShape(
+        { value: cache.winnerShapeRef, path: cache.winnerPath || "window.__fusionVsObjectCache.winner" },
+        cache.winnerContextRefs.filter(isObjectLike)
+      );
+      if (cached) {
+        touchMeta(cache.winnerShapeRef);
+        return serializeCandidate(cached);
+      }
+    }
+    const queue = [];
+    const pushRoot = (value, pathLabel) => {
+      if (!isObjectLike(value) || isSkippable(value)) return;
+      queue.push({ value, path: pathLabel, lineage: [] });
+    };
+    pushRoot(window.__fusionTetrioGame, "window.__fusionTetrioGame");
+    pushRoot(window.tetrioGame, "window.tetrioGame");
+    pushRoot(window.TETRIO_GAME, "window.TETRIO_GAME");
+    pushRoot(window.game, "window.game");
+    pushRoot(window.app, "window.app");
+    pushRoot(window.tetrio, "window.tetrio");
+    for (const entry of ownValueEntries(window, "window", 1500)) {
+      if (!isObjectLike(entry.value) || isSkippable(entry.value)) continue;
+      queue.push({ value: entry.value, path: entry.path, lineage: [] });
+    }
+    const visited = new WeakSet();
+    let visitedCount = 0;
+    let best = null;
+    while (queue.length > 0 && visitedCount < MAX_VISITED) {
+      const current = queue.shift();
+      if (!current || !isObjectLike(current.value) || isSkippable(current.value)) continue;
+      if (visited.has(current.value)) continue;
+      visited.add(current.value);
+      visitedCount += 1;
+      touchMeta(current.value);
+      const candidate = inspectNode(current.value, current.path, current.lineage);
+      if (
+        candidate &&
+        (!best ||
+          candidate.score > best.score ||
+          (candidate.score === best.score && candidate.path.length < best.path.length))
+      ) {
+        best = candidate;
+      }
+      if (current.lineage.length >= MAX_DEPTH) {
+        continue;
+      }
+      const nextLineage = [...current.lineage, current.value].slice(-6);
+      for (const child of ownValueEntries(current.value, current.path)) {
+        if (!isObjectLike(child.value) || isSkippable(child.value)) continue;
+        queue.push({
+          value: child.value,
+          path: child.path,
+          lineage: nextLineage
+        });
+      }
+    }
+    if (best) {
+      cache.winnerPath = best.path;
+      cache.winnerShapeRef = best.shapeRef;
+      cache.winnerContextRefs = best.contextRefs.filter(isObjectLike);
+    }
+    return serializeCandidate(best);
+  })()`;
 }
 
 export function tetrioStateExpression() {

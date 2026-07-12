@@ -8,21 +8,26 @@ import vm from "node:vm";
 import {
   buildSnapshotSignature,
   buildSnapshotToken,
+  buildVsObjectSnapshotSignature,
   clearSnapshotFile,
   createSnapshotTracking,
+  createVsObjectTracking,
   determineChromiumOwnership,
   isVsWsSimEnvEnabled,
   isTetrioGameEndedState,
   pausedFrameExposureExpression,
+  processVsObjectDiagnostics,
   readTetrioState,
   resolvePollMs,
   resolveUseSeedSimulationFallback,
   resetSnapshotTracking,
+  resetVsObjectTracking,
   shouldAttemptClosureCapture,
   shouldLogStateReason,
   shouldAdvanceGameEpoch,
   shouldHandleEndedGame,
-  tetrioStateExpression
+  tetrioStateExpression,
+  vsObjectStateExpression
 } from "./tetrio-cdp-source.mjs";
 
 test("connect-only snapshot helper never claims Chromium ownership", () => {
@@ -49,6 +54,10 @@ test("snapshot helper owns Chromium only when it launched the browser", () => {
 
 function createBoard() {
   return Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => 0));
+}
+
+function createVsBoard(height = 20) {
+  return Array.from({ length: height }, () => Array.from({ length: 10 }, () => 0));
 }
 
 function createGame({
@@ -344,6 +353,243 @@ test("tetrioStateExpression extracts optional lines cleared stats", () => {
 
   assert.equal(result.ok, true);
   assert.equal(result.linesCleared, 24);
+});
+
+test("resetVsObjectTracking clears VS diagnostic state", () => {
+  const tracking = createVsObjectTracking();
+  tracking.roundId = "round-1";
+  tracking.lastSnapshotSignature = "sig";
+  tracking.lastCandidateLogSignature = "log";
+  tracking.lastNotFoundRoundId = "round-1";
+  tracking.lastActiveRoundId = "round-1";
+
+  resetVsObjectTracking(tracking);
+
+  assert.deepEqual(tracking, {
+    roundId: "",
+    lastSnapshotSignature: "",
+    lastCandidateLogSignature: "",
+    lastNotFoundRoundId: "",
+    lastActiveRoundId: ""
+  });
+});
+
+test("VS object snapshot signature changes when board state changes", () => {
+  const emptyBoard = createVsBoard(20);
+  const filledBoard = createVsBoard(20);
+  filledBoard[19][0] = true;
+
+  assert.notEqual(
+    buildVsObjectSnapshotSignature({
+      roundId: "round-1",
+      gameid: "g-1",
+      board: emptyBoard,
+      current: "T",
+      hold: "I",
+      queue: ["O"],
+      active: true
+    }),
+    buildVsObjectSnapshotSignature({
+      roundId: "round-1",
+      gameid: "g-1",
+      board: filledBoard,
+      current: "T",
+      hold: "I",
+      queue: ["O"],
+      active: true
+    })
+  );
+});
+
+test("VS object probe selects the local player by gameid and reads board queue hold", () => {
+  const localBoard = createVsBoard(20);
+  localBoard[19][0] = 1;
+  localBoard[18][1] = 1;
+  const opponentBoard = createVsBoard(20);
+  opponentBoard[19][9] = 1;
+
+  const localPlayer = {
+    userid: "local-user",
+    username: "hebi_",
+    gameid: "5449",
+    game: {
+      board: localBoard,
+      current: { type: "t" },
+      hold: { type: "i" },
+      queue: [{ type: "o" }, { type: "s" }, { type: "z" }],
+      active: true
+    }
+  };
+  const opponentPlayer = {
+    userid: "guest-user",
+    username: "guest_",
+    gameid: "5450",
+    game: {
+      board: opponentBoard,
+      current: { type: "l" },
+      hold: { type: "j" },
+      queue: [{ type: "i" }, { type: "o" }],
+      active: true
+    }
+  };
+
+  const { result } = evaluateInWindow(vsObjectStateExpression({
+    roundId: "5449:1744077373",
+    gameid: "5449",
+    userid: "local-user",
+    username: "hebi_"
+  }), {
+    roomState: {
+      players: [opponentPlayer, localPlayer]
+    }
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.gameid, "5449");
+  assert.equal(result.userid, "local-user");
+  assert.equal(result.current, "t");
+  assert.equal(result.hold, "i");
+  assert.deepEqual(result.queue.slice(0, 3), ["o", "s", "z"]);
+  assert.equal(result.boardWidth, 10);
+  assert.equal(result.boardHeight, 20);
+  assert.equal(result.occupiedCells, 2);
+  assert.equal(result.active, true);
+});
+
+test("VS object probe revalidates cached candidates when the round changes", () => {
+  const oldBoard = createVsBoard(20);
+  oldBoard[19][0] = 1;
+  const newBoard = createVsBoard(20);
+  newBoard[19][4] = 1;
+  newBoard[18][4] = 1;
+  const oldLocal = {
+    userid: "local-user",
+    username: "hebi_",
+    gameid: "5449",
+    game: {
+      board: oldBoard,
+      current: { type: "t" },
+      hold: { type: "i" },
+      queue: [{ type: "o" }],
+      active: true
+    }
+  };
+  const newLocal = {
+    userid: "local-user",
+    username: "hebi_",
+    gameid: "6001",
+    game: {
+      board: newBoard,
+      current: { type: "s" },
+      hold: { type: "z" },
+      queue: [{ type: "l" }, { type: "j" }],
+      active: true
+    }
+  };
+  const window = {
+    matchState: {
+      players: [oldLocal]
+    }
+  };
+  window.window = window;
+  const context = {
+    window,
+    location: { href: "https://tetr.io/" },
+    Date,
+    Math,
+    Object,
+    Array,
+    Boolean,
+    Number,
+    String
+  };
+
+  const roundOne = vm.runInNewContext(
+    vsObjectStateExpression({
+      roundId: "5449:1744077373",
+      gameid: "5449",
+      userid: "local-user",
+      username: "hebi_"
+    }),
+    context
+  );
+  assert.equal(roundOne.ok, true);
+  assert.equal(roundOne.gameid, "5449");
+  assert.equal(roundOne.current, "t");
+
+  window.matchState.players = [oldLocal, newLocal];
+  const roundTwo = vm.runInNewContext(
+    vsObjectStateExpression({
+      roundId: "6001:1744077374",
+      gameid: "6001",
+      userid: "local-user",
+      username: "hebi_"
+    }),
+    context
+  );
+  assert.equal(roundTwo.ok, true);
+  assert.equal(roundTwo.gameid, "6001");
+  assert.equal(roundTwo.current, "s");
+  assert.equal(roundTwo.occupiedCells, 2);
+});
+
+test("VS object diagnostics keep live snapshot empty when no local object is found", async () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "vs-object-diagnostics-"));
+  const liveSnapshotPath = path.join(tempDir, "live-snapshot.json");
+  const vsObjectSnapshotPath = path.join(tempDir, "vs-object-snapshot.json");
+  const tracking = createVsObjectTracking();
+  const logs = [];
+  writeFileSync(liveSnapshotPath, "{\"ok\":true}");
+
+  const first = await processVsObjectDiagnostics(null, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "5449:1744077373",
+      localGameId: "5449",
+      localUserId: "local-user",
+      localUsername: "hebi_"
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    log: (line) => logs.push(line),
+    readVsObjectStateFn: async () => ({
+      ok: false,
+      reason: "TETR.IO VS local game object not found"
+    })
+  });
+
+  const second = await processVsObjectDiagnostics(null, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "5449:1744077373",
+      localGameId: "5449",
+      localUserId: "local-user",
+      localUsername: "hebi_"
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    log: (line) => logs.push(line),
+    readVsObjectStateFn: async () => ({
+      ok: false,
+      reason: "TETR.IO VS local game object not found"
+    })
+  });
+
+  assert.deepEqual(first, {
+    handled: true,
+    found: false,
+    candidate: null
+  });
+  assert.deepEqual(second, {
+    handled: true,
+    found: false,
+    candidate: null
+  });
+  assert.equal(existsSync(liveSnapshotPath), false);
+  assert.equal(existsSync(vsObjectSnapshotPath), false);
+  assert.deepEqual(logs, ["[vs-object] local game object not found"]);
 });
 
 test("VS sim OFF reads state then probes once after cooldown", async () => {

@@ -21,7 +21,7 @@
   "play_style": "normal",
   "poll_interval_ms": 4,
   "pps_unlimited": true,
-  "target_pps": 3.0,
+  "target_pps": 4.5,
   "tap_duration_ms": 60,
   "movement_tap_duration_ms": 16,
   "rotate_tap_duration_ms": 18,

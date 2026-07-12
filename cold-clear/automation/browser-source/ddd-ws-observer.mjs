@@ -180,8 +180,11 @@ export async function installDddWsObserver(
     return () => {};
   }
 
+  const vsBridgeEnabled =
+    vsSimEnabled || typeof onVsRoundStatus === "function";
+
   let vsBridge = null;
-  if (vsSimEnabled) {
+  if (vsBridgeEnabled) {
     try {
       vsBridge = createVsBridgeState(vsBridgePath, logger);
     } catch (error) {
@@ -352,8 +355,10 @@ function emitVsRoundStatusIfChanged(observerState, onVsRoundStatus) {
   const active = Boolean(current?.active);
   const roundId = active ? String(current?.roundId ?? "") : "";
   const localGameId = active ? String(current?.local?.gameid ?? "") : "";
+  const localUserId = active ? String(current?.local?.userid ?? "") : "";
+  const localUsername = active ? String(current?.local?.username ?? "") : "";
   const seed = active ? String(current?.options?.seed ?? "") : "";
-  const nextKey = `${active ? 1 : 0}|${roundId}|${localGameId}|${seed}`;
+  const nextKey = `${active ? 1 : 0}|${roundId}|${localGameId}|${localUserId}|${localUsername}|${seed}`;
   if (nextKey === observerState.lastVsRoundStatusKey) {
     return;
   }
@@ -363,6 +368,8 @@ function emitVsRoundStatusIfChanged(observerState, onVsRoundStatus) {
       active,
       roundId,
       localGameId,
+      localUserId,
+      localUsername,
       seed
     });
   } catch {}
