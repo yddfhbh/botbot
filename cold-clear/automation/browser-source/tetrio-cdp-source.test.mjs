@@ -9,20 +9,26 @@ import {
   buildSnapshotSignature,
   buildSnapshotToken,
   clearSnapshotFile,
+  createBootstrapState,
   createSnapshotTracking,
   determineChromiumOwnership,
+  isBootstrapReadyForClosureCapture,
+  isTransientRuntimeError,
   isVsWsSimEnvEnabled,
   isTetrioGameEndedState,
   pausedFrameExposureExpression,
   readTetrioState,
+  resetBootstrapState,
   resolvePollMs,
   resolveUseSeedSimulationFallback,
   resetSnapshotTracking,
+  safeRuntimeEvaluate,
   shouldAttemptClosureCapture,
   shouldLogStateReason,
   shouldAdvanceGameEpoch,
   shouldHandleEndedGame,
-  tetrioStateExpression
+  tetrioStateExpression,
+  updateBootstrapDocumentState
 } from "./tetrio-cdp-source.mjs";
 
 test("connect-only snapshot helper never claims Chromium ownership", () => {
@@ -122,9 +128,21 @@ function evaluateInWindow(expression, windowOverrides = {}, extraContext = {}) {
 function createReadStateCdp(values) {
   const queue = [...values];
   return {
-    async send(method) {
+    runtimeCalls: [],
+    async send(method, params = {}) {
       if (method !== "Runtime.evaluate") {
         throw new Error(`Unhandled method ${method}`);
+      }
+      this.runtimeCalls.push(params);
+      if (String(params.expression).includes("document.readyState")) {
+        return {
+          result: {
+            value: {
+              readyState: "complete",
+              href: "https://tetr.io/"
+            }
+          }
+        };
       }
       return {
         result: {
@@ -137,6 +155,19 @@ function createReadStateCdp(values) {
       };
     }
   };
+}
+
+function readyBootstrapState(now = 20_000, { transportReadyAt = 18_500 } = {}) {
+  const bootstrapState = createBootstrapState(0);
+  updateBootstrapDocumentState(
+    bootstrapState,
+    { readyState: "complete", href: "https://tetr.io/" },
+    1
+  );
+  bootstrapState.transportReadyAt = transportReadyAt;
+  bootstrapState.readyLogged = false;
+  bootstrapState.waitingLogged = false;
+  return bootstrapState;
 }
 
 test("game ended handling is triggered only once per ended session", () => {
@@ -346,6 +377,125 @@ test("tetrioStateExpression extracts optional lines cleared stats", () => {
   assert.equal(result.linesCleared, 24);
 });
 
+test("tetrioStateExpression Runtime.evaluate does not use awaitPromise", async () => {
+  const cdp = createReadStateCdp([
+    {
+      ok: true,
+      ready: true,
+      playing: true,
+      countdown: false,
+      pieceCounter: 0,
+      current: "t",
+      hold: null,
+      queue: ["i", "o"]
+    }
+  ]);
+
+  await readTetrioState(cdp, {
+    probePageState: false,
+    suppressClosureCapture: false,
+    useSeedSimulationFallback: false,
+    network: { lastPageProbeAt: 0, seed: null },
+    probeState: { lastCaptureAt: 0 },
+    bootstrapState: readyBootstrapState()
+  });
+
+  const tetrioEval = cdp.runtimeCalls.find((call) =>
+    String(call.expression).includes("const pieceNames")
+  );
+  assert.ok(tetrioEval);
+  assert.equal(Object.hasOwn(tetrioEval, "awaitPromise"), false);
+});
+
+test("safeRuntimeEvaluate returns fallback when Promise was collected", async () => {
+  const fallback = { result: { value: { ok: false, ready: false } } };
+  const cdp = {
+    async send() {
+      throw new Error("Promise was collected");
+    }
+  };
+
+  const result = await safeRuntimeEvaluate(
+    cdp,
+    { expression: "42", returnByValue: true },
+    fallback
+  );
+
+  assert.equal(result, fallback);
+});
+
+test("Promise was collected is classified as a transient runtime error", () => {
+  assert.equal(isTransientRuntimeError(new Error("Promise was collected")), true);
+});
+
+test("Promise was collected once does not prevent the next poll from recovering", async () => {
+  let stateReads = 0;
+  const cdp = {
+    async send(method, params = {}) {
+      assert.equal(method, "Runtime.evaluate");
+      if (String(params.expression).includes("document.readyState")) {
+        return {
+          result: {
+            value: {
+              readyState: "complete",
+              href: "https://tetr.io/"
+            }
+          }
+        };
+      }
+      stateReads += 1;
+      if (stateReads === 1) {
+        throw new Error("Promise was collected");
+      }
+      return {
+        result: {
+          value: {
+            ok: true,
+            ready: true,
+            playing: true,
+            countdown: false,
+            pieceCounter: 0,
+            current: "t",
+            hold: null,
+            queue: ["i", "o"]
+          }
+        }
+      };
+    }
+  };
+  const transientState = { lastRuntimeError: "" };
+  const logs = [];
+
+  const first = await readTetrioState(cdp, {
+    probePageState: false,
+    suppressClosureCapture: false,
+    useSeedSimulationFallback: false,
+    network: { lastPageProbeAt: 0, seed: null },
+    probeState: { lastCaptureAt: 0 },
+    bootstrapState: readyBootstrapState(),
+    transientState,
+    log: (line) => logs.push(line)
+  });
+  const second = await readTetrioState(cdp, {
+    probePageState: false,
+    suppressClosureCapture: false,
+    useSeedSimulationFallback: false,
+    network: { lastPageProbeAt: 0, seed: null },
+    probeState: { lastCaptureAt: 0 },
+    bootstrapState: readyBootstrapState(),
+    transientState,
+    log: (line) => logs.push(line)
+  });
+
+  assert.equal(first.ok, false);
+  assert.equal(second.ok, true);
+  assert.ok(
+    logs.some((line) =>
+      line.includes("[browser] transient Runtime.evaluate failure: Promise was collected; retrying")
+    )
+  );
+});
+
 test("VS sim OFF reads state then probes once after cooldown", async () => {
   const cdp = createReadStateCdp([
     { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" },
@@ -367,12 +517,18 @@ test("VS sim OFF reads state then probes once after cooldown", async () => {
     suppressClosureCapture: false,
     network: { lastPageProbeAt: 0 },
     probeState: { lastCaptureAt: 0 },
+    bootstrapState: readyBootstrapState(),
+    now: 20_000,
     captureGameFn: async () => {
       captureCalls += 1;
       return { ok: true, source: "closure:Ai" };
     }
   });
 
+  assert.equal(
+    isBootstrapReadyForClosureCapture(readyBootstrapState(20_000), 20_000),
+    true
+  );
   assert.equal(captureCalls, 1);
   assert.equal(state.ok, true);
 });
@@ -398,12 +554,18 @@ test("VS sim ON but round inactive still probes after cooldown", async () => {
     suppressClosureCapture: false,
     network: { lastPageProbeAt: 0 },
     probeState: { lastCaptureAt: 0 },
+    bootstrapState: readyBootstrapState(),
+    now: 20_000,
     captureGameFn: async () => {
       captureCalls += 1;
       return { ok: true, source: "closure:Ai" };
     }
   });
 
+  assert.equal(
+    isBootstrapReadyForClosureCapture(readyBootstrapState(20_000), 20_000),
+    true
+  );
   assert.equal(captureCalls, 1);
   assert.equal(state.ok, true);
 });
@@ -420,6 +582,8 @@ test("VS sim ON with active round suppresses closure capture for ten seconds", a
     suppressedReason: "VS WebSocket simulation owns live state",
     network: { lastPageProbeAt: 0 },
     probeState: { lastCaptureAt: 0 },
+    bootstrapState: readyBootstrapState(),
+    now: 20_000,
     captureGameFn: async () => {
       captureCalls += 1;
       return { ok: true, source: "closure:Ai" };
@@ -454,12 +618,195 @@ test("suppression keeps cheap state reads active", async () => {
     suppressedReason: "VS WebSocket simulation owns live state",
     network: { lastPageProbeAt: 0 },
     probeState: { lastCaptureAt: 0 },
+    bootstrapState: readyBootstrapState(),
+    now: 20_000,
     captureGameFn: async () => {
       throw new Error("should not capture");
     }
   });
 
-  assert.equal(reads, 1);
+  assert.equal(reads, 2);
+});
+
+test("document.readyState=loading keeps closure capture disabled", async () => {
+  let captureCalls = 0;
+  const cdp = {
+    async send(method, params = {}) {
+      assert.equal(method, "Runtime.evaluate");
+      if (String(params.expression).includes("document.readyState")) {
+        return {
+          result: {
+            value: {
+              readyState: "loading",
+              href: "https://tetr.io/"
+            }
+          }
+        };
+      }
+      return {
+        result: {
+          value: {
+            ok: false,
+            ready: false,
+            reason: "TETR.IO game instance not captured yet"
+          }
+        }
+      };
+    }
+  };
+
+  await readTetrioState(cdp, {
+    probePageState: true,
+    suppressClosureCapture: false,
+    useSeedSimulationFallback: false,
+    network: { lastPageProbeAt: 0, seed: null },
+    probeState: { lastCaptureAt: 0 },
+    bootstrapState: createBootstrapState(0),
+    now: 1_000,
+    captureGameFn: async () => {
+      captureCalls += 1;
+      return { ok: true, source: "closure:Ai" };
+    }
+  });
+
+  assert.equal(captureCalls, 0);
+});
+
+test("document complete before websocket keeps closure capture disabled", async () => {
+  let captureCalls = 0;
+  const bootstrapState = createBootstrapState(0);
+  updateBootstrapDocumentState(
+    bootstrapState,
+    { readyState: "complete", href: "https://tetr.io/" },
+    100
+  );
+  const cdp = createReadStateCdp([
+    { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" }
+  ]);
+
+  await readTetrioState(cdp, {
+    probePageState: true,
+    suppressClosureCapture: false,
+    useSeedSimulationFallback: false,
+    network: { lastPageProbeAt: 0, seed: null },
+    probeState: { lastCaptureAt: 0 },
+    bootstrapState,
+    now: 1_000,
+    captureGameFn: async () => {
+      captureCalls += 1;
+      return { ok: true, source: "closure:Ai" };
+    }
+  });
+
+  assert.equal(captureCalls, 0);
+});
+
+test("websocket bootstrap waits until 1499ms before enabling capture", async () => {
+  let captureCalls = 0;
+  const cdp = createReadStateCdp([
+    { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" }
+  ]);
+
+  await readTetrioState(cdp, {
+    probePageState: true,
+    suppressClosureCapture: false,
+    useSeedSimulationFallback: false,
+    network: { lastPageProbeAt: 0, seed: null },
+    probeState: { lastCaptureAt: 0 },
+    bootstrapState: readyBootstrapState(19_999, { transportReadyAt: 18_501 }),
+    now: 19_999,
+    captureGameFn: async () => {
+      captureCalls += 1;
+      return { ok: true, source: "closure:Ai" };
+    }
+  });
+
+  assert.equal(
+    isBootstrapReadyForClosureCapture(
+      readyBootstrapState(19_999, { transportReadyAt: 18_501 }),
+      19_999
+    ),
+    false
+  );
+  assert.equal(captureCalls, 0);
+});
+
+test("websocket bootstrap enables capture after 1500ms", async () => {
+  let captureCalls = 0;
+  const cdp = createReadStateCdp([
+    { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" },
+    {
+      ok: true,
+      ready: true,
+      playing: true,
+      countdown: false,
+      pieceCounter: 0,
+      current: "t",
+      hold: null,
+      queue: ["i", "o"]
+    }
+  ]);
+
+  await readTetrioState(cdp, {
+    probePageState: true,
+    suppressClosureCapture: false,
+    useSeedSimulationFallback: false,
+    network: { lastPageProbeAt: 0, seed: null },
+    probeState: { lastCaptureAt: 0 },
+    bootstrapState: readyBootstrapState(20_000, { transportReadyAt: 18_500 }),
+    now: 20_000,
+    captureGameFn: async () => {
+      captureCalls += 1;
+      return { ok: true, source: "closure:Ai" };
+    }
+  });
+
+  assert.equal(captureCalls, 1);
+});
+
+test("bootstrap falls back to connectedAt after 15 seconds without websocket", async () => {
+  let captureCalls = 0;
+  const bootstrapState = createBootstrapState(0);
+  updateBootstrapDocumentState(
+    bootstrapState,
+    { readyState: "complete", href: "https://tetr.io/" },
+    100
+  );
+  const cdp = createReadStateCdp([
+    { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" },
+    {
+      ok: true,
+      ready: true,
+      playing: true,
+      countdown: false,
+      pieceCounter: 0,
+      current: "t",
+      hold: null,
+      queue: ["i", "o"]
+    }
+  ]);
+
+  await readTetrioState(cdp, {
+    probePageState: true,
+    suppressClosureCapture: false,
+    useSeedSimulationFallback: false,
+    network: { lastPageProbeAt: 0, seed: null },
+    probeState: { lastCaptureAt: 0 },
+    bootstrapState,
+    now: 15_000,
+    captureGameFn: async () => {
+      captureCalls += 1;
+      return { ok: true, source: "closure:Ai" };
+    }
+  });
+
+  assert.equal(captureCalls, 1);
+});
+
+test("navigation resets bootstrap gating before capture can run again", async () => {
+  const bootstrapState = readyBootstrapState();
+  resetBootstrapState(bootstrapState, { resetConnectedAt: true, now: 30_000 });
+  assert.equal(isBootstrapReadyForClosureCapture(bootstrapState, 31_000), false);
 });
 
 test("ended cached game is not selected again when a fresh game is available", () => {
@@ -547,4 +894,15 @@ test("closure exposure allows a reused object once it is no longer ended", () =>
   assert.equal(result.source, "closure:Ai");
   assert.equal(window.__fusionTetrioGame, reusedGame);
   assert.equal(Object.hasOwn(window, "__fusionEndedTetrioGame"), false);
+});
+
+test("captureTetrioGame source still keeps raf and setTimeout breakpoints", () => {
+  const source = readFileSync(
+    new URL("./tetrio-cdp-source.mjs", import.meta.url),
+    "utf8"
+  );
+  assert.match(
+    source,
+    /for \(const expression of \["window\.requestAnimationFrame", "window\.setTimeout"\]\)/
+  );
 });

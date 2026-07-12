@@ -16,6 +16,8 @@ const DEFAULT_STATUS_MS = 2500;
 const DEFAULT_CAPTURE_COOLDOWN_MS = 2000;
 const DEFAULT_SUPPRESSED_REASON = "VS WebSocket simulation owns live state";
 const PERF_LOG_INTERVAL_MS = 2000;
+const DEFAULT_BOOTSTRAP_TRANSPORT_SETTLE_MS = 1500;
+const DEFAULT_BOOTSTRAP_FALLBACK_MS = 15000;
 
 export function determineChromiumOwnership({ connectOnly, alreadyOpen }) {
   return !connectOnly && !alreadyOpen;
@@ -71,6 +73,7 @@ export function isVsWsSimEnvEnabled(env = process.env) {
 export function shouldAttemptClosureCapture({
   probePageState,
   suppressClosureCapture,
+  bootstrapReady = true,
   stateOk,
   lastCaptureAt = 0,
   lastPageProbeAt = 0,
@@ -80,10 +83,99 @@ export function shouldAttemptClosureCapture({
   return Boolean(
     probePageState &&
       !suppressClosureCapture &&
+      bootstrapReady &&
       !stateOk &&
       now - lastCaptureAt >= cooldownMs &&
       now - lastPageProbeAt >= cooldownMs
   );
+}
+
+export function createBootstrapState(now = Date.now()) {
+  return {
+    connectedAt: now,
+    documentCompleteAt: 0,
+    transportReadyAt: 0,
+    waitingLogged: false,
+    readyLogged: false
+  };
+}
+
+export function resetBootstrapState(
+  bootstrapState,
+  { resetConnectedAt = false, now = Date.now() } = {}
+) {
+  if (resetConnectedAt) {
+    bootstrapState.connectedAt = now;
+  }
+  bootstrapState.documentCompleteAt = 0;
+  bootstrapState.transportReadyAt = 0;
+  bootstrapState.waitingLogged = false;
+  bootstrapState.readyLogged = false;
+  return bootstrapState;
+}
+
+export function markBootstrapTransportReady(
+  bootstrapState,
+  now = Date.now()
+) {
+  if (!bootstrapState || bootstrapState.transportReadyAt > 0) {
+    return bootstrapState;
+  }
+  bootstrapState.transportReadyAt = now;
+  return bootstrapState;
+}
+
+export function updateBootstrapDocumentState(
+  bootstrapState,
+  pageState,
+  now = Date.now()
+) {
+  if (
+    bootstrapState &&
+    pageState?.readyState === "complete" &&
+    bootstrapState.documentCompleteAt === 0
+  ) {
+    bootstrapState.documentCompleteAt = now;
+  }
+  return bootstrapState;
+}
+
+export function isBootstrapReadyForClosureCapture(
+  bootstrapState,
+  now = Date.now(),
+  {
+    transportSettleMs = DEFAULT_BOOTSTRAP_TRANSPORT_SETTLE_MS,
+    fallbackMs = DEFAULT_BOOTSTRAP_FALLBACK_MS
+  } = {}
+) {
+  if (!bootstrapState?.documentCompleteAt) {
+    return false;
+  }
+  if (bootstrapState.transportReadyAt > 0) {
+    return now - bootstrapState.transportReadyAt >= transportSettleMs;
+  }
+  return now - bootstrapState.connectedAt >= fallbackMs;
+}
+
+export function isTransientRuntimeError(error) {
+  const message = String(error?.message ?? error ?? "").toLowerCase();
+  return (
+    message.includes("promise was collected") ||
+    message.includes("cannot find default execution context") ||
+    message.includes("execution context was destroyed") ||
+    message.includes("cannot find context with specified id") ||
+    message.includes("inspected target navigated or closed") ||
+    message.includes("no frame with given id")
+  );
+}
+
+function maybeLogTransientRuntimeError(error, transientState, log = console.log) {
+  const message = String(error?.message ?? error ?? "");
+  if (!transientState || transientState.lastRuntimeError === message) {
+    return;
+  }
+  transientState.lastRuntimeError = message;
+  log(`[browser] transient Runtime.evaluate failure: ${message}; retrying`);
 }
 
 export function shouldLogStateReason({
@@ -224,9 +316,22 @@ async function main() {
   }).catch(() => undefined);
 
   const network = createTetrioNetworkState();
+  const bootstrapState = createBootstrapState();
+  const transientState = { lastRuntimeError: "" };
   if (useRibbonWebsocket) {
-    await installRibbonMonitor(cdp, network, msgpack);
+    await installRibbonMonitor(cdp, network, msgpack, bootstrapState);
   }
+  cdp.on("Page.frameNavigated", (event) => {
+    if (event?.frame?.parentId) {
+      return;
+    }
+    resetBootstrapState(bootstrapState, { resetConnectedAt: true });
+    network.lastPageProbeAt = 0;
+  });
+  cdp.on("Runtime.executionContextsCleared", () => {
+    resetBootstrapState(bootstrapState);
+    network.lastPageProbeAt = 0;
+  });
 
   let gameEpoch = 1;
   let waitingForNextGame = false;
@@ -254,161 +359,176 @@ async function main() {
   process.on("SIGTERM", () => stop().finally(() => process.exit(0)));
 
   while (true) {
-    const loopNow = Date.now();
-    maxEventLoopDelayMs = Math.max(
-      maxEventLoopDelayMs,
-      Math.max(0, loopNow - (loopStartedAt + pollMs))
-    );
-    loopStartedAt = loopNow;
-    const state = await readTetrioState(cdp, {
-      probePageState,
-      useSeedSimulationFallback,
-      network,
-      probeState,
-      suppressClosureCapture: vsWsSimEnabled && vsRoundActive,
-      suppressedReason: DEFAULT_SUPPRESSED_REASON,
-      perfEnabled: browserPerfEnabled
-    });
-
-    if (shouldHandleEndedGame(state, endedHandled)) {
-      endedHandled = true;
-      waitingForNextGame = true;
-
-      await markCurrentGameAsEnded(cdp);
-
-      resetSnapshotTracking(snapshotTracking);
-      probeState.lastCaptureAt = 0;
-      clearSnapshotFile(snapshotPath);
-
-      console.log(`[browser] game session ended epoch=${gameEpoch}`);
-      console.log("[browser] cleared ended game cache; waiting for next game");
-    }
-
-    if (isTetrioGameEndedState(state)) {
-      const perfUpdate = maybeLogBrowserPerf({
-        browserPerfEnabled,
-        lastPerfLoggedAt,
-        maxEventLoopDelayMs
+    try {
+      const loopNow = Date.now();
+      maxEventLoopDelayMs = Math.max(
+        maxEventLoopDelayMs,
+        Math.max(0, loopNow - (loopStartedAt + pollMs))
+      );
+      loopStartedAt = loopNow;
+      const state = await readTetrioState(cdp, {
+        probePageState,
+        useSeedSimulationFallback,
+        network,
+        probeState,
+        bootstrapState,
+        transientState,
+        suppressClosureCapture: vsWsSimEnabled && vsRoundActive,
+        suppressedReason: DEFAULT_SUPPRESSED_REASON,
+        perfEnabled: browserPerfEnabled
       });
-      if (perfUpdate) {
-        lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
-        maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+
+      if (shouldHandleEndedGame(state, endedHandled)) {
+        endedHandled = true;
+        waitingForNextGame = true;
+
+        await markCurrentGameAsEnded(cdp);
+
+        resetSnapshotTracking(snapshotTracking);
+        probeState.lastCaptureAt = 0;
+        clearSnapshotFile(snapshotPath);
+
+        console.log(`[browser] game session ended epoch=${gameEpoch}`);
+        console.log("[browser] cleared ended game cache; waiting for next game");
       }
-      await sleep(pollMs);
-      continue;
-    }
 
-    if (!state.ok || !state.ready || !state.playing || state.countdown) {
-      const reason =
-        state.reason ??
-        (!state.playing ? "page is not playing" : state.countdown ? "countdown active" : "state not ready");
-      const now = Date.now();
-      if (shouldLogStateReason({
-        reason,
-        lastReason,
-        lastReasonAt,
-        now,
-        suppressRepeatedReason: state.reason === DEFAULT_SUPPRESSED_REASON
-      })) {
-        console.log(`[browser] ${reason}`);
-        lastReason = reason;
-        lastReasonAt = now;
+      if (isTetrioGameEndedState(state)) {
+        const perfUpdate = maybeLogBrowserPerf({
+          browserPerfEnabled,
+          lastPerfLoggedAt,
+          maxEventLoopDelayMs
+        });
+        if (perfUpdate) {
+          lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
+          maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+        }
+        await sleep(pollMs);
+        continue;
       }
-      const perfUpdate = maybeLogBrowserPerf({
-        browserPerfEnabled,
-        lastPerfLoggedAt,
-        maxEventLoopDelayMs
-      });
-      if (perfUpdate) {
-        lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
-        maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+
+      if (!state.ok || !state.ready || !state.playing || state.countdown) {
+        const reason =
+          state.reason ??
+          (!state.playing
+            ? "page is not playing"
+            : state.countdown
+              ? "countdown active"
+              : "state not ready");
+        const now = Date.now();
+        if (shouldLogStateReason({
+          reason,
+          lastReason,
+          lastReasonAt,
+          now,
+          suppressRepeatedReason: state.reason === DEFAULT_SUPPRESSED_REASON
+        })) {
+          console.log(`[browser] ${reason}`);
+          lastReason = reason;
+          lastReasonAt = now;
+        }
+        const perfUpdate = maybeLogBrowserPerf({
+          browserPerfEnabled,
+          lastPerfLoggedAt,
+          maxEventLoopDelayMs
+        });
+        if (perfUpdate) {
+          lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
+          maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+        }
+        await sleep(pollMs);
+        continue;
       }
-      await sleep(pollMs);
-      continue;
-    }
 
-    if (shouldAdvanceGameEpoch(state, waitingForNextGame)) {
-      gameEpoch += 1;
-      waitingForNextGame = false;
-      endedHandled = false;
-      resetSnapshotTracking(snapshotTracking);
-      console.log(`[browser] new game detected epoch=${gameEpoch}`);
-    }
+      if (shouldAdvanceGameEpoch(state, waitingForNextGame)) {
+        gameEpoch += 1;
+        waitingForNextGame = false;
+        endedHandled = false;
+        resetSnapshotTracking(snapshotTracking);
+        console.log(`[browser] new game detected epoch=${gameEpoch}`);
+      }
 
-    lastReason = "";
-    lastReasonAt = 0;
+      lastReason = "";
+      lastReasonAt = 0;
 
-    const pieceKey = `${gameEpoch}:${state.pieceCounter}`;
-    if (pieceKey !== snapshotTracking.pendingPieceKey) {
-      snapshotTracking.pendingPieceKey = pieceKey;
-      snapshotTracking.pendingPieceDetectedAt = Date.now();
-    }
+      const pieceKey = `${gameEpoch}:${state.pieceCounter}`;
+      if (pieceKey !== snapshotTracking.pendingPieceKey) {
+        snapshotTracking.pendingPieceKey = pieceKey;
+        snapshotTracking.pendingPieceDetectedAt = Date.now();
+      }
 
-    const signature = buildSnapshotSignature(gameEpoch, state);
-    if (signature === snapshotTracking.stableSignature) {
-      snapshotTracking.stableCount += 1;
-    } else {
-      snapshotTracking.stableSignature = signature;
-      snapshotTracking.stableCount = 1;
-    }
+      const signature = buildSnapshotSignature(gameEpoch, state);
+      if (signature === snapshotTracking.stableSignature) {
+        snapshotTracking.stableCount += 1;
+      } else {
+        snapshotTracking.stableSignature = signature;
+        snapshotTracking.stableCount = 1;
+      }
 
-    if (snapshotTracking.stableCount < 2) {
-      await sleep(pollMs);
-      continue;
-    }
+      if (snapshotTracking.stableCount < 2) {
+        await sleep(pollMs);
+        continue;
+      }
 
-    const snapshot = {
-      ok: true,
-      source: "browser_cdp",
-      field: state.field,
-      current: state.current.toUpperCase(),
-      hold: state.hold ? state.hold.toUpperCase() : null,
-      queue: state.queue.map((piece) => piece.toUpperCase()),
-      b2b: Boolean(state.b2b),
-      combo: state.combo,
-      incoming: state.incoming,
-      pieceCounter: state.pieceCounter,
-      token: buildSnapshotToken(gameEpoch, state.pieceCounter),
-      playing: state.playing,
-      countdown: state.countdown,
-      activeX: Number.isFinite(state.activeX) ? state.activeX : undefined,
-      activeY: Number.isFinite(state.activeY) ? state.activeY : undefined,
-      activeRotation: state.activeRotation ?? undefined
-    };
+      const snapshot = {
+        ok: true,
+        source: "browser_cdp",
+        field: state.field,
+        current: state.current.toUpperCase(),
+        hold: state.hold ? state.hold.toUpperCase() : null,
+        queue: state.queue.map((piece) => piece.toUpperCase()),
+        b2b: Boolean(state.b2b),
+        combo: state.combo,
+        incoming: state.incoming,
+        pieceCounter: state.pieceCounter,
+        token: buildSnapshotToken(gameEpoch, state.pieceCounter),
+        playing: state.playing,
+        countdown: state.countdown,
+        activeX: Number.isFinite(state.activeX) ? state.activeX : undefined,
+        activeY: Number.isFinite(state.activeY) ? state.activeY : undefined,
+        activeRotation: state.activeRotation ?? undefined
+      };
 
-    if (signature !== snapshotTracking.lastWrittenSignature) {
-      writeSnapshot(snapshotPath, snapshot);
-      snapshotTracking.lastWrittenSignature = signature;
-      if (
-        pieceKey === snapshotTracking.pendingPieceKey &&
-        pieceKey !== snapshotTracking.lastPerfLoggedPieceKey
-      ) {
-        snapshotTracking.lastPerfLoggedPieceKey = pieceKey;
-        if (browserPerfEnabled) {
+      if (signature !== snapshotTracking.lastWrittenSignature) {
+        writeSnapshot(snapshotPath, snapshot);
+        snapshotTracking.lastWrittenSignature = signature;
+        if (
+          pieceKey === snapshotTracking.pendingPieceKey &&
+          pieceKey !== snapshotTracking.lastPerfLoggedPieceKey
+        ) {
+          snapshotTracking.lastPerfLoggedPieceKey = pieceKey;
+          if (browserPerfEnabled) {
+            console.log(
+              `[browser-perf] piece_change_to_snapshot_ms=${Math.max(0, Date.now() - snapshotTracking.pendingPieceDetectedAt)}`
+            );
+          }
+        }
+        if (snapshot.token !== snapshotTracking.lastLoggedToken) {
+          snapshotTracking.lastLoggedToken = snapshot.token;
           console.log(
-            `[browser-perf] piece_change_to_snapshot_ms=${Math.max(0, Date.now() - snapshotTracking.pendingPieceDetectedAt)}`
+            `[browser] page state ready pieceCounter=${state.pieceCounter} current=${snapshot.current} hold=${snapshot.hold ?? "-"} queue=${snapshot.queue.join(",")}`
           );
         }
       }
-      if (snapshot.token !== snapshotTracking.lastLoggedToken) {
-        snapshotTracking.lastLoggedToken = snapshot.token;
-        console.log(
-          `[browser] page state ready pieceCounter=${state.pieceCounter} current=${snapshot.current} hold=${snapshot.hold ?? "-"} queue=${snapshot.queue.join(",")}`
-        );
+
+      const perfUpdate = maybeLogBrowserPerf({
+        browserPerfEnabled,
+        lastPerfLoggedAt,
+        maxEventLoopDelayMs
+      });
+      if (perfUpdate) {
+        lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
+        maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
       }
-    }
 
-    const perfUpdate = maybeLogBrowserPerf({
-      browserPerfEnabled,
-      lastPerfLoggedAt,
-      maxEventLoopDelayMs
-    });
-    if (perfUpdate) {
-      lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
-      maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+      await sleep(pollMs);
+    } catch (error) {
+      if (isTransientRuntimeError(error)) {
+        maybeLogTransientRuntimeError(error, transientState);
+        await sleep(Math.max(50, pollMs));
+        continue;
+      }
+      throw error;
     }
-
-    await sleep(pollMs);
   }
 }
 
@@ -424,8 +544,7 @@ async function markCurrentGameAsEnded(cdp) {
 
       return true;
     })()`,
-    returnByValue: true,
-    awaitPromise: true
+    returnByValue: true
   }).catch(() => undefined);
 }
 
@@ -631,16 +750,16 @@ async function installBackgroundInputKeepalive(cdp) {
   await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source }).catch(() => undefined);
   await cdp.send("Runtime.evaluate", {
     expression: source,
-    returnByValue: true,
-    awaitPromise: true
+    returnByValue: true
   }).catch(() => undefined);
 }
 
-async function installRibbonMonitor(cdp, network, msgpack) {
+async function installRibbonMonitor(cdp, network, msgpack, bootstrapState) {
   await cdp.send("Network.enable").catch(() => undefined);
   cdp.on("Network.webSocketCreated", (event) => {
     if (/spool\.tetr\.io\/ribbon/i.test(event?.url ?? "")) {
       network.ribbonSeen = true;
+      markBootstrapTransportReady(bootstrapState);
       console.log("[browser] ribbon websocket opened");
     }
   });
@@ -725,12 +844,70 @@ function finiteNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+async function readBootstrapPageState(
+  cdp,
+  bootstrapState,
+  now,
+  transientState,
+  log = console.log
+) {
+  const raw = await safeRuntimeEvaluate(cdp, {
+    expression: `(() => ({
+      readyState: document.readyState,
+      href: location.href
+    }))()`,
+    returnByValue: true
+  }, {
+    result: {
+      value: {
+        readyState: "loading",
+        href: ""
+      }
+    }
+  }, {
+    transientState,
+    log
+  });
+  const pageState = raw?.result?.value ?? { readyState: "loading", href: "" };
+  updateBootstrapDocumentState(bootstrapState, pageState, now);
+  return pageState;
+}
+
 export async function readTetrioState(cdp, options) {
+  const now = options.now ?? Date.now();
+  const log = options.log ?? console.log;
+  const bootstrapState = options.bootstrapState ?? createBootstrapState(now);
+  const pageState = await readBootstrapPageState(
+    cdp,
+    bootstrapState,
+    now,
+    options.transientState,
+    log
+  );
+  const bootstrapReady = isBootstrapReadyForClosureCapture(bootstrapState, now);
+  if (
+    options.probePageState &&
+    !options.suppressClosureCapture &&
+    !bootstrapReady &&
+    !bootstrapState.waitingLogged
+  ) {
+    log("[browser] waiting for TETR.IO bootstrap before closure capture");
+    bootstrapState.waitingLogged = true;
+  }
+  if (
+    options.probePageState &&
+    !options.suppressClosureCapture &&
+    bootstrapReady &&
+    !bootstrapState.readyLogged
+  ) {
+    log("[browser] TETR.IO bootstrap ready; closure capture enabled");
+    bootstrapState.readyLogged = true;
+  }
+
   const read = async () => {
     const raw = await safeRuntimeEvaluate(cdp, {
       expression: tetrioStateExpression(),
-      returnByValue: true,
-      awaitPromise: true
+      returnByValue: true
     }, {
       result: {
         value: {
@@ -739,15 +916,18 @@ export async function readTetrioState(cdp, options) {
           reason: "browser execution context not ready yet"
         }
       }
+    }, {
+      transientState: options.transientState,
+      log
     });
     return raw.result?.value ?? { ok: false, ready: false, reason: "page probe returned empty" };
   };
 
   let state = await read();
-  const now = Date.now();
   const shouldCapture = shouldAttemptClosureCapture({
     probePageState: options.probePageState,
     suppressClosureCapture: options.suppressClosureCapture,
+    bootstrapReady,
     stateOk: state.ok,
     lastCaptureAt: options.probeState?.lastCaptureAt ?? 0,
     lastPageProbeAt: options.network?.lastPageProbeAt ?? 0,
@@ -858,25 +1038,21 @@ async function captureTetrioGame(cdp) {
   }
 }
 
-async function safeRuntimeEvaluate(cdp, params, fallbackResult = null) {
+export async function safeRuntimeEvaluate(
+  cdp,
+  params,
+  fallbackResult = null,
+  { transientState = null, log = console.log } = {}
+) {
   try {
     return await cdp.send("Runtime.evaluate", params);
   } catch (error) {
-    if (isMissingExecutionContextError(error)) {
+    if (isTransientRuntimeError(error)) {
+      maybeLogTransientRuntimeError(error, transientState, log);
       return fallbackResult;
     }
     throw error;
   }
-}
-
-function isMissingExecutionContextError(error) {
-  const message = String(error?.message ?? error ?? "").toLowerCase();
-  return (
-    message.includes("cannot find default execution context") ||
-    message.includes("execution context was destroyed") ||
-    message.includes("inspected target navigated or closed") ||
-    message.includes("no frame with given id")
-  );
 }
 
 async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent) {
