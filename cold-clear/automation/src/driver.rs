@@ -68,6 +68,9 @@ pub struct TimedGameAction {
 
 pub trait InputBackend {
     fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()>;
+    fn gate_first_vs_route(&mut self) -> Result<Option<FirstRouteGateStatus>> {
+        Ok(None)
+    }
     fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
         for action in actions {
             self.tap(action.action, action.duration)?;
@@ -83,11 +86,21 @@ pub trait InputBackend {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct FirstRouteGateStatus {
+    pub raf_count: u32,
+    pub elapsed_ms: u64,
+}
+
 pub type SharedBrowserCdpInputBackend = Arc<Mutex<BrowserCdpInputBackend>>;
 
 impl<T: InputBackend + ?Sized> InputBackend for Box<T> {
     fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()> {
         (**self).tap(action, duration)
+    }
+
+    fn gate_first_vs_route(&mut self) -> Result<Option<FirstRouteGateStatus>> {
+        (**self).gate_first_vs_route()
     }
 
     fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
@@ -958,6 +971,15 @@ impl BrowserCdpInputBackend {
         command_type: &'static str,
         payload: impl FnOnce(u64) -> String,
     ) -> Result<()> {
+        self.send_command_response(command_type, payload)
+            .map(|_| ())
+    }
+
+    fn send_command_response(
+        &mut self,
+        command_type: &'static str,
+        payload: impl FnOnce(u64) -> String,
+    ) -> Result<BrowserInputHelperResponse> {
         let id = self.next_command_id;
         self.next_command_id += 1;
         let line = payload(id);
@@ -970,7 +992,11 @@ impl BrowserCdpInputBackend {
         self.stdin
             .flush()
             .context("failed to flush browser input helper")?;
-        self.wait_for_command_response(id, command_type)
+        let response = self.read_command_response(id, command_type)?;
+        if response.ok {
+            return Ok(response);
+        }
+        bail!("{}", helper_response_error(command_type, id, &response));
     }
 
     fn wait_for_ready(&mut self, _timeout: Duration) -> Result<()> {
@@ -1005,7 +1031,11 @@ impl BrowserCdpInputBackend {
         }
     }
 
-    fn wait_for_command_response(&mut self, id: u64, command_type: &'static str) -> Result<()> {
+    fn read_command_response(
+        &mut self,
+        id: u64,
+        command_type: &'static str,
+    ) -> Result<BrowserInputHelperResponse> {
         let mut line = String::new();
         loop {
             line.clear();
@@ -1036,15 +1066,7 @@ impl BrowserCdpInputBackend {
             if response.id != Some(id) {
                 continue;
             }
-            if response.ok {
-                return Ok(());
-            }
-            bail!(
-                "browser input helper rejected {} command id={}: {}",
-                command_type,
-                id,
-                response.error.unwrap_or_else(|| "unknown error".to_owned())
-            );
+            return Ok(response);
         }
     }
 }
@@ -1070,6 +1092,16 @@ impl InputBackend for BrowserCdpInputBackend {
             let _ = self.release_all_keys();
         }
         result
+    }
+
+    fn gate_first_vs_route(&mut self) -> Result<Option<FirstRouteGateStatus>> {
+        let response = self.send_command_response("firstRouteGate", |id| {
+            format!(r#"{{"id":{},"type":"firstRouteGate"}}"#, id)
+        })?;
+        Ok(Some(FirstRouteGateStatus {
+            raf_count: response.raf_count.unwrap_or(0),
+            elapsed_ms: response.elapsed_ms.unwrap_or(0),
+        }))
     }
 
     fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
@@ -1121,6 +1153,14 @@ impl InputBackend for SharedBrowserCdpInputBackendHandle {
         backend.tap(action, duration)
     }
 
+    fn gate_first_vs_route(&mut self) -> Result<Option<FirstRouteGateStatus>> {
+        let mut backend = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shared browser input backend lock poisoned"))?;
+        backend.gate_first_vs_route()
+    }
+
     fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
         let mut backend = self
             .inner
@@ -1159,6 +1199,30 @@ struct BrowserInputHelperResponse {
     id: Option<u64>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    #[serde(alias = "rafCount")]
+    raf_count: Option<u32>,
+    #[serde(default)]
+    #[serde(alias = "elapsedMs")]
+    elapsed_ms: Option<u64>,
+}
+
+fn helper_response_error(
+    command_type: &str,
+    id: u64,
+    response: &BrowserInputHelperResponse,
+) -> String {
+    let primary = response
+        .reason
+        .as_deref()
+        .or(response.error.as_deref())
+        .unwrap_or("unknown error");
+    format!(
+        "browser input helper rejected {} command id={}: {}",
+        command_type, id, primary
+    )
 }
 
 #[allow(dead_code)]

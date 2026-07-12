@@ -4,24 +4,38 @@ import { readFileSync } from "node:fs";
 
 import { handleMessage, normalizeSequenceActions } from "./browser-cdp-input.mjs";
 
-function createFakeCdp({ failDispatch, focusResult } = {}) {
+function createFakeCdp({ failDispatch, focusResult, runtimeResults = [], debuggerPaused = false } = {}) {
   const events = [];
+  let runtimeCallIndex = 0;
   return {
     events,
+    isDebuggerPaused() {
+      return debuggerPaused;
+    },
     async send(method, params = {}) {
       if (method === "Page.bringToFront") {
         events.push({ method });
         return {};
       }
+      if (method === "Debugger.enable") {
+        events.push({ method });
+        return {};
+      }
       if (method === "Runtime.evaluate") {
         events.push({ method });
+        const runtimeResult = runtimeResults[runtimeCallIndex++];
         return {
           result: {
-            value: focusResult ?? {
-              visibilityState: "visible",
-              activeTag: "BODY",
-              contentEditable: false
-            }
+            value:
+              runtimeResult ??
+              focusResult ?? {
+                visibilityState: "visible",
+                actualVisibilityState: "visible",
+                hasFocus: true,
+                actualHasFocus: true,
+                activeTag: "BODY",
+                contentEditable: false
+              }
           }
         };
       }
@@ -317,6 +331,72 @@ test("safe BODY focus allows key input", async () => {
     ["keyDown:KeyX", "keyUp:KeyX"]
   );
   assert.equal(responses[0].ok, true);
+});
+
+test("first route gate failure suppresses all key input", async () => {
+  const cdp = createFakeCdp({
+    runtimeResults: [
+      {
+        visibilityState: "visible",
+        actualVisibilityState: "visible",
+        hasFocus: true,
+        actualHasFocus: true,
+        activeTag: "BODY",
+        contentEditable: false
+      },
+      {
+        ok: false,
+        reason: "page_not_focused"
+      }
+    ]
+  });
+  const { context, responses } = createContext(cdp);
+
+  await handleMessage({ id: 7, type: "firstRouteGate" }, context);
+
+  assert.equal(
+    cdp.events.filter((event) => event.type === "keyDown" || event.type === "keyUp").length,
+    0
+  );
+  assert.equal(responses.length, 1);
+  assert.equal(responses[0].ok, false);
+  assert.equal(responses[0].error, "first_route_gate_failed");
+  assert.equal(responses[0].reason, "page_not_focused");
+});
+
+test("first route gate success reports readiness without sending keys", async () => {
+  const cdp = createFakeCdp({
+    runtimeResults: [
+      {
+        visibilityState: "visible",
+        actualVisibilityState: "visible",
+        hasFocus: true,
+        actualHasFocus: true,
+        activeTag: "BODY",
+        contentEditable: false
+      },
+      {
+        ok: true,
+        rafCount: 2,
+        elapsedMs: 48
+      }
+    ]
+  });
+  const { context, responses } = createContext(cdp);
+
+  await handleMessage({ id: 8, type: "firstRouteGate" }, context);
+
+  assert.equal(
+    cdp.events.filter((event) => event.type === "keyDown" || event.type === "keyUp").length,
+    0
+  );
+  assert.deepEqual(responses[0], {
+    ok: true,
+    id: 8,
+    type: "firstRouteGate",
+    rafCount: 2,
+    elapsedMs: 48
+  });
 });
 
 test("stdout payloads remain parseable JSON even when stderr logs are emitted", async () => {

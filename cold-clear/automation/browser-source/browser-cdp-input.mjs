@@ -91,6 +91,8 @@ const KEY_MAP = {
   rotate180: keySpec("a", "KeyA", 65, "a"),
   hold: keySpec("c", "KeyC", 67, "c")
 };
+const FIRST_ROUTE_GATE_TIMEOUT_MS = 500;
+const FIRST_ROUTE_GATE_MAX_RAF_GAP_MS = 250;
 
 function keySpec(key, code, windowsVirtualKeyCode, text = "") {
   return {
@@ -160,6 +162,20 @@ export async function handleMessage(
       return cdp;
     }
 
+    if (message.type === "firstRouteGate") {
+      cdp = await ensureConnected(cdp, targetInfo, pressedKeys);
+      await prepareInputTarget(cdp, focusLogState);
+      const result = await ensureFirstRouteReady(cdp);
+      sendResponse({
+        ok: true,
+        id: message.id ?? null,
+        type: "firstRouteGate",
+        rafCount: result.rafCount,
+        elapsedMs: result.elapsedMs
+      });
+      return cdp;
+    }
+
     return cdp;
   } catch (error) {
     const payload = {
@@ -208,6 +224,15 @@ export function normalizeSequenceActions(actions) {
 async function focusPage(cdp) {
   const result = await cdp.send("Runtime.evaluate", {
     expression: `(() => {
+      const keepalive = window.__fusionBackgroundInputKeepalive;
+      const actualVisibilityState =
+        typeof keepalive?.originalVisibilityState === "function"
+          ? keepalive.originalVisibilityState()
+          : (document.visibilityState ?? null);
+      const actualHasFocus =
+        typeof keepalive?.originalHasFocus === "function"
+          ? Boolean(keepalive.originalHasFocus())
+          : Boolean(document.hasFocus?.());
       window.focus();
       const active = document.activeElement;
       if (active && typeof active.blur === "function") active.blur();
@@ -215,6 +240,9 @@ async function focusPage(cdp) {
       const nextActive = document.activeElement;
       return {
         visibilityState: document.visibilityState ?? null,
+        actualVisibilityState,
+        hasFocus: Boolean(document.hasFocus?.()),
+        actualHasFocus,
         activeTag: nextActive?.tagName ?? null,
         contentEditable: Boolean(
           nextActive?.isContentEditable ||
@@ -227,6 +255,9 @@ async function focusPage(cdp) {
   }).catch(() => undefined);
   return result?.result?.value ?? {
     visibilityState: null,
+    actualVisibilityState: null,
+    hasFocus: false,
+    actualHasFocus: false,
     activeTag: null,
     contentEditable: false
   };
@@ -280,6 +311,105 @@ async function prepareInputTarget(cdp, focusLogState) {
     `safe:${activeTag || "NONE"}`,
     `[input] focus prepared active=${activeTag || "NONE"}`
   );
+}
+
+async function ensureFirstRouteReady(cdp) {
+  if (cdp.isDebuggerPaused()) {
+    throw new InputCommandError("first_route_gate_failed", {
+      reason: "debugger_paused"
+    });
+  }
+
+  const evaluation = await evaluateWithTimeout(
+    cdp,
+    {
+      expression: `(() => new Promise((resolve) => {
+        const keepalive = window.__fusionBackgroundInputKeepalive;
+        const visibilityState =
+          typeof keepalive?.originalVisibilityState === "function"
+            ? keepalive.originalVisibilityState()
+            : (document.visibilityState ?? null);
+        const hasFocus =
+          typeof keepalive?.originalHasFocus === "function"
+            ? Boolean(keepalive.originalHasFocus())
+            : Boolean(document.hasFocus?.());
+        const active = document.activeElement;
+        const activeTag = active?.tagName ?? null;
+        const contentEditable = Boolean(
+          active?.isContentEditable ||
+          active?.getAttribute?.("contenteditable") === "true"
+        );
+        const unsafe =
+          contentEditable ||
+          activeTag === "INPUT" ||
+          activeTag === "TEXTAREA" ||
+          activeTag === "SELECT" ||
+          activeTag === "BUTTON" ||
+          activeTag === "A" ||
+          activeTag === "IFRAME";
+        if (visibilityState && visibilityState !== "visible") {
+          resolve({ ok: false, reason: "page_not_visible", visibilityState });
+          return;
+        }
+        if (!hasFocus) {
+          resolve({ ok: false, reason: "page_not_focused" });
+          return;
+        }
+        if (unsafe) {
+          resolve({ ok: false, reason: "unsafe_active_element", activeTag, contentEditable });
+          return;
+        }
+        if (typeof window.requestAnimationFrame !== "function") {
+          resolve({ ok: false, reason: "request_animation_frame_unavailable" });
+          return;
+        }
+
+        const start = performance.now();
+        const stamps = [];
+        const onFrame = (stamp) => {
+          stamps.push(stamp);
+          if (stamps.length >= 2) {
+            const gapMs = Math.max(0, stamps[1] - stamps[0]);
+            const elapsedMs = Math.max(0, stamps[1] - start);
+            if (gapMs > ${FIRST_ROUTE_GATE_MAX_RAF_GAP_MS}) {
+              resolve({
+                ok: false,
+                reason: "raf_gap_too_long",
+                rafCount: stamps.length,
+                elapsedMs: Math.round(elapsedMs),
+                rafGapMs: Math.round(gapMs)
+              });
+              return;
+            }
+            resolve({
+              ok: true,
+              rafCount: stamps.length,
+              elapsedMs: Math.round(elapsedMs),
+              rafGapMs: Math.round(gapMs)
+            });
+            return;
+          }
+          window.requestAnimationFrame(onFrame);
+        };
+
+        window.requestAnimationFrame(onFrame);
+      }))()`,
+      returnByValue: true,
+      awaitPromise: true
+    },
+    FIRST_ROUTE_GATE_TIMEOUT_MS,
+    "debugger_paused"
+  );
+  const value = evaluation?.result?.value ?? null;
+  if (!value?.ok) {
+    throw new InputCommandError("first_route_gate_failed", {
+      reason: value?.reason ?? "unknown"
+    });
+  }
+  return {
+    rafCount: Number(value.rafCount ?? 0),
+    elapsedMs: Number(value.elapsedMs ?? 0)
+  };
 }
 
 function isUnsafeActiveElement(activeTag, isContentEditable) {
@@ -403,6 +533,7 @@ async function connectToTarget({ port, url, targetHint }) {
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
   await cdp.send("Page.enable").catch(() => undefined);
   await cdp.send("Runtime.enable").catch(() => undefined);
+  await cdp.send("Debugger.enable").catch(() => undefined);
   await cdp.send("Page.bringToFront").catch(() => undefined);
   await installBackgroundInputKeepalive(cdp);
   await focusPage(cdp);
@@ -475,6 +606,17 @@ async function fetchJson(url, options) {
   return await response.json();
 }
 
+async function evaluateWithTimeout(cdp, params, timeoutMs, timeoutReason) {
+  return await Promise.race([
+    cdp.send("Runtime.evaluate", params),
+    sleep(timeoutMs).then(() => {
+      throw new InputCommandError("first_route_gate_failed", {
+        reason: timeoutReason
+      });
+    })
+  ]);
+}
+
 async function installBackgroundInputKeepalive(cdp) {
   const source = `(() => {
     if (window.__fusionBackgroundInputKeepalive) return window.__fusionBackgroundInputKeepalive;
@@ -486,6 +628,11 @@ async function installBackgroundInputKeepalive(cdp) {
         });
       } catch {}
     };
+
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "visibilityState");
+    const hiddenDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "hidden");
+    const originalHasFocus =
+      typeof document.hasFocus === "function" ? document.hasFocus.bind(document) : null;
 
     defineGetter(Document.prototype, "hidden", false);
     defineGetter(Document.prototype, "visibilityState", "visible");
@@ -512,7 +659,28 @@ async function installBackgroundInputKeepalive(cdp) {
     );
 
     window.__fusionBackgroundInputKeepalive = {
-      at: Date.now()
+      at: Date.now(),
+      originalVisibilityState() {
+        try {
+          return visibilityDescriptor?.get?.call(document) ?? null;
+        } catch {
+          return null;
+        }
+      },
+      originalHidden() {
+        try {
+          return hiddenDescriptor?.get?.call(document) ?? null;
+        } catch {
+          return null;
+        }
+      },
+      originalHasFocus() {
+        try {
+          return Boolean(originalHasFocus?.());
+        } catch {
+          return false;
+        }
+      }
     };
     return window.__fusionBackgroundInputKeepalive;
   })()`;
@@ -539,8 +707,17 @@ class CdpClient {
     this.socket = socket;
     this.nextId = 1;
     this.pending = new Map();
+    this.debuggerPaused = false;
     socket.addEventListener("message", (event) => {
       const message = JSON.parse(event.data);
+      if (message.method === "Debugger.paused") {
+        this.debuggerPaused = true;
+        return;
+      }
+      if (message.method === "Debugger.resumed") {
+        this.debuggerPaused = false;
+        return;
+      }
       if (!message.id) return;
       const pending = this.pending.get(message.id);
       if (!pending) return;
@@ -568,6 +745,10 @@ class CdpClient {
 
   isOpen() {
     return this.socket.readyState === WebSocket.OPEN;
+  }
+
+  isDebuggerPaused() {
+    return this.debuggerPaused;
   }
 }
 

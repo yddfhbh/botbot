@@ -1,6 +1,6 @@
 {
   "roundId": "5449:1744077373",
-  "readyAt": 1783845407027,
+  "readyAt": 1783846620341,
   "readyOffsetMs": 3000,
   "readyOffsetSource": "countdown",
   "local": {
@@ -30,6 +30,6 @@
   "version": 1,
   "sequence": 2,
   "active": false,
-  "capturedAt": 1783845404030,
+  "capturedAt": 1783846617344,
   "incomingGarbage": []
 }

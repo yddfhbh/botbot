@@ -13,7 +13,7 @@ use crate::scanner::{GameSnapshot, PieceToken};
 
 const DEFAULT_NEXT_COUNT: usize = 6;
 const DEFAULT_VALIDATION_MAX_PIECES: usize = 10;
-const DEFAULT_VS_POST_READY_GRACE_MS: u64 = 100;
+const DEFAULT_VS_POST_READY_GRACE_MS: u64 = 500;
 const MAX_VS_POST_READY_GRACE_MS: u64 = 1_000;
 const POST_DROP_SETTLE_MS: u64 = 80;
 const VS_WS_SIM_ENV: &str = "FUSION_VS_WS_SIM";
@@ -1484,13 +1484,13 @@ mod tests {
     }
 
     #[test]
-    fn default_vs_post_ready_grace_is_100ms() {
-        assert_eq!(parse_post_ready_grace_ms(None), 100);
+    fn default_vs_post_ready_grace_is_500ms() {
+        assert_eq!(parse_post_ready_grace_ms(None), 500);
     }
 
     #[test]
-    fn invalid_vs_post_ready_grace_uses_default_100ms() {
-        assert_eq!(parse_post_ready_grace_ms(Some("abc")), 100);
+    fn invalid_vs_post_ready_grace_uses_default_500ms() {
+        assert_eq!(parse_post_ready_grace_ms(Some("abc")), 500);
     }
 
     #[test]
@@ -1504,17 +1504,17 @@ mod tests {
     }
 
     #[test]
-    fn default_vs_grace_blocks_input_until_ready_at_plus_99ms() {
+    fn default_vs_grace_blocks_input_until_ready_at_plus_499ms() {
         let input_allowed_at_ms =
             compute_input_allowed_at_ms(1_000, parse_post_ready_grace_ms(None));
-        assert!(initial_input_grace_active(0, 1_099, input_allowed_at_ms));
+        assert!(initial_input_grace_active(0, 1_499, input_allowed_at_ms));
     }
 
     #[test]
-    fn default_vs_grace_allows_input_at_ready_at_plus_100ms() {
+    fn default_vs_grace_allows_input_at_ready_at_plus_500ms() {
         let input_allowed_at_ms =
             compute_input_allowed_at_ms(1_000, parse_post_ready_grace_ms(None));
-        assert!(!initial_input_grace_active(0, 1_100, input_allowed_at_ms));
+        assert!(!initial_input_grace_active(0, 1_500, input_allowed_at_ms));
     }
 
     #[test]
@@ -1547,23 +1547,23 @@ mod tests {
         assert!(snapshot.is_none());
         assert!(logs.iter().any(
             |line| line.contains("[vs-sim] start timing ready_offset_ms=")
-                && line.contains("grace_ms=100")
+                && line.contains("grace_ms=500")
         ));
         assert!(logs
             .iter()
-            .any(|line| line.contains("waiting post-countdown focus grace 100ms")));
+            .any(|line| line.contains("waiting post-countdown focus grace 500ms")));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn first_snapshot_is_allowed_at_ready_at_plus_100ms() {
+    fn first_snapshot_is_allowed_at_ready_at_plus_500ms() {
         let path = temp_bridge_path("vs-sim-focus-grace-allowed");
         write_ready_bridge(&path, "4382:2034120187", 1);
         let mut logs = Vec::new();
         let mut controller = VsSimulationController::with_settings(true, path.clone());
         controller.next_snapshot(&mut |_| {}).unwrap();
         if let Some(session) = controller.session.as_mut() {
-            session.countdown_ready_at_ms = current_time_ms().saturating_sub(100);
+            session.countdown_ready_at_ms = current_time_ms().saturating_sub(500);
             session.input_allowed_at_ms = current_time_ms();
             session.logged_input_grace_complete = false;
         }
@@ -1576,7 +1576,7 @@ mod tests {
         assert!(logs.iter().any(|line| {
             line.strip_prefix("[vs-sim] input grace complete elapsed_ms=")
                 .and_then(|value| value.parse::<u64>().ok())
-                .map(|elapsed| elapsed >= 100)
+                .map(|elapsed| elapsed >= 500)
                 .unwrap_or(false)
         }));
         let _ = fs::remove_file(path);
