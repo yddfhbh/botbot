@@ -15,10 +15,12 @@ const DEFAULT_NEXT_COUNT: usize = 6;
 const DEFAULT_VALIDATION_MAX_PIECES: usize = 10;
 const DEFAULT_VS_POST_READY_GRACE_MS: u64 = 500;
 const MAX_VS_POST_READY_GRACE_MS: u64 = 1_000;
-const POST_DROP_SETTLE_MS: u64 = 80;
+const DEFAULT_VS_POST_LOCK_DELAY_MS: u64 = 150;
+const MAX_VS_POST_LOCK_DELAY_MS: u64 = 500;
 const VS_WS_SIM_ENV: &str = "FUSION_VS_WS_SIM";
 const VS_WS_SIM_MAX_PIECES_ENV: &str = "FUSION_VS_WS_SIM_MAX_PIECES";
 const VS_POST_READY_GRACE_MS_ENV: &str = "FUSION_VS_POST_READY_GRACE_MS";
+const VS_POST_LOCK_DELAY_MS_ENV: &str = "FUSION_VS_POST_LOCK_DELAY_MS";
 
 pub struct VsSimulationController {
     enabled: bool,
@@ -27,6 +29,7 @@ pub struct VsSimulationController {
     blocked_round_id: Option<String>,
     max_pieces: usize,
     post_ready_grace_ms: u64,
+    post_lock_delay_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -43,11 +46,14 @@ struct VsSimulationSession {
     hold: Option<Piece>,
     piece_index: usize,
     committed_locks: usize,
+    post_lock_committed_at_ms: u64,
     next_snapshot_ready_at_ms: u64,
     paused_pending_verification: bool,
     logged_start_timing: bool,
     logged_focus_grace_wait: bool,
     logged_input_grace_complete: bool,
+    logged_post_lock_wait: bool,
+    logged_post_lock_release: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -123,6 +129,7 @@ impl VsSimulationController {
             blocked_round_id: None,
             max_pieces,
             post_ready_grace_ms: resolve_post_ready_grace_ms(),
+            post_lock_delay_ms: resolve_post_lock_delay_ms(),
         }
     }
 
@@ -205,7 +212,29 @@ impl VsSimulationController {
             }
         }
         if now < next_snapshot_ready_at_ms {
+            if let Some(session) = self.session.as_mut() {
+                if !session.logged_post_lock_wait {
+                    log(format!(
+                        "[vs-sim] post-lock waiting delay_ms={} committed_locks={}",
+                        self.post_lock_delay_ms, session.committed_locks
+                    ));
+                    session.logged_post_lock_wait = true;
+                }
+            }
             return Ok(None);
+        }
+        if next_snapshot_ready_at_ms > 0 {
+            if let Some(session) = self.session.as_mut() {
+                if !session.logged_post_lock_release {
+                    let after_lock_ms = now.saturating_sub(session.post_lock_committed_at_ms);
+                    log(format!(
+                        "[vs-sim] next snapshot released after_lock_ms={after_lock_ms}"
+                    ));
+                    session.logged_post_lock_release = true;
+                }
+                session.post_lock_committed_at_ms = 0;
+                session.next_snapshot_ready_at_ms = 0;
+            }
         }
 
         Ok(Some(
@@ -310,8 +339,10 @@ impl VsSimulationController {
             session.hold = execution.next_hold;
             session.piece_index = execution.next_piece_index;
             session.committed_locks = session.committed_locks.saturating_add(1);
-            session.next_snapshot_ready_at_ms =
-                current_time_ms().saturating_add(POST_DROP_SETTLE_MS);
+            session.post_lock_committed_at_ms = 0;
+            session.next_snapshot_ready_at_ms = 0;
+            session.logged_post_lock_wait = false;
+            session.logged_post_lock_release = false;
 
             let current_after = session
                 .current_piece()
@@ -333,6 +364,11 @@ impl VsSimulationController {
                     session.committed_locks
                 ));
                 log("[vs-sim] paused pending verification".to_owned());
+            } else if self.post_lock_delay_ms > 0 {
+                let committed_at_ms = current_time_ms();
+                session.post_lock_committed_at_ms = committed_at_ms;
+                session.next_snapshot_ready_at_ms =
+                    committed_at_ms.saturating_add(self.post_lock_delay_ms);
             }
 
             Ok(CommitOutcome::Committed)
@@ -563,11 +599,14 @@ impl VsSimulationSession {
             hold: None,
             piece_index: 0,
             committed_locks: 0,
+            post_lock_committed_at_ms: 0,
             next_snapshot_ready_at_ms: 0,
             paused_pending_verification: false,
             logged_start_timing: false,
             logged_focus_grace_wait: false,
             logged_input_grace_complete: false,
+            logged_post_lock_wait: false,
+            logged_post_lock_release: false,
         })
     }
 
@@ -809,11 +848,22 @@ fn resolve_post_ready_grace_ms() -> u64 {
     parse_post_ready_grace_ms(std::env::var(VS_POST_READY_GRACE_MS_ENV).ok().as_deref())
 }
 
+fn resolve_post_lock_delay_ms() -> u64 {
+    parse_post_lock_delay_ms(std::env::var(VS_POST_LOCK_DELAY_MS_ENV).ok().as_deref())
+}
+
 fn parse_post_ready_grace_ms(value: Option<&str>) -> u64 {
     match value.and_then(|raw| raw.parse::<i64>().ok()) {
         None => DEFAULT_VS_POST_READY_GRACE_MS,
         Some(parsed) if parsed < 0 => 0,
         Some(parsed) => (parsed as u64).min(MAX_VS_POST_READY_GRACE_MS),
+    }
+}
+
+fn parse_post_lock_delay_ms(value: Option<&str>) -> u64 {
+    match value.and_then(|raw| raw.parse::<u64>().ok()) {
+        Some(parsed) if parsed <= MAX_VS_POST_LOCK_DELAY_MS => parsed,
+        _ => DEFAULT_VS_POST_LOCK_DELAY_MS,
     }
 }
 
@@ -965,11 +1015,14 @@ mod tests {
             hold,
             piece_index,
             committed_locks,
+            post_lock_committed_at_ms: 0,
             next_snapshot_ready_at_ms: 0,
             paused_pending_verification: false,
             logged_start_timing: false,
             logged_focus_grace_wait: false,
             logged_input_grace_complete: false,
+            logged_post_lock_wait: false,
+            logged_post_lock_release: false,
         }
     }
 
@@ -1533,6 +1586,18 @@ mod tests {
     }
 
     #[test]
+    fn default_vs_post_lock_delay_is_150ms() {
+        assert_eq!(parse_post_lock_delay_ms(None), 150);
+    }
+
+    #[test]
+    fn invalid_vs_post_lock_delay_uses_default_150ms() {
+        assert_eq!(parse_post_lock_delay_ms(Some("abc")), 150);
+        assert_eq!(parse_post_lock_delay_ms(Some("-1")), 150);
+        assert_eq!(parse_post_lock_delay_ms(Some("999")), 150);
+    }
+
+    #[test]
     fn first_snapshot_wait_logs_while_grace_is_active() {
         let path = temp_bridge_path("vs-sim-focus-grace-wait");
         let ready_at = current_time_ms().saturating_add(250);
@@ -1579,6 +1644,69 @@ mod tests {
                 .map(|elapsed| elapsed >= 500)
                 .unwrap_or(false)
         }));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn hard_drop_waits_for_post_lock_delay_before_releasing_next_snapshot() {
+        let path = temp_bridge_path("vs-sim-post-lock-delay");
+        write_ready_bridge(&path, "4382:2034120187", 1);
+        let mut controller = VsSimulationController::with_settings(true, path.clone());
+        controller.post_lock_delay_ms = 150;
+        let snapshot = controller
+            .next_snapshot(&mut |_| {})
+            .unwrap()
+            .expect("simulated snapshot");
+        controller
+            .commit_hard_drop(&snapshot, &simple_lock_move(Piece::O), false, &mut |_| {})
+            .unwrap();
+
+        let mut wait_logs = Vec::new();
+        let waiting_snapshot = controller
+            .next_snapshot(&mut |line| wait_logs.push(line))
+            .unwrap();
+
+        assert!(waiting_snapshot.is_none());
+        assert!(wait_logs.iter().any(|line| {
+            line.contains("[vs-sim] post-lock waiting delay_ms=150 committed_locks=1")
+        }));
+
+        if let Some(session) = controller.session.as_mut() {
+            session.post_lock_committed_at_ms = current_time_ms().saturating_sub(150);
+            session.next_snapshot_ready_at_ms = current_time_ms();
+        }
+        let mut release_logs = Vec::new();
+        let released_snapshot = controller
+            .next_snapshot(&mut |line| release_logs.push(line))
+            .unwrap();
+
+        assert!(released_snapshot.is_some());
+        assert!(release_logs.iter().any(|line| {
+            line.strip_prefix("[vs-sim] next snapshot released after_lock_ms=")
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|elapsed| elapsed >= 150)
+                .unwrap_or(false)
+        }));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn zero_post_lock_delay_keeps_existing_next_snapshot_behavior() {
+        let path = temp_bridge_path("vs-sim-post-lock-zero");
+        write_ready_bridge(&path, "4382:2034120187", 1);
+        let mut controller = VsSimulationController::with_settings(true, path.clone());
+        controller.post_lock_delay_ms = 0;
+        let snapshot = controller
+            .next_snapshot(&mut |_| {})
+            .unwrap()
+            .expect("simulated snapshot");
+        controller
+            .commit_hard_drop(&snapshot, &simple_lock_move(Piece::O), false, &mut |_| {})
+            .unwrap();
+
+        let released_snapshot = controller.next_snapshot(&mut |_| {}).unwrap();
+
+        assert!(released_snapshot.is_some());
         let _ = fs::remove_file(path);
     }
 

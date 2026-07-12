@@ -1,22 +1,22 @@
 {
-  "roundId": "5449:1744077373",
-  "readyAt": 1783849054832,
+  "roundId": "6729:1586235849",
+  "readyAt": 1783860520635,
   "readyOffsetMs": 3000,
   "readyOffsetSource": "countdown",
   "local": {
     "username": "hebi_",
-    "userid": "local-id",
-    "gameid": 5449
+    "userid": "63b3ad2b1103e5097025feba",
+    "gameid": 6729
   },
   "opponents": [
     {
       "username": "guest-e00651",
-      "userid": "guest-id",
-      "gameid": 5450
+      "userid": "6a5042ff2dfdb4928a8950fe",
+      "gameid": 6730
     }
   ],
   "options": {
-    "seed": 1744077373,
+    "seed": 1586235849,
     "bagtype": "7-bag",
     "nextcount": 5,
     "boardwidth": 10,
@@ -28,8 +28,8 @@
   },
   "roomSeed": 187156,
   "version": 1,
-  "sequence": 2,
-  "active": false,
-  "capturedAt": 1783849051834,
+  "sequence": 1,
+  "active": true,
+  "capturedAt": 1783860517635,
   "incomingGarbage": []
 }

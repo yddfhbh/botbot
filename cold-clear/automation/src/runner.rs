@@ -32,6 +32,10 @@ use crate::sprint::{
 };
 use crate::vs_sim::VsSimulationController;
 
+const DEFAULT_VS_POST_HOLD_DELAY_MS: u64 = 60;
+const MAX_VS_POST_HOLD_DELAY_MS: u64 = 250;
+const VS_POST_HOLD_DELAY_MS_ENV: &str = "FUSION_VS_POST_HOLD_DELAY_MS";
+
 #[derive(Clone, Debug)]
 enum PlannerEvaluator {
     Normal(Standard),
@@ -134,6 +138,7 @@ where
     let mut sprint_state = SprintState::default();
     let mut perf_window = RollingPerfWindow::default();
     let mut vs_sim_controller = VsSimulationController::new(&config.snapshot_path);
+    let vs_post_hold_delay_ms = resolve_vs_post_hold_delay_ms();
 
     loop {
         if stop.load(AtomicOrdering::Relaxed) {
@@ -178,11 +183,13 @@ where
                         }
                         let input_started_at = Instant::now();
                         let executed_hold = prepared.execution_plan.hold;
-                        if let Err(error) = execute_plan_until_hard_drop(
+                        if let Err(error) = execute_plan_until_hard_drop_with_vs_post_hold_delay(
+                            &snapshot,
                             driver,
                             &prepared.execution_plan,
                             &config.handling,
                             execution_timings,
+                            vs_post_hold_delay_ms,
                             |line| log(line),
                         ) {
                             if snapshot.source == "browser_ws_sim" {
@@ -569,6 +576,58 @@ where
 
 fn should_use_browser_pre_hard_drop_probe(snapshot: &GameSnapshot) -> bool {
     snapshot.source != "browser_ws_sim"
+}
+
+fn execute_plan_until_hard_drop_with_vs_post_hold_delay<B, F>(
+    snapshot: &GameSnapshot,
+    backend: &mut B,
+    plan: &ExecutionPlan,
+    handling: &HandlingConfig,
+    timings: ExecutionTimings,
+    vs_post_hold_delay_ms: u64,
+    mut log: F,
+) -> Result<()>
+where
+    B: InputBackend + ?Sized,
+    F: FnMut(String),
+{
+    if snapshot.source != "browser_ws_sim" || !plan.hold {
+        return execute_plan_until_hard_drop(backend, plan, handling, timings, log);
+    }
+
+    let hold_only_plan = ExecutionPlan {
+        hold: true,
+        movement_actions: Vec::new(),
+        hard_drop: false,
+    };
+    execute_plan_until_hard_drop(backend, &hold_only_plan, handling, timings, |line| {
+        log(line)
+    })?;
+
+    if vs_post_hold_delay_ms > 0 {
+        log(format!(
+            "[vs-sim] post-hold waiting delay_ms={vs_post_hold_delay_ms}"
+        ));
+        thread::sleep(Duration::from_millis(vs_post_hold_delay_ms));
+    }
+
+    let movement_only_plan = ExecutionPlan {
+        hold: false,
+        movement_actions: plan.movement_actions.clone(),
+        hard_drop: false,
+    };
+    execute_plan_until_hard_drop(backend, &movement_only_plan, handling, timings, log)
+}
+
+fn resolve_vs_post_hold_delay_ms() -> u64 {
+    parse_vs_post_hold_delay_ms(std::env::var(VS_POST_HOLD_DELAY_MS_ENV).ok().as_deref())
+}
+
+fn parse_vs_post_hold_delay_ms(value: Option<&str>) -> u64 {
+    match value.and_then(|raw| raw.parse::<u64>().ok()) {
+        Some(parsed) if parsed <= MAX_VS_POST_HOLD_DELAY_MS => parsed,
+        _ => DEFAULT_VS_POST_HOLD_DELAY_MS,
+    }
 }
 
 fn skip_snapshot_reason(
@@ -2077,7 +2136,10 @@ mod tests {
         route_sequences: u32,
         hard_drop_sequences: u32,
         fail_when_route_contains_hold: bool,
+        fail_when_route_excludes_hold: bool,
         fail_hard_drop: bool,
+        route_batches: Vec<Vec<GameAction>>,
+        route_batch_instants: Vec<Instant>,
     }
 
     impl InputBackend for RoutePhaseBackend {
@@ -2095,14 +2157,19 @@ mod tests {
                 }
                 self.hard_drop_sequences += 1;
             } else if !actions.is_empty() {
-                if self.fail_when_route_contains_hold
-                    && actions
-                        .iter()
-                        .any(|action| action.action == GameAction::Hold)
-                {
+                let contains_hold = actions
+                    .iter()
+                    .any(|action| action.action == GameAction::Hold);
+                if self.fail_when_route_contains_hold && contains_hold {
                     anyhow::bail!("simulated hold failure");
                 }
+                if self.fail_when_route_excludes_hold && !contains_hold {
+                    anyhow::bail!("simulated movement failure");
+                }
                 self.route_sequences += 1;
+                self.route_batches
+                    .push(actions.iter().map(|action| action.action).collect());
+                self.route_batch_instants.push(Instant::now());
             }
             Ok(())
         }
@@ -2742,6 +2809,18 @@ mod tests {
     }
 
     #[test]
+    fn default_vs_post_hold_delay_is_60ms() {
+        assert_eq!(parse_vs_post_hold_delay_ms(None), 60);
+    }
+
+    #[test]
+    fn invalid_vs_post_hold_delay_uses_default_60ms() {
+        assert_eq!(parse_vs_post_hold_delay_ms(Some("abc")), 60);
+        assert_eq!(parse_vs_post_hold_delay_ms(Some("-1")), 60);
+        assert_eq!(parse_vs_post_hold_delay_ms(Some("999")), 60);
+    }
+
+    #[test]
     fn route_preflight_failure_suppresses_all_vs_inputs() {
         let dir = temp_bridge_dir("vs-route-preflight-fail");
         let bridge_path = dir.join("vs-ws-bridge.json");
@@ -2879,6 +2958,142 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(backend.route_sequences, 0);
+        assert_eq!(backend.hard_drop_sequences, 0);
+        assert!(controller.next_snapshot(&mut |_| {}).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn vs_hold_route_waits_before_movement_sequence() {
+        let snapshot = vs_validation_snapshot();
+        let mut backend = RoutePhaseBackend::default();
+        let mut logs = Vec::new();
+        let started_at = Instant::now();
+
+        execute_plan_until_hard_drop_with_vs_post_hold_delay(
+            &snapshot,
+            &mut backend,
+            &vs_hold_route_plan(),
+            &HandlingConfig::default(),
+            runner_test_timings(),
+            20,
+            |line| logs.push(line),
+        )
+        .unwrap();
+
+        assert_eq!(backend.route_sequences, 2);
+        assert_eq!(
+            backend.route_batches,
+            vec![vec![GameAction::Hold], vec![GameAction::Left]]
+        );
+        assert_eq!(backend.route_batch_instants.len(), 2);
+        assert!(
+            backend.route_batch_instants[1]
+                .duration_since(backend.route_batch_instants[0])
+                .as_millis()
+                >= 20
+        );
+        assert!(started_at.elapsed().as_millis() >= 20);
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("[vs-sim] post-hold waiting delay_ms=20")));
+    }
+
+    #[test]
+    fn vs_hold_route_zero_post_hold_delay_keeps_existing_behavior() {
+        let snapshot = vs_validation_snapshot();
+        let mut backend = RoutePhaseBackend::default();
+
+        execute_plan_until_hard_drop_with_vs_post_hold_delay(
+            &snapshot,
+            &mut backend,
+            &vs_hold_route_plan(),
+            &HandlingConfig::default(),
+            runner_test_timings(),
+            0,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            backend.route_batches,
+            vec![vec![GameAction::Hold], vec![GameAction::Left]]
+        );
+    }
+
+    #[test]
+    fn non_hold_vs_route_skips_post_hold_split() {
+        let snapshot = vs_validation_snapshot();
+        let mut backend = RoutePhaseBackend::default();
+
+        execute_plan_until_hard_drop_with_vs_post_hold_delay(
+            &snapshot,
+            &mut backend,
+            &vs_route_plan(),
+            &HandlingConfig::default(),
+            runner_test_timings(),
+            60,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(backend.route_sequences, 1);
+        assert_eq!(backend.route_batches, vec![vec![GameAction::Left]]);
+    }
+
+    #[test]
+    fn solo_route_does_not_apply_vs_post_hold_split() {
+        let snapshot = runner_test_snapshot("browser-1-0", 0);
+        let mut backend = RoutePhaseBackend::default();
+
+        execute_plan_until_hard_drop_with_vs_post_hold_delay(
+            &snapshot,
+            &mut backend,
+            &vs_hold_route_plan(),
+            &HandlingConfig::default(),
+            runner_test_timings(),
+            60,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(backend.route_sequences, 1);
+        assert_eq!(
+            backend.route_batches,
+            vec![vec![GameAction::Hold, GameAction::Left]]
+        );
+    }
+
+    #[test]
+    fn movement_failure_after_hold_prevents_hard_drop_and_invalidates_round() {
+        let dir = temp_bridge_dir("vs-movement-after-hold-fail");
+        let bridge_path = dir.join("vs-ws-bridge.json");
+        write_runner_bridge(&bridge_path, "4382:2034120187", true, "[]");
+        let mut controller = VsSimulationController::with_settings(true, bridge_path);
+        let mut backend = RoutePhaseBackend {
+            fail_when_route_excludes_hold: true,
+            ..Default::default()
+        };
+        let snapshot = vs_validation_snapshot();
+
+        assert!(controller
+            .validate_route_preflight(&snapshot, &mut |_| {})
+            .unwrap());
+        let result = execute_plan_until_hard_drop_with_vs_post_hold_delay(
+            &snapshot,
+            &mut backend,
+            &vs_hold_route_plan(),
+            &HandlingConfig::default(),
+            runner_test_timings(),
+            0,
+            |_| {},
+        );
+        if result.is_err() {
+            controller.invalidate_current_round("input error before hard drop", &mut |_| {});
+        }
+
+        assert!(result.is_err());
+        assert_eq!(backend.route_sequences, 1);
         assert_eq!(backend.hard_drop_sequences, 0);
         assert!(controller.next_snapshot(&mut |_| {}).unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
