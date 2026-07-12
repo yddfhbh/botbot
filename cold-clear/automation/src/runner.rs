@@ -191,6 +191,17 @@ where
                             return Err(error).context("failed to execute bot move");
                         }
                         if prepared.execution_plan.hard_drop {
+                            if snapshot.source == "browser_ws_sim"
+                                && !vs_sim_controller.validate_pre_hard_drop(&snapshot, &mut log)?
+                            {
+                                log("[vs-sim] session invalidated".to_owned());
+                                vs_sim_controller.invalidate_current_round(
+                                    "pre-drop validation failed",
+                                    &mut log,
+                                );
+                                thread::sleep(poll_delay);
+                                continue;
+                            }
                             let hard_drop_decision = match maybe_finalize_hard_drop(
                                 config,
                                 &snapshot,
@@ -424,6 +435,9 @@ where
     D: InputBackend + ?Sized,
     F: FnMut(String),
 {
+    if !should_use_browser_pre_hard_drop_probe(snapshot) {
+        return Ok(HardDropDecision::Proceed);
+    }
     let Some(live_snapshot) = read_live_snapshot_for_correction(config, snapshot, log)? else {
         return Ok(HardDropDecision::Proceed);
     };
@@ -538,6 +552,10 @@ where
     }
 
     Ok(Some(live_snapshot))
+}
+
+fn should_use_browser_pre_hard_drop_probe(snapshot: &GameSnapshot) -> bool {
+    snapshot.source != "browser_ws_sim"
 }
 
 fn skip_snapshot_reason(
@@ -2563,6 +2581,17 @@ mod tests {
         );
         assert!(taps.load(AtomicOrdering::Relaxed) > 0);
         assert_eq!(sequences.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn browser_ws_sim_skips_browser_pre_hard_drop_probe() {
+        let mut snapshot = runner_test_snapshot("vs-4382-220638408-0", 0);
+        snapshot.source = "browser_ws_sim".to_owned();
+
+        assert!(!should_use_browser_pre_hard_drop_probe(&snapshot));
+        assert!(should_use_browser_pre_hard_drop_probe(
+            &runner_test_snapshot("browser-1-0", 0)
+        ));
     }
 
     #[test]

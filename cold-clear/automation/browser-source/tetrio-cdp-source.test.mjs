@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
@@ -168,6 +168,33 @@ test("VS WebSocket simulation disables browser seed fallback only when enabled",
     resolveUseSeedSimulationFallback(false, { FUSION_VS_WS_SIM: "1" }),
     false
   );
+});
+
+test("VS queue reference for seed 220638408 matches the Rust validation fixture", () => {
+  const source = readFileSync(
+    new URL("./tetrio-cdp-source.mjs", import.meta.url),
+    "utf8"
+  );
+  const createPrngSource = source.match(
+    /function createPrng\(seed\) \{[\s\S]*?\n\}/
+  )?.[0];
+  const generateQueueSource = source.match(
+    /function generate7BagQueue\(seed, count\) \{[\s\S]*?\n\}/
+  )?.[0];
+  assert.ok(createPrngSource);
+  assert.ok(generateQueueSource);
+
+  const queue = Array.from(vm.runInNewContext(
+    `${createPrngSource}\n${generateQueueSource}\ngenerate7BagQueue("220638408", 28)`,
+    { Math, Number }
+  ));
+
+  assert.deepEqual(queue, [
+    "i", "o", "z", "s", "t", "l", "j",
+    "t", "z", "s", "i", "j", "o", "l",
+    "i", "j", "s", "l", "t", "o", "z",
+    "z", "l", "o", "i", "s", "t", "j"
+  ]);
 });
 
 test("snapshot tokens and signatures include the game epoch", () => {

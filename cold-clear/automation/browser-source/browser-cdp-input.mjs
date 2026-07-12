@@ -31,6 +31,7 @@ async function main() {
   await waitForCdpReady(port);
   let cdp = await connectToTarget({ port, url, targetHint });
   const pressedKeys = new Set();
+  const focusLogState = createFocusLogState();
   writeResponse({ type: "ready", ok: true });
 
   const rl = readline.createInterface({
@@ -65,6 +66,7 @@ async function main() {
       url,
       targetHint,
       pressedKeys,
+      focusLogState,
       writeResponse
     });
   });
@@ -102,7 +104,15 @@ function keySpec(key, code, windowsVirtualKeyCode, text = "") {
 
 export async function handleMessage(
   message,
-  { cdp, port, url, targetHint, pressedKeys, writeResponse: sendResponse }
+  {
+    cdp,
+    port,
+    url,
+    targetHint,
+    pressedKeys,
+    focusLogState = createFocusLogState(),
+    writeResponse: sendResponse
+  }
 ) {
   const targetInfo = { port, url, targetHint };
   try {
@@ -120,6 +130,7 @@ export async function handleMessage(
     if (message.type === "tap") {
       const action = normalizeTapAction(message);
       cdp = await ensureConnected(cdp, targetInfo, pressedKeys);
+      await prepareInputTarget(cdp, focusLogState);
       await executeInputAction(cdp, action, targetInfo, (nextCdp) => {
         cdp = nextCdp;
       }, pressedKeys);
@@ -136,6 +147,7 @@ export async function handleMessage(
     if (message.type === "sequence") {
       const actions = normalizeSequenceActions(message.actions);
       cdp = await ensureConnected(cdp, targetInfo, pressedKeys);
+      await prepareInputTarget(cdp, focusLogState);
       await executeSequence(cdp, actions, targetInfo, (nextCdp) => {
         cdp = nextCdp;
       }, pressedKeys);
@@ -150,12 +162,14 @@ export async function handleMessage(
 
     return cdp;
   } catch (error) {
-    sendResponse({
+    const payload = {
       ok: false,
       id: message.id ?? null,
       type: message.type ?? "unknown",
-      error: error?.message ?? String(error)
-    });
+      error: error?.code ?? error?.message ?? String(error)
+    };
+    Object.assign(payload, error?.details ?? {});
+    sendResponse(payload);
     return cdp;
   }
 }
@@ -192,17 +206,102 @@ export function normalizeSequenceActions(actions) {
 }
 
 async function focusPage(cdp) {
-  await cdp.send("Runtime.evaluate", {
+  const result = await cdp.send("Runtime.evaluate", {
     expression: `(() => {
       window.focus();
       const active = document.activeElement;
       if (active && typeof active.blur === "function") active.blur();
       if (document.body && typeof document.body.focus === "function") document.body.focus();
-      return true;
+      const nextActive = document.activeElement;
+      return {
+        visibilityState: document.visibilityState ?? null,
+        activeTag: nextActive?.tagName ?? null,
+        contentEditable: Boolean(
+          nextActive?.isContentEditable ||
+          nextActive?.getAttribute?.("contenteditable") === "true"
+        )
+      };
     })()`,
     returnByValue: true,
     awaitPromise: true
   }).catch(() => undefined);
+  return result?.result?.value ?? {
+    visibilityState: null,
+    activeTag: null,
+    contentEditable: false
+  };
+}
+
+function createFocusLogState() {
+  return {
+    lastKey: ""
+  };
+}
+
+class InputCommandError extends Error {
+  constructor(code, details = {}) {
+    super(code);
+    this.code = code;
+    this.details = details;
+  }
+}
+
+async function prepareInputTarget(cdp, focusLogState) {
+  await cdp.send("Page.bringToFront");
+  const focusState = await focusPage(cdp);
+  const visibilityState = `${focusState?.visibilityState ?? ""}`;
+  const activeTag = `${focusState?.activeTag ?? ""}`.toUpperCase();
+  const isContentEditable = Boolean(focusState?.contentEditable);
+
+  if (visibilityState && visibilityState !== "visible") {
+    logFocusStateOnce(
+      focusLogState,
+      `hidden:${visibilityState}`,
+      `[input] blocked hidden page visibility=${visibilityState}`
+    );
+    throw new InputCommandError("page_not_visible", { visibilityState });
+  }
+
+  if (isUnsafeActiveElement(activeTag, isContentEditable)) {
+    const details = { activeTag: activeTag || "UNKNOWN" };
+    if (isContentEditable) {
+      details.contentEditable = true;
+    }
+    logFocusStateOnce(
+      focusLogState,
+      `unsafe:${details.activeTag}:${isContentEditable ? "contenteditable" : "plain"}`,
+      `[input] blocked unsafe active element tag=${details.activeTag}`
+    );
+    throw new InputCommandError("unsafe_active_element", details);
+  }
+
+  logFocusStateOnce(
+    focusLogState,
+    `safe:${activeTag || "NONE"}`,
+    `[input] focus prepared active=${activeTag || "NONE"}`
+  );
+}
+
+function isUnsafeActiveElement(activeTag, isContentEditable) {
+  if (isContentEditable) {
+    return true;
+  }
+  return (
+    activeTag === "INPUT" ||
+    activeTag === "TEXTAREA" ||
+    activeTag === "SELECT" ||
+    activeTag === "BUTTON" ||
+    activeTag === "A" ||
+    activeTag === "IFRAME"
+  );
+}
+
+function logFocusStateOnce(focusLogState, nextKey, message) {
+  if (!focusLogState || focusLogState.lastKey === nextKey) {
+    return;
+  }
+  focusLogState.lastKey = nextKey;
+  console.log(message);
 }
 
 async function dispatchKey(cdp, spec, type) {

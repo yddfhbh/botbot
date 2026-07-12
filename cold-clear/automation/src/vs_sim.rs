@@ -12,13 +12,19 @@ use serde_json::Value;
 use crate::scanner::{GameSnapshot, PieceToken};
 
 const DEFAULT_NEXT_COUNT: usize = 6;
+const DEFAULT_VALIDATION_MAX_PIECES: usize = 10;
+const POST_COUNTDOWN_FOCUS_GRACE_MS: u64 = 500;
+const POST_DROP_SETTLE_MS: u64 = 80;
+const MAX_BRIDGE_AGE_MS: u64 = 10_000;
 const VS_WS_SIM_ENV: &str = "FUSION_VS_WS_SIM";
+const VS_WS_SIM_MAX_PIECES_ENV: &str = "FUSION_VS_WS_SIM_MAX_PIECES";
 
 pub struct VsSimulationController {
     enabled: bool,
     bridge_path: PathBuf,
     session: Option<VsSimulationSession>,
     blocked_round_id: Option<String>,
+    max_pieces: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -28,10 +34,15 @@ struct VsSimulationSession {
     seed: String,
     next_count: usize,
     ready_at_ms: u64,
+    captured_at_ms: u64,
     last_bridge_sequence: u64,
     board: Board,
     hold: Option<Piece>,
     piece_index: usize,
+    processed_pieces: usize,
+    next_snapshot_ready_at_ms: u64,
+    paused_pending_verification: bool,
+    logged_focus_grace_wait: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,11 +99,16 @@ impl VsSimulationController {
     }
 
     pub fn with_settings(enabled: bool, bridge_path: PathBuf) -> Self {
+        Self::with_validation_limit(enabled, bridge_path, resolve_max_piece_limit())
+    }
+
+    pub fn with_validation_limit(enabled: bool, bridge_path: PathBuf, max_pieces: usize) -> Self {
         Self {
             enabled,
             bridge_path,
             session: None,
             blocked_round_id: None,
+            max_pieces,
         }
     }
 
@@ -128,11 +144,80 @@ impl VsSimulationController {
         let Some(session) = &self.session else {
             return Ok(None);
         };
-        if current_time_ms() < session.ready_at_ms {
+        let now = current_time_ms();
+        if session.paused_pending_verification {
+            return Ok(None);
+        }
+        if session.piece_index == 0 && now < session.ready_at_ms {
+            if let Some(session) = self.session.as_mut() {
+                if !session.logged_focus_grace_wait {
+                    log(format!(
+                        "[vs-sim] waiting post-countdown focus grace {}ms",
+                        POST_COUNTDOWN_FOCUS_GRACE_MS
+                    ));
+                    session.logged_focus_grace_wait = true;
+                }
+            }
+            return Ok(None);
+        }
+        if now < session.next_snapshot_ready_at_ms {
             return Ok(None);
         }
 
         Ok(Some(session.snapshot()?))
+    }
+
+    pub fn validate_pre_hard_drop<F>(
+        &mut self,
+        snapshot: &GameSnapshot,
+        log: &mut F,
+    ) -> Result<bool>
+    where
+        F: FnMut(String),
+    {
+        if !self.enabled || snapshot.source != "browser_ws_sim" {
+            return Ok(true);
+        }
+
+        let Some(bridge) = read_bridge_wire(&self.bridge_path)? else {
+            log("[vs-sim] pre-drop validation failed reason=bridge_unavailable".to_owned());
+            return Ok(false);
+        };
+        self.sync_bridge(bridge, log)?;
+
+        let Some(session) = &self.session else {
+            log("[vs-sim] pre-drop validation failed reason=session_missing".to_owned());
+            return Ok(false);
+        };
+        if session.paused_pending_verification {
+            log("[vs-sim] pre-drop validation failed reason=validation_paused".to_owned());
+            return Ok(false);
+        }
+        if snapshot.token != session.token() {
+            log(format!(
+                "[vs-sim] pre-drop validation failed reason=token_mismatch expected={} actual={}",
+                snapshot.token,
+                session.token()
+            ));
+            return Ok(false);
+        }
+        if snapshot.piece_counter != Some(session.piece_index as u32) {
+            log(format!(
+                "[vs-sim] pre-drop validation failed reason=piece_index_mismatch expected={} actual={}",
+                snapshot.piece_counter.unwrap_or_default(),
+                session.piece_index
+            ));
+            return Ok(false);
+        }
+        let bridge_age_ms = current_time_ms().saturating_sub(session.captured_at_ms);
+        if bridge_age_ms > MAX_BRIDGE_AGE_MS {
+            log(format!(
+                "[vs-sim] pre-drop validation failed reason=bridge_stale age_ms={bridge_age_ms}"
+            ));
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 
     pub fn commit_hard_drop<F>(
@@ -182,6 +267,16 @@ impl VsSimulationController {
 
         session.hold = execution.next_hold;
         session.piece_index = execution.next_piece_index;
+        session.processed_pieces = session.processed_pieces.saturating_add(1);
+        session.next_snapshot_ready_at_ms = current_time_ms().saturating_add(POST_DROP_SETTLE_MS);
+        if self.max_pieces > 0 && session.processed_pieces >= self.max_pieces {
+            session.paused_pending_verification = true;
+            log(format!(
+                "[vs-sim] validation piece limit reached count={}",
+                session.processed_pieces
+            ));
+            log("[vs-sim] paused pending verification".to_owned());
+        }
         Ok(())
     }
 
@@ -239,10 +334,14 @@ impl VsSimulationController {
         match &mut self.session {
             Some(session) if session.round_id == bridge.round_id => {
                 session.ready_at_ms = bridge.ready_at;
+                session.captured_at_ms = bridge.captured_at;
                 session.last_bridge_sequence = bridge.sequence;
             }
             _ => {
-                self.session = Some(VsSimulationSession::from_bridge(&bridge)?);
+                let session = VsSimulationSession::from_bridge(&bridge)?;
+                let first14 = generated_sequence_labels(&session.seed, 14)?;
+                log(format!("[vs-sim] generated queue first14={first14}"));
+                self.session = Some(session);
             }
         }
 
@@ -268,11 +367,18 @@ impl VsSimulationSession {
             local_game_id,
             seed,
             next_count,
-            ready_at_ms: bridge.ready_at,
+            ready_at_ms: bridge
+                .ready_at
+                .saturating_add(POST_COUNTDOWN_FOCUS_GRACE_MS),
+            captured_at_ms: bridge.captured_at,
             last_bridge_sequence: bridge.sequence,
             board: Board::new(),
             hold: None,
             piece_index: 0,
+            processed_pieces: 0,
+            next_snapshot_ready_at_ms: 0,
+            paused_pending_verification: false,
+            logged_focus_grace_wait: false,
         })
     }
 
@@ -445,6 +551,29 @@ fn generate_piece_sequence(seed: &str, count: usize) -> Result<Vec<Piece>> {
     Ok(out)
 }
 
+fn generated_sequence_labels(seed: &str, count: usize) -> Result<String> {
+    Ok(generate_piece_sequence(seed, count)?
+        .into_iter()
+        .map(|piece| match piece {
+            Piece::I => "I",
+            Piece::O => "O",
+            Piece::T => "T",
+            Piece::L => "L",
+            Piece::J => "J",
+            Piece::S => "S",
+            Piece::Z => "Z",
+        })
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+fn resolve_max_piece_limit() -> usize {
+    std::env::var(VS_WS_SIM_MAX_PIECES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_VALIDATION_MAX_PIECES)
+}
+
 struct ParkMiller {
     value: i64,
 }
@@ -501,13 +630,14 @@ mod tests {
         ready_at: u64,
         incoming_garbage: &str,
     ) -> String {
+        let captured_at = current_time_ms();
         format!(
             r#"{{
   "version": 1,
   "sequence": {sequence},
   "roundId": "{round_id}",
   "active": true,
-  "capturedAt": 1000,
+  "capturedAt": {captured_at},
   "readyAt": {ready_at},
   "local": {{
     "username": "hebi_",
@@ -607,6 +737,9 @@ mod tests {
         controller
             .commit_hard_drop(&before, &simple_lock_move(Piece::O), &mut |_| {})
             .unwrap();
+        if let Some(session) = controller.session.as_mut() {
+            session.next_snapshot_ready_at_ms = 0;
+        }
 
         let after = controller
             .next_snapshot(&mut |_| {})
@@ -632,6 +765,9 @@ mod tests {
         controller
             .commit_hard_drop(&snapshot, &move_after_hold, &mut |_| {})
             .unwrap();
+        if let Some(session) = controller.session.as_mut() {
+            session.next_snapshot_ready_at_ms = 0;
+        }
 
         let next = controller
             .next_snapshot(&mut |_| {})
@@ -657,6 +793,9 @@ mod tests {
         controller
             .commit_hard_drop(&snapshot, &first_hold_move, &mut |_| {})
             .unwrap();
+        if let Some(session) = controller.session.as_mut() {
+            session.next_snapshot_ready_at_ms = 0;
+        }
 
         let swapped_snapshot = controller
             .next_snapshot(&mut |_| {})
@@ -667,6 +806,9 @@ mod tests {
         controller
             .commit_hard_drop(&swapped_snapshot, &second_hold_move, &mut |_| {})
             .unwrap();
+        if let Some(session) = controller.session.as_mut() {
+            session.next_snapshot_ready_at_ms = 0;
+        }
 
         let next = controller
             .next_snapshot(&mut |_| {})
@@ -761,6 +903,108 @@ mod tests {
 
         assert_eq!(snapshot.source, "browser_ws_sim");
         assert!(fallback.is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn generated_queue_matches_js_reference_for_seed_220638408() {
+        let sequence = generate_piece_sequence("220638408", 28).unwrap();
+        let labels = sequence
+            .into_iter()
+            .map(|piece| match piece {
+                Piece::I => "I",
+                Piece::O => "O",
+                Piece::T => "T",
+                Piece::L => "L",
+                Piece::J => "J",
+                Piece::S => "S",
+                Piece::Z => "Z",
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec![
+                "I", "O", "Z", "S", "T", "L", "J", "T", "Z", "S", "I", "J", "O", "L", "I", "J",
+                "S", "L", "T", "O", "Z", "Z", "L", "O", "I", "S", "T", "J"
+            ]
+        );
+    }
+
+    #[test]
+    fn pre_drop_validation_rejects_token_mismatch() {
+        let path = temp_bridge_path("vs-sim-pre-drop-token");
+        write_ready_bridge(&path, "4382:2034120187", 1);
+        let mut controller = VsSimulationController::with_settings(true, path.clone());
+        let mut logs = Vec::new();
+        let snapshot = controller
+            .next_snapshot(&mut |_| {})
+            .unwrap()
+            .expect("simulated snapshot");
+        let mut mismatched = snapshot.clone();
+        mismatched.token = "browser-1-1008".to_owned();
+
+        let valid = controller
+            .validate_pre_hard_drop(&mismatched, &mut |line| logs.push(line))
+            .unwrap();
+
+        assert!(!valid);
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("reason=token_mismatch")));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn first_snapshot_waits_for_post_countdown_focus_grace() {
+        let path = temp_bridge_path("vs-sim-focus-grace");
+        let ready_at = current_time_ms().saturating_add(250);
+        write_bridge(&path, &sample_bridge("4382:2034120187", 1, ready_at, "[]"));
+        let mut logs = Vec::new();
+        let mut controller = VsSimulationController::with_settings(true, path.clone());
+
+        let snapshot = controller
+            .next_snapshot(&mut |line| logs.push(line))
+            .unwrap();
+
+        assert!(snapshot.is_none());
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("waiting post-countdown focus grace 500ms")));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_piece_limit_pauses_after_ten_commits() {
+        let path = temp_bridge_path("vs-sim-piece-limit");
+        write_ready_bridge(&path, "4382:2034120187", 1);
+        let mut logs = Vec::new();
+        let mut controller = VsSimulationController::with_validation_limit(true, path.clone(), 10);
+
+        for _ in 0..10 {
+            let snapshot = controller
+                .next_snapshot(&mut |_| {})
+                .unwrap()
+                .expect("simulated snapshot");
+            controller
+                .commit_hard_drop(
+                    &snapshot,
+                    &simple_lock_move(snapshot.queue_pieces()[0]),
+                    &mut |line| logs.push(line),
+                )
+                .unwrap();
+            if let Some(session) = controller.session.as_mut() {
+                session.next_snapshot_ready_at_ms = 0;
+            }
+        }
+
+        assert!(controller.next_snapshot(&mut |_| {}).unwrap().is_none());
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("validation piece limit reached count=10")));
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("paused pending verification")));
         let _ = fs::remove_file(path);
     }
 }
