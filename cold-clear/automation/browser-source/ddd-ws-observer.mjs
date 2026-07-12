@@ -154,6 +154,12 @@ const GARBAGE_INTERACTION_DATA_KEYS = [
   "cid"
 ];
 
+function safeLog(log, message) {
+  try {
+    log?.(message);
+  } catch {}
+}
+
 export async function installDddWsObserver(
   cdp,
   {
@@ -165,17 +171,20 @@ export async function installDddWsObserver(
     vsBridgePath = DEFAULT_VS_BRIDGE_PATH
   } = {}
 ) {
+  const logger = (message) => safeLog(log, message);
+
   if (typeof unpack !== "function") {
-    log?.("[ws-observer] msgpackr unavailable; observer inactive");
+    safeLog(log, "[ws-observer] msgpackr unavailable; observer inactive");
     return () => {};
   }
 
   let vsBridge = null;
   if (vsSimEnabled) {
     try {
-      vsBridge = createVsBridgeState(vsBridgePath, log);
+      vsBridge = createVsBridgeState(vsBridgePath, logger);
     } catch (error) {
-      log?.(
+      safeLog(
+        log,
         `[vs-bridge] initialization failed: ${error?.message ?? String(error)}`
       );
     }
@@ -193,9 +202,10 @@ export async function installDddWsObserver(
   };
   if (traceEnabled) {
     try {
-      observerState.trace = createTraceRecorder(traceFilePath, log);
+      observerState.trace = createTraceRecorder(traceFilePath, logger);
     } catch (error) {
-      log?.(
+      safeLog(
+        log,
         `[ws-trace] disabled after initialization error: ${
           error?.message ?? String(error)
         }`
@@ -213,7 +223,7 @@ export async function installDddWsObserver(
         return;
       }
       observerState.requestUrls.set(requestId, url);
-      log?.(`[ws-observer] websocket opened host=${safeUrlHost(url)}`);
+      safeLog(log, `[ws-observer] websocket opened host=${safeUrlHost(url)}`);
     } catch {}
   });
 
@@ -222,7 +232,7 @@ export async function installDddWsObserver(
       if (event?.requestId) {
         observerState.requestUrls.delete(event.requestId);
       }
-      markVsBridgeInactive(observerState.vsBridge, log);
+      markVsBridgeInactive(observerState.vsBridge, logger);
     } catch {}
   });
 
@@ -260,7 +270,7 @@ export async function installDddWsObserver(
                 urlHost,
                 requestId: event?.requestId ?? null
               },
-              log
+              logger
             );
           } catch {}
         }
@@ -296,7 +306,7 @@ export async function installDddWsObserver(
                 urlHost,
                 requestId: event?.requestId ?? null
               },
-              log
+              logger
             );
           } catch {}
         }
@@ -306,12 +316,12 @@ export async function installDddWsObserver(
   });
 
   return () => {
-    markVsBridgeInactive(observerState.vsBridge, log);
+    markVsBridgeInactive(observerState.vsBridge, logger);
     offCreated();
     offClosed();
     offReceived();
     observerState.requestUrls.clear();
-    finalizeTrace(observerState, log);
+    finalizeTrace(observerState, logger);
   };
 }
 
@@ -532,31 +542,33 @@ function logCapturedCandidates(candidates, requestId, observerState, log) {
     observerState.lastOptionsSignature = signature;
     observerState.optionsCaptured += 1;
 
-    log?.("[ws-observer] game options captured");
+    safeLog(log, "[ws-observer] game options captured");
     if (requestId && observerState.requestUrls.has(requestId)) {
-      log?.(
+      safeLog(
+        log,
         `[ws-observer] url_host=${safeUrlHost(
           observerState.requestUrls.get(requestId)
         )}`
       );
     }
-    log?.(`[ws-observer] seed=${String(options.seed)}`);
-    log?.(`[ws-observer] bagtype=${String(options.bagtype)}`);
+    safeLog(log, `[ws-observer] seed=${String(options.seed)}`);
+    safeLog(log, `[ws-observer] bagtype=${String(options.bagtype)}`);
     if (Object.prototype.hasOwnProperty.call(options, "nextcount")) {
-      log?.(`[ws-observer] nextcount=${String(options.nextcount)}`);
+      safeLog(log, `[ws-observer] nextcount=${String(options.nextcount)}`);
     }
     if (
       Object.prototype.hasOwnProperty.call(options, "boardwidth") &&
       Object.prototype.hasOwnProperty.call(options, "boardheight")
     ) {
-      log?.(
+      safeLog(
+        log,
         `[ws-observer] board=${String(options.boardwidth)}x${String(
           options.boardheight
         )}`
       );
     }
     if (Object.prototype.hasOwnProperty.call(options, "gameid")) {
-      log?.(`[ws-observer] gameid=${String(options.gameid)}`);
+      safeLog(log, `[ws-observer] gameid=${String(options.gameid)}`);
     }
   }
 }
@@ -617,7 +629,7 @@ function createTraceRecorder(traceFilePath, log) {
   const filePath = path.resolve(traceFilePath);
   mkdirSync(path.dirname(filePath), { recursive: true });
   rmSync(filePath, { force: true });
-  log?.(`[ws-trace] recording ${traceFilePath.replace(/\\/g, "/")}`);
+  safeLog(log, `[ws-trace] recording ${traceFilePath.replace(/\\/g, "/")}`);
   return {
     filePath,
     displayPath: traceFilePath.replace(/\\/g, "/"),
@@ -1167,7 +1179,7 @@ function maybeRecordTraceCandidate(candidate, event, observerState, log) {
     !trace.firstKindsLogged.has(record.kind)
   ) {
     trace.firstKindsLogged.add(record.kind);
-    log?.(`[ws-trace] first ${record.kind} candidate`);
+    safeLog(log, `[ws-trace] first ${record.kind} candidate`);
   }
 }
 
@@ -1316,7 +1328,7 @@ function stopTraceRecording(trace, log) {
   }
   trace.stopped = true;
   trace.stopLogged = true;
-  log?.("[ws-trace] limit reached; recording stopped");
+  safeLog(log, "[ws-trace] limit reached; recording stopped");
 }
 
 function finalizeTrace(observerState, log) {
@@ -1324,7 +1336,8 @@ function finalizeTrace(observerState, log) {
   if (!trace) {
     return;
   }
-  log?.(
+  safeLog(
+    log,
     `[ws-trace] records=${trace.records} options=${trace.kindCounts.options ?? 0} identity=${trace.kindCounts.identity ?? 0} board=${trace.kindCounts.board ?? 0} replay=${trace.kindCounts.replay ?? 0} garbage=${trace.kindCounts.garbage ?? 0}`
   );
 }
