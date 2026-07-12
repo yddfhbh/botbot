@@ -9,6 +9,7 @@ import {
   buildSnapshotSignature,
   buildSnapshotToken,
   buildVsObjectSnapshotSignature,
+  captureVsLocalGameObjectFromPausedScope,
   clearSnapshotFile,
   createSnapshotTracking,
   createVsObjectTracking,
@@ -18,8 +19,10 @@ import {
   pausedFrameExposureExpression,
   processVsObjectDiagnostics,
   readTetrioState,
+  readVsLocalGameObjectFromCachedHandle,
   resolvePollMs,
   resolveUseSeedSimulationFallback,
+  resolveVsScopePauseBudgetMs,
   resetSnapshotTracking,
   resetVsObjectTracking,
   shouldAttemptClosureCapture,
@@ -148,6 +151,223 @@ function createReadStateCdp(values) {
   };
 }
 
+function createVsLocalGameObject({
+  gameid = "4412",
+  userid = "local-user",
+  username = "hebi_",
+  current = "t",
+  hold = "i",
+  queue = ["o", "s", "z"],
+  active = true
+} = {}) {
+  const board = createVsBoard(20);
+  board[19][4] = 1;
+  board[18][4] = 1;
+  return {
+    gameid,
+    userid,
+    username,
+    board,
+    current: { type: current },
+    hold,
+    queue,
+    active,
+    ejectState() {
+      return null;
+    },
+    ejectBoardState() {
+      return null;
+    }
+  };
+}
+
+function createMockVsScopeCdp(initialCallFrames = [], options = {}) {
+  const listeners = new Map();
+  const history = [];
+  const objectIds = new WeakMap();
+  const objectsById = new Map();
+  const invalidObjectIds = new Set();
+  let nextObjectId = 1;
+  let pausedCallFrames = initialCallFrames;
+  let pauseEventDelayMs = options.pauseEventDelayMs ?? 0;
+  let getPropertiesDelayMs = options.getPropertiesDelayMs ?? 0;
+  let getPropertiesErrorAtCall = options.getPropertiesErrorAtCall ?? null;
+  let resumeErrorsRemaining = options.resumeErrorsRemaining ?? 0;
+  let getPropertiesCalls = 0;
+
+  const ensureObjectId = (value) => {
+    if (!value || (typeof value !== "object" && typeof value !== "function")) {
+      return "";
+    }
+    const existing = objectIds.get(value);
+    if (existing) {
+      return existing;
+    }
+    const objectId = `mock-${nextObjectId++}`;
+    objectIds.set(value, objectId);
+    objectsById.set(objectId, value);
+    return objectId;
+  };
+
+  const toRemote = (value) => {
+    if (value === null) {
+      return { type: "object", subtype: "null", value: null };
+    }
+    const primitiveType = typeof value;
+    if (primitiveType === "string" || primitiveType === "number" || primitiveType === "boolean") {
+      return {
+        type: primitiveType,
+        value
+      };
+    }
+    if (primitiveType === "undefined") {
+      return { type: "undefined" };
+    }
+    if (primitiveType === "function") {
+      return {
+        type: "function",
+        className: value.name || "Function",
+        description: value.name || "Function",
+        objectId: ensureObjectId(value)
+      };
+    }
+    const objectId = ensureObjectId(value);
+    if (Array.isArray(value)) {
+      return {
+        type: "object",
+        subtype: "array",
+        className: "Array",
+        description: `Array(${value.length})`,
+        objectId
+      };
+    }
+    return {
+      type: "object",
+      className: value.constructor?.name || "Object",
+      description: value.constructor?.name || "Object",
+      objectId
+    };
+  };
+
+  const buildPausedEvent = () => ({
+    callFrames: pausedCallFrames.map((callFrame, frameIndex) => ({
+      callFrameId: `frame-${frameIndex}`,
+      functionName: callFrame.functionName ?? "",
+      scopeChain: (callFrame.scopeChain ?? []).map((scope, scopeIndex) => ({
+        type: scope.type,
+        object: {
+          ...toRemote(scope.object),
+          objectId: ensureObjectId(scope.object) || `scope-${frameIndex}-${scopeIndex}`
+        }
+      }))
+    }))
+  });
+
+  const emit = (method, params) => {
+    const handlers = listeners.get(method);
+    if (!handlers) {
+      return;
+    }
+    for (const handler of [...handlers]) {
+      handler(params);
+    }
+  };
+
+  return {
+    history,
+    setPausedCallFrames(callFrames) {
+      pausedCallFrames = callFrames;
+    },
+    setPauseEventDelayMs(delayMs) {
+      pauseEventDelayMs = delayMs;
+    },
+    setGetPropertiesDelayMs(delayMs) {
+      getPropertiesDelayMs = delayMs;
+    },
+    invalidateObjectId(objectId) {
+      invalidObjectIds.add(objectId);
+    },
+    on(method, handler) {
+      const handlers = listeners.get(method) ?? new Set();
+      handlers.add(handler);
+      listeners.set(method, handlers);
+    },
+    off(method, handler) {
+      const handlers = listeners.get(method);
+      if (!handlers) {
+        return;
+      }
+      handlers.delete(handler);
+      if (handlers.size === 0) {
+        listeners.delete(method);
+      }
+    },
+    waitForEvent(method, predicate = () => true, timeoutMs = 1000) {
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          cleanup();
+          reject(new Error(`Timed out waiting for CDP event ${method}`));
+        }, timeoutMs);
+        const handler = (params) => {
+          if (!predicate(params)) {
+            return;
+          }
+          cleanup();
+          resolve(params);
+        };
+        const cleanup = () => {
+          clearTimeout(timeout);
+          this.off(method, handler);
+        };
+        this.on(method, handler);
+      });
+    },
+    async send(method, params = {}) {
+      history.push({ method, params });
+      if (
+        method === "Debugger.enable" ||
+        method === "Debugger.disable"
+      ) {
+        return {};
+      }
+      if (method === "Debugger.resume") {
+        if (resumeErrorsRemaining > 0) {
+          resumeErrorsRemaining -= 1;
+          throw new Error("Debugger is not paused");
+        }
+        return {};
+      }
+      if (method === "Debugger.pause") {
+        setTimeout(() => emit("Debugger.paused", buildPausedEvent()), pauseEventDelayMs);
+        return {};
+      }
+      if (method === "Runtime.getProperties") {
+        getPropertiesCalls += 1;
+        if (getPropertiesDelayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, getPropertiesDelayMs));
+        }
+        if (getPropertiesErrorAtCall !== null && getPropertiesCalls >= getPropertiesErrorAtCall) {
+          throw new Error("mock getProperties failure");
+        }
+        const target = objectsById.get(params.objectId);
+        if (!target || invalidObjectIds.has(params.objectId)) {
+          throw new Error("Cannot find object with given id");
+        }
+        const descriptors = Object.getOwnPropertyDescriptors(target);
+        return {
+          result: Object.entries(descriptors).map(([name, descriptor]) => ({
+            name,
+            value: Object.hasOwn(descriptor, "value")
+              ? toRemote(descriptor.value)
+              : undefined
+          }))
+        };
+      }
+      throw new Error(`Unhandled CDP method ${method}`);
+    }
+  };
+}
+
 test("game ended handling is triggered only once per ended session", () => {
   const endedState = {
     ok: true,
@@ -207,6 +427,14 @@ test("VS sim env detection only enables suppression for env value 1", () => {
   assert.equal(isVsWsSimEnvEnabled({}), false);
   assert.equal(isVsWsSimEnvEnabled({ FUSION_VS_WS_SIM: "0" }), false);
   assert.equal(isVsWsSimEnvEnabled({ FUSION_VS_WS_SIM: "1" }), true);
+});
+
+test("VS paused-scope pause budget falls back to 120ms outside the allowed range", () => {
+  assert.equal(resolveVsScopePauseBudgetMs("50"), 50);
+  assert.equal(resolveVsScopePauseBudgetMs("500"), 500);
+  assert.equal(resolveVsScopePauseBudgetMs("49"), 120);
+  assert.equal(resolveVsScopePauseBudgetMs("501"), 120);
+  assert.equal(resolveVsScopePauseBudgetMs("abc"), 120);
 });
 
 test("closure capture probe is attempted when VS sim is off and cooldown elapsed", () => {
@@ -370,7 +598,20 @@ test("resetVsObjectTracking clears VS diagnostic state", () => {
     lastSnapshotSignature: "",
     lastCandidateLogSignature: "",
     lastNotFoundRoundId: "",
-    lastActiveRoundId: ""
+    lastActiveRoundId: "",
+    cachedObjectId: "",
+    cachedPath: "",
+    cachedScore: 0,
+    scopeAttempts: 0,
+    nextScopeAttemptAt: 0,
+    scopeCaptureLocked: false,
+    scopeFailureLogged: false,
+    scopeCaptureInFlight: false,
+    scopeStats: {
+      framesScanned: 0,
+      scopesScanned: 0,
+      objectsScanned: 0
+    }
   });
 });
 
@@ -590,6 +831,658 @@ test("VS object diagnostics keep live snapshot empty when no local object is fou
   assert.equal(existsSync(liveSnapshotPath), false);
   assert.equal(existsSync(vsObjectSnapshotPath), false);
   assert.deepEqual(logs, ["[vs-object] local game object not found"]);
+});
+
+test("VS paused scope capture selects a local-scope candidate with obfuscated variable names", async () => {
+  const localGame = createVsLocalGameObject();
+  const cdp = createMockVsScopeCdp([
+    {
+      functionName: "tick",
+      scopeChain: [
+        {
+          type: "local",
+          object: {
+            x9$: {
+              zz_game: localGame
+            }
+          }
+        }
+      ]
+    }
+  ]);
+  const logs = [];
+
+  const capture = await captureVsLocalGameObjectFromPausedScope(cdp, {
+    roundId: "4412:384296123",
+    identity: {
+      gameid: "4412",
+      userid: "local-user",
+      username: "hebi_"
+    },
+    log: (line) => logs.push(line)
+  });
+
+  assert.equal(capture.ok, true);
+  assert.equal(capture.candidate.scopeType, "local");
+  assert.match(capture.candidate.variablePath, /x9\$\.zz_game/);
+  assert.ok(logs.includes("[vs-scope] local game object captured"));
+  assert.equal(cdp.history.filter((entry) => entry.method === "Debugger.resume").length, 1);
+});
+
+test("VS paused scope capture falls back to closure scope when local scope has no game", async () => {
+  const localGame = createVsLocalGameObject();
+  const cdp = createMockVsScopeCdp([
+    {
+      functionName: "raf",
+      scopeChain: [
+        {
+          type: "local",
+          object: {
+            somethingElse: { value: 1 }
+          }
+        },
+        {
+          type: "closure",
+          object: {
+            q: localGame
+          }
+        }
+      ]
+    }
+  ]);
+
+  const capture = await captureVsLocalGameObjectFromPausedScope(cdp, {
+    roundId: "4412:384296123",
+    identity: {
+      gameid: "4412",
+      userid: "local-user",
+      username: "hebi_"
+    }
+  });
+
+  assert.equal(capture.ok, true);
+  assert.equal(capture.candidate.scopeType, "closure");
+});
+
+test("VS paused scope capture excludes opponent game objects and prefers the local gameid", async () => {
+  const opponentGame = createVsLocalGameObject({
+    gameid: "9999",
+    userid: "other-user",
+    username: "enemy_",
+    current: "o"
+  });
+  const localGame = createVsLocalGameObject({
+    gameid: "4412",
+    userid: "local-user",
+    username: "hebi_",
+    current: "t"
+  });
+  const cdp = createMockVsScopeCdp([
+    {
+      functionName: "update",
+      scopeChain: [
+        {
+          type: "local",
+          object: {
+            enemy: opponentGame,
+            mine: localGame
+          }
+        }
+      ]
+    }
+  ]);
+
+  const capture = await captureVsLocalGameObjectFromPausedScope(cdp, {
+    roundId: "4412:384296123",
+    identity: {
+      gameid: "4412",
+      userid: "local-user",
+      username: "hebi_"
+    }
+  });
+
+  assert.equal(capture.ok, true);
+  assert.equal(capture.candidate.gameid, "4412");
+  assert.equal(capture.candidate.current, "t");
+});
+
+test("VS paused scope capture rejects opponent-only candidates and still resumes the debugger", async () => {
+  const opponentGame = createVsLocalGameObject({
+    gameid: "9999",
+    userid: "other-user",
+    username: "enemy_"
+  });
+  const cdp = createMockVsScopeCdp([
+    {
+      functionName: "update",
+      scopeChain: [
+        {
+          type: "local",
+          object: {
+            enemy: opponentGame
+          }
+        }
+      ]
+    }
+  ]);
+
+  const capture = await captureVsLocalGameObjectFromPausedScope(cdp, {
+    roundId: "4412:384296123",
+    identity: {
+      gameid: "4412",
+      userid: "local-user",
+      username: "hebi_"
+    }
+  });
+
+  assert.equal(capture.ok, false);
+  assert.equal(cdp.history.filter((entry) => entry.method === "Debugger.resume").length, 1);
+});
+
+test("VS paused scope capture resumes within the pause budget when scope scanning times out", async () => {
+  const localGame = createVsLocalGameObject();
+  const cdp = createMockVsScopeCdp(
+    [
+      {
+        functionName: "tick",
+        scopeChain: [{ type: "local", object: { p: localGame } }]
+      }
+    ],
+    {
+      getPropertiesDelayMs: 80
+    }
+  );
+  const logs = [];
+
+  const capture = await captureVsLocalGameObjectFromPausedScope(cdp, {
+    roundId: "4412:budget",
+    identity: {
+      gameid: "4412",
+      userid: "local-user",
+      username: "hebi_"
+    },
+    pauseBudgetMs: 50,
+    log: (line) => logs.push(line)
+  });
+
+  assert.equal(capture.ok, false);
+  assert.equal(capture.timedOut, true);
+  assert.ok(logs.some((line) => line.startsWith("[vs-scope] scan timed out budget_ms=50 objects_scanned=")));
+  const watchdogLog = logs.find((line) => line.startsWith("[vs-scope] resume watchdog fired elapsed_ms="));
+  const resumedLog = logs.find((line) => line.startsWith("[vs-scope] pause resumed elapsed_ms="));
+  assert.ok(watchdogLog);
+  assert.ok(resumedLog);
+  assert.ok(Number.parseInt(watchdogLog.split("=").pop(), 10) <= 50);
+  assert.ok(Number.parseInt(resumedLog.split("=").pop(), 10) <= 50);
+  assert.equal(cdp.history.filter((entry) => entry.method === "Debugger.resume").length, 1);
+  assert.equal(cdp.history.some((entry) => entry.method.startsWith("Input.")), false);
+});
+
+test("VS paused scope capture resumes on getProperties errors", async () => {
+  const localGame = createVsLocalGameObject();
+  const cdp = createMockVsScopeCdp(
+    [
+      {
+        functionName: "tick",
+        scopeChain: [{ type: "local", object: { p: localGame } }]
+      }
+    ],
+    {
+      getPropertiesErrorAtCall: 1
+    }
+  );
+
+  const capture = await captureVsLocalGameObjectFromPausedScope(cdp, {
+    roundId: "4412:error",
+    identity: {
+      gameid: "4412",
+      userid: "local-user",
+      username: "hebi_"
+    },
+    pauseBudgetMs: 50
+  });
+
+  assert.equal(capture.ok, false);
+  assert.match(capture.reason, /mock getProperties failure/);
+  assert.equal(cdp.history.filter((entry) => entry.method === "Debugger.resume").length, 1);
+});
+
+test("VS paused scope capture resumes when the round changes during scanning", async () => {
+  const localGame = createVsLocalGameObject();
+  const cdp = createMockVsScopeCdp(
+    [
+      {
+        functionName: "tick",
+        scopeChain: [{ type: "local", object: { p: localGame } }]
+      }
+    ],
+    {
+      getPropertiesDelayMs: 80
+    }
+  );
+  let active = true;
+  setTimeout(() => {
+    active = false;
+  }, 15);
+
+  const capture = await captureVsLocalGameObjectFromPausedScope(cdp, {
+    roundId: "4412:round-change",
+    identity: {
+      gameid: "4412",
+      userid: "local-user",
+      username: "hebi_"
+    },
+    pauseBudgetMs: 50,
+    getVsRoundStatus: () => ({
+      active,
+      roundId: active ? "4412:round-change" : "5500:next"
+    })
+  });
+
+  assert.equal(capture.ok, false);
+  assert.equal(capture.cancelled, true);
+  assert.equal(cdp.history.filter((entry) => entry.method === "Debugger.resume").length, 1);
+});
+
+test("VS paused scope capture resumes when VS becomes inactive during scanning", async () => {
+  const localGame = createVsLocalGameObject();
+  const cdp = createMockVsScopeCdp(
+    [
+      {
+        functionName: "tick",
+        scopeChain: [{ type: "local", object: { p: localGame } }]
+      }
+    ],
+    {
+      getPropertiesDelayMs: 80
+    }
+  );
+  let active = true;
+  setTimeout(() => {
+    active = false;
+  }, 15);
+
+  const capture = await captureVsLocalGameObjectFromPausedScope(cdp, {
+    roundId: "4412:inactive",
+    identity: {
+      gameid: "4412",
+      userid: "local-user",
+      username: "hebi_"
+    },
+    pauseBudgetMs: 50,
+    getVsRoundStatus: () => ({
+      active,
+      roundId: "4412:inactive"
+    })
+  });
+
+  assert.equal(capture.ok, false);
+  assert.equal(capture.cancelled, true);
+  assert.equal(cdp.history.filter((entry) => entry.method === "Debugger.resume").length, 1);
+});
+
+test("VS paused scope capture stays safe when watchdog and finally overlap", async () => {
+  const localGame = createVsLocalGameObject();
+  const cdp = createMockVsScopeCdp(
+    [
+      {
+        functionName: "tick",
+        scopeChain: [{ type: "local", object: { p: localGame } }]
+      }
+    ],
+    {
+      getPropertiesDelayMs: 80,
+      resumeErrorsRemaining: 1
+    }
+  );
+
+  const capture = await captureVsLocalGameObjectFromPausedScope(cdp, {
+    roundId: "4412:watchdog-race",
+    identity: {
+      gameid: "4412",
+      userid: "local-user",
+      username: "hebi_"
+    },
+    pauseBudgetMs: 50
+  });
+
+  assert.equal(capture.ok, false);
+  assert.equal(capture.timedOut, true);
+  assert.ok(cdp.history.filter((entry) => entry.method === "Debugger.resume").length >= 1);
+});
+
+test("VS diagnostics caches paused-scope object handles and stops pausing after capture", async () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "vs-scope-cached-"));
+  const liveSnapshotPath = path.join(tempDir, "live-snapshot.json");
+  const vsObjectSnapshotPath = path.join(tempDir, "vs-object-snapshot.json");
+  const tracking = createVsObjectTracking();
+  const localGame = createVsLocalGameObject();
+  const cdp = createMockVsScopeCdp([
+    {
+      functionName: "tick",
+      scopeChain: [
+        {
+          type: "local",
+          object: {
+            p: localGame
+          }
+        }
+      ]
+    }
+  ]);
+
+  const first = await processVsObjectDiagnostics(cdp, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "4412:384296123",
+      localGameId: "4412",
+      localUserId: "local-user",
+      localUsername: "hebi_"
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    nowFn: () => 0,
+    readVsObjectStateFn: async () => ({
+      ok: false,
+      reason: "window graph miss"
+    })
+  });
+  const second = await processVsObjectDiagnostics(cdp, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "4412:384296123",
+      localGameId: "4412",
+      localUserId: "local-user",
+      localUsername: "hebi_"
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    nowFn: () => 250,
+    readVsObjectStateFn: async () => ({
+      ok: false,
+      reason: "window graph miss"
+    })
+  });
+  const third = await processVsObjectDiagnostics(cdp, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "4412:384296123",
+      localGameId: "4412",
+      localUserId: "local-user",
+      localUsername: "hebi_"
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    nowFn: () => 400,
+    readVsObjectStateFn: async () => ({
+      ok: false,
+      reason: "window graph miss"
+    })
+  });
+
+  assert.equal(first.found, false);
+  assert.equal(second.found, true);
+  assert.equal(third.found, true);
+  assert.equal(cdp.history.filter((entry) => entry.method === "Debugger.pause").length, 1);
+  assert.equal(cdp.history.some((entry) => entry.method.startsWith("Input.")), false);
+  const snapshot = JSON.parse(readFileSync(vsObjectSnapshotPath, "utf8"));
+  assert.equal(snapshot.source, "paused_scope");
+  assert.equal(snapshot.localGameId, "4412");
+  assert.equal(existsSync(liveSnapshotPath), false);
+});
+
+test("VS diagnostics discard cached objectIds on round change and capture again for the new round", async () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "vs-scope-round-reset-"));
+  const liveSnapshotPath = path.join(tempDir, "live-snapshot.json");
+  const vsObjectSnapshotPath = path.join(tempDir, "vs-object-snapshot.json");
+  const tracking = createVsObjectTracking();
+  const roundOneGame = createVsLocalGameObject({ gameid: "4412", current: "t" });
+  const roundTwoGame = createVsLocalGameObject({ gameid: "5500", current: "s" });
+  const cdp = createMockVsScopeCdp([
+    {
+      functionName: "tick",
+      scopeChain: [{ type: "local", object: { p: roundOneGame } }]
+    }
+  ]);
+
+  await processVsObjectDiagnostics(cdp, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "4412:1",
+      localGameId: "4412",
+      localUserId: "local-user",
+      localUsername: "hebi_"
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    nowFn: () => 0,
+    readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" })
+  });
+  await processVsObjectDiagnostics(cdp, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "4412:1",
+      localGameId: "4412",
+      localUserId: "local-user",
+      localUsername: "hebi_"
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    nowFn: () => 250,
+    readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" })
+  });
+
+  const firstObjectId = tracking.cachedObjectId;
+  cdp.setPausedCallFrames([
+    {
+      functionName: "tick",
+      scopeChain: [{ type: "local", object: { p: roundTwoGame } }]
+    }
+  ]);
+
+  await processVsObjectDiagnostics(cdp, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "5500:2",
+      localGameId: "5500",
+      localUserId: "local-user",
+      localUsername: "hebi_"
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    nowFn: () => 1000,
+    readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" })
+  });
+  assert.equal(tracking.cachedObjectId, "");
+
+  await processVsObjectDiagnostics(cdp, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "5500:2",
+      localGameId: "5500",
+      localUserId: "local-user",
+      localUsername: "hebi_"
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    nowFn: () => 1300,
+    readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" })
+  });
+
+  assert.notEqual(tracking.cachedObjectId, "");
+  assert.notEqual(tracking.cachedObjectId, firstObjectId);
+  assert.equal(cdp.history.filter((entry) => entry.method === "Debugger.pause").length, 2);
+});
+
+test("VS diagnostics wait for the next round after an invalid cached objectId", async () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "vs-scope-invalid-object-"));
+  const liveSnapshotPath = path.join(tempDir, "live-snapshot.json");
+  const vsObjectSnapshotPath = path.join(tempDir, "vs-object-snapshot.json");
+  const tracking = createVsObjectTracking();
+  const localGame = createVsLocalGameObject();
+  const cdp = createMockVsScopeCdp([
+    {
+      functionName: "tick",
+      scopeChain: [{ type: "local", object: { p: localGame } }]
+    }
+  ]);
+
+  await processVsObjectDiagnostics(cdp, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "4412:1",
+      localGameId: "4412",
+      localUserId: "local-user",
+      localUsername: "hebi_"
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    nowFn: () => 0,
+    readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" })
+  });
+  await processVsObjectDiagnostics(cdp, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "4412:1",
+      localGameId: "4412",
+      localUserId: "local-user",
+      localUsername: "hebi_"
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    nowFn: () => 250,
+    readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" })
+  });
+
+  const pauseCount = cdp.history.filter((entry) => entry.method === "Debugger.pause").length;
+  cdp.invalidateObjectId(tracking.cachedObjectId);
+
+  const invalidRead = await processVsObjectDiagnostics(cdp, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "4412:1",
+      localGameId: "4412",
+      localUserId: "local-user",
+      localUsername: "hebi_"
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    nowFn: () => 500,
+    readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" })
+  });
+  const sameRoundRetry = await processVsObjectDiagnostics(cdp, {
+    vsRoundStatus: {
+      active: true,
+      roundId: "4412:1",
+      localGameId: "4412",
+      localUserId: "local-user",
+      localUsername: "hebi_"
+    },
+    tracking,
+    liveSnapshotPath,
+    vsObjectSnapshotPath,
+    scopeTraceEnabled: true,
+    nowFn: () => 900,
+    readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" })
+  });
+
+  assert.equal(invalidRead.found, false);
+  assert.equal(sameRoundRetry.found, false);
+  assert.equal(tracking.cachedObjectId, "");
+  assert.equal(cdp.history.filter((entry) => entry.method === "Debugger.pause").length, pauseCount);
+});
+
+test("VS diagnostics stop after three paused-scope attempts and log the final failure once", async () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "vs-scope-max-attempts-"));
+  const liveSnapshotPath = path.join(tempDir, "live-snapshot.json");
+  const vsObjectSnapshotPath = path.join(tempDir, "vs-object-snapshot.json");
+  const tracking = createVsObjectTracking();
+  const logs = [];
+  let attempts = 0;
+
+  for (const now of [0, 200, 700, 1200, 1700]) {
+    await processVsObjectDiagnostics(null, {
+      vsRoundStatus: {
+        active: true,
+        roundId: "4412:1",
+        localGameId: "4412",
+        localUserId: "local-user",
+        localUsername: "hebi_"
+      },
+      tracking,
+      liveSnapshotPath,
+      vsObjectSnapshotPath,
+      scopeTraceEnabled: true,
+      nowFn: () => now,
+      log: (line) => logs.push(line),
+      readVsObjectStateFn: async () => ({ ok: false, reason: "window graph miss" }),
+      captureVsObjectFromPausedScopeFn: async () => {
+        attempts += 1;
+        return {
+          ok: false,
+          reason: "not found",
+          stats: {
+            framesScanned: 2,
+            scopesScanned: 3,
+            objectsScanned: 4
+          }
+        };
+      }
+    });
+  }
+
+  assert.equal(attempts, 3);
+  assert.equal(
+    logs.filter((line) => line === "[vs-scope] local game object not found").length,
+    1
+  );
+});
+
+test("cached VS object handles can be read back without another pause", async () => {
+  const game = createVsLocalGameObject({ current: "l", hold: "o", queue: ["i", "t"] });
+  const cdp = createMockVsScopeCdp([
+    {
+      functionName: "tick",
+      scopeChain: [{ type: "local", object: { p: game } }]
+    }
+  ]);
+
+  const capture = await captureVsLocalGameObjectFromPausedScope(cdp, {
+    roundId: "4412:1",
+    identity: {
+      gameid: "4412",
+      userid: "local-user",
+      username: "hebi_"
+    }
+  });
+  const cached = await readVsLocalGameObjectFromCachedHandle(cdp, {
+    objectId: capture.objectId
+  });
+
+  assert.equal(cached.ok, true);
+  assert.equal(cached.current, "l");
+  assert.deepEqual(cached.queue, ["i", "t"]);
+  assert.equal(cdp.history.filter((entry) => entry.method === "Debugger.pause").length, 1);
 });
 
 test("VS sim OFF reads state then probes once after cooldown", async () => {

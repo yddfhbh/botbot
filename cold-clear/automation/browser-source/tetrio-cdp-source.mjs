@@ -17,6 +17,20 @@ const DEFAULT_CAPTURE_COOLDOWN_MS = 2000;
 const DEFAULT_SUPPRESSED_REASON = "VS WebSocket simulation owns live state";
 const DEFAULT_VS_OBJECT_SNAPSHOT_PATH = "automation/vs-object-snapshot.json";
 const PERF_LOG_INTERVAL_MS = 2000;
+const DEFAULT_VS_SCOPE_PAUSE_BUDGET_MS = 120;
+const MIN_VS_SCOPE_PAUSE_BUDGET_MS = 50;
+const MAX_VS_SCOPE_PAUSE_BUDGET_MS = 500;
+const VS_SCOPE_INITIAL_DELAY_MS = 200;
+const VS_SCOPE_RETRY_DELAY_MS = 500;
+const VS_SCOPE_MAX_ATTEMPTS = 3;
+const VS_SCOPE_MAX_DEPTH = 2;
+const VS_SCOPE_MAX_OBJECTS = 200;
+const VS_SCOPE_MAX_PROPERTIES = 80;
+const VS_SCOPE_TYPES = ["local", "closure", "block", "script"];
+const VS_SCOPE_PRIORITY = new Map(
+  VS_SCOPE_TYPES.map((scopeType, index) => [scopeType, index])
+);
+const VS_PIECE_NAMES = ["i", "o", "t", "s", "z", "j", "l"];
 
 export function determineChromiumOwnership({ connectOnly, alreadyOpen }) {
   return !connectOnly && !alreadyOpen;
@@ -40,7 +54,16 @@ export function createVsObjectTracking() {
     lastSnapshotSignature: "",
     lastCandidateLogSignature: "",
     lastNotFoundRoundId: "",
-    lastActiveRoundId: ""
+    lastActiveRoundId: "",
+    cachedObjectId: "",
+    cachedPath: "",
+    cachedScore: 0,
+    scopeAttempts: 0,
+    nextScopeAttemptAt: 0,
+    scopeCaptureLocked: false,
+    scopeFailureLogged: false,
+    scopeCaptureInFlight: false,
+    scopeStats: createVsScopeStats()
   };
 }
 
@@ -61,7 +84,38 @@ export function resetVsObjectTracking(tracking) {
   tracking.lastCandidateLogSignature = "";
   tracking.lastNotFoundRoundId = "";
   tracking.lastActiveRoundId = "";
+  tracking.cachedObjectId = "";
+  tracking.cachedPath = "";
+  tracking.cachedScore = 0;
+  tracking.scopeAttempts = 0;
+  tracking.nextScopeAttemptAt = 0;
+  tracking.scopeCaptureLocked = false;
+  tracking.scopeFailureLogged = false;
+  tracking.scopeCaptureInFlight = false;
+  tracking.scopeStats = createVsScopeStats();
   return tracking;
+}
+
+function createVsScopeStats() {
+  return {
+    framesScanned: 0,
+    scopesScanned: 0,
+    objectsScanned: 0
+  };
+}
+
+export function resolveVsScopePauseBudgetMs(
+  value = process.env.FUSION_VS_SCOPE_PAUSE_BUDGET_MS
+) {
+  const parsed = Number.parseInt(value ?? `${DEFAULT_VS_SCOPE_PAUSE_BUDGET_MS}`, 10);
+  if (
+    !Number.isFinite(parsed) ||
+    parsed < MIN_VS_SCOPE_PAUSE_BUDGET_MS ||
+    parsed > MAX_VS_SCOPE_PAUSE_BUDGET_MS
+  ) {
+    return DEFAULT_VS_SCOPE_PAUSE_BUDGET_MS;
+  }
+  return parsed;
 }
 
 export function buildSnapshotSignature(gameEpoch, state) {
@@ -193,6 +247,7 @@ async function main() {
   );
   const vsWsSimEnabled = isVsWsSimEnvEnabled();
   const vsObjectTraceEnabled = process.env.FUSION_VS_OBJECT_TRACE === "1";
+  const vsScopeTraceEnabled = process.env.FUSION_VS_SCOPE_TRACE === "1";
   const browserPerfEnabled = process.env.FUSION_BROWSER_PERF === "1";
   const chromePath = process.env.CHROME_PATH || "";
   const msgpack = await loadOptionalMsgpack();
@@ -332,7 +387,9 @@ async function main() {
         tracking: vsObjectTracking,
         liveSnapshotPath: snapshotPath,
         vsObjectSnapshotPath,
-        traceEnabled: vsObjectTraceEnabled
+        traceEnabled: vsObjectTraceEnabled,
+        scopeTraceEnabled: vsScopeTraceEnabled,
+        getVsRoundStatus: () => vsRoundStatus
       });
 
       lastReason = "";
@@ -842,6 +899,1096 @@ export async function readVsLocalGameObject(cdp, identity) {
   };
 }
 
+function clearVsCachedHandle(tracking) {
+  tracking.cachedObjectId = "";
+  tracking.cachedPath = "";
+  tracking.cachedScore = 0;
+}
+
+function resetVsScopeRoundState(tracking, now) {
+  clearVsCachedHandle(tracking);
+  tracking.scopeAttempts = 0;
+  tracking.nextScopeAttemptAt = now + VS_SCOPE_INITIAL_DELAY_MS;
+  tracking.scopeCaptureLocked = false;
+  tracking.scopeFailureLogged = false;
+  tracking.scopeCaptureInFlight = false;
+  tracking.scopeStats = createVsScopeStats();
+}
+
+function accumulateVsScopeStats(target, source) {
+  target.framesScanned += source?.framesScanned ?? 0;
+  target.scopesScanned += source?.scopesScanned ?? 0;
+  target.objectsScanned += source?.objectsScanned ?? 0;
+}
+
+function isVsScopeTraceEnabled(env = process.env) {
+  return env?.FUSION_VS_SCOPE_TRACE === "1";
+}
+
+function isInvalidRemoteObjectError(error) {
+  const message = String(error?.message ?? error ?? "").toLowerCase();
+  return (
+    message.includes("cannot find object with given id") ||
+    message.includes("object id") ||
+    message.includes("execution context was destroyed") ||
+    message.includes("cannot find default execution context") ||
+    message.includes("inspected target navigated or closed")
+  );
+}
+
+function isVsRoundStillActive(roundId, getVsRoundStatus) {
+  const status = typeof getVsRoundStatus === "function" ? getVsRoundStatus() : null;
+  return Boolean(status?.active) && String(status?.roundId ?? "") === String(roundId ?? "");
+}
+
+function buildVsObjectSnapshot(candidate, vsRoundStatus, source) {
+  return {
+    roundId: String(vsRoundStatus?.roundId ?? candidate?.roundId ?? ""),
+    localGameId: String(vsRoundStatus?.localGameId ?? candidate?.gameid ?? ""),
+    gameid: String(candidate?.gameid ?? vsRoundStatus?.localGameId ?? ""),
+    board: candidate?.board ?? [],
+    current: candidate?.current ? String(candidate.current).toUpperCase() : null,
+    hold: candidate?.hold ? String(candidate.hold).toUpperCase() : null,
+    queue: Array.isArray(candidate?.queue)
+      ? candidate.queue.map((piece) => String(piece).toUpperCase())
+      : [],
+    active: Boolean(candidate?.active),
+    capturedAt: candidate?.capturedAt ?? Date.now(),
+    source
+  };
+}
+
+function logVsScopeCandidate(candidate, roundId, log = (message) => console.log(message)) {
+  log("[vs-scope] candidate");
+  log(`roundId=${roundId}`);
+  log(`frame_index=${candidate.frameIndex}`);
+  log(`function_name=${candidate.functionName}`);
+  log(`scope_type=${candidate.scopeType}`);
+  log(`variable_path=${candidate.variablePath}`);
+  log(`score=${candidate.score}`);
+  log(`gameid=${candidate.gameid ?? ""}`);
+  log(`userid=${candidate.userid ?? ""}`);
+  log(`username=${candidate.username ?? ""}`);
+  log(`has_eject_state=${candidate.hasEjectState}`);
+  log(`has_eject_board_state=${candidate.hasEjectBoardState}`);
+  log(`board_shape=${candidate.boardShape ?? ""}`);
+  log(`current=${candidate.current ?? ""}`);
+  log(`hold=${candidate.hold ?? ""}`);
+  log(`queue_length=${candidate.queue.length}`);
+}
+
+function logVsScopeCapture(candidate, roundId, log = (message) => console.log(message)) {
+  log("[vs-scope] local game object captured");
+  log(`roundId=${roundId}`);
+  log(`path=${candidate.variablePath}`);
+  log(`score=${candidate.score}`);
+  log("object_id_cached=true");
+}
+
+function logVsScopeNotFound(roundId, attempt, stats, log = (message) => console.log(message)) {
+  log("[vs-scope] local game object not found");
+  log(`roundId=${roundId}`);
+  log(`attempt=${attempt}`);
+  log(`frames_scanned=${stats.framesScanned}`);
+  log(`scopes_scanned=${stats.scopesScanned}`);
+  log(`objects_scanned=${stats.objectsScanned}`);
+}
+
+function measureVsPauseElapsedMs(pauseStartedAt, budgetMs, nowFn = () => Date.now()) {
+  if (!pauseStartedAt) {
+    return 0;
+  }
+  return Math.min(
+    budgetMs,
+    Math.max(0, nowFn() - pauseStartedAt)
+  );
+}
+
+function formatVsRootPath(name) {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)
+    ? name
+    : `[${JSON.stringify(name)}]`;
+}
+
+function appendVsPath(basePath, name) {
+  if (/^\d+$/.test(name)) {
+    return `${basePath}[${name}]`;
+  }
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)
+    ? `${basePath}.${name}`
+    : `${basePath}[${JSON.stringify(name)}]`;
+}
+
+function remotePrimitiveValue(remoteValue) {
+  if (!remoteValue || typeof remoteValue !== "object") {
+    return undefined;
+  }
+  if (Object.hasOwn(remoteValue, "value")) {
+    return remoteValue.value;
+  }
+  if (remoteValue.type === "undefined") {
+    return undefined;
+  }
+  return undefined;
+}
+
+function remoteObjectId(remoteValue) {
+  return typeof remoteValue?.objectId === "string" ? remoteValue.objectId : "";
+}
+
+function isRemoteObjectLike(remoteValue) {
+  return Boolean(
+    remoteValue &&
+      typeof remoteValue === "object" &&
+      (remoteValue.type === "object" || remoteValue.type === "function") &&
+      remoteObjectId(remoteValue)
+  );
+}
+
+function isRemoteArrayLike(remoteValue) {
+  return Boolean(
+    isRemoteObjectLike(remoteValue) &&
+      (remoteValue.subtype === "array" || /array/i.test(remoteValue.className ?? ""))
+  );
+}
+
+function isRemoteSkippable(remoteValue) {
+  if (!isRemoteObjectLike(remoteValue)) {
+    return true;
+  }
+  const subtype = String(remoteValue.subtype ?? "").toLowerCase();
+  const className = String(remoteValue.className ?? "").toLowerCase();
+  const description = String(remoteValue.description ?? "").toLowerCase();
+  return (
+    subtype === "window" ||
+    subtype === "node" ||
+    subtype === "regexp" ||
+    subtype === "date" ||
+    subtype === "arraybuffer" ||
+    subtype === "typedarray" ||
+    className === "window" ||
+    className === "document" ||
+    className.includes("arraybuffer") ||
+    className.includes("uint") ||
+    className.includes("int") ||
+    className.includes("float") ||
+    className.includes("dataview") ||
+    description.startsWith("window")
+  );
+}
+
+function ensureVsScopeCanContinue(context) {
+  if (context?.abortState?.aborted) {
+    throw new Error(context.abortState.reason || "VS scope scan aborted");
+  }
+  if ((context?.stats?.objectsScanned ?? 0) >= VS_SCOPE_MAX_OBJECTS) {
+    throw new Error("VS scope object budget exceeded");
+  }
+}
+
+function markVsObjectScanned(remoteValue, context) {
+  const objectId = remoteObjectId(remoteValue);
+  if (!objectId) {
+    return false;
+  }
+  if (context.seenObjectIds.has(objectId)) {
+    return false;
+  }
+  context.seenObjectIds.add(objectId);
+  context.stats.objectsScanned += 1;
+  ensureVsScopeCanContinue(context);
+  return true;
+}
+
+async function getRemoteProperties(cdp, remoteValue, context) {
+  ensureVsScopeCanContinue(context);
+  const objectId = remoteObjectId(remoteValue);
+  if (!objectId) {
+    return [];
+  }
+  if (context.propertyCache.has(objectId)) {
+    return await context.propertyCache.get(objectId);
+  }
+  const pending = cdp
+    .send("Runtime.getProperties", {
+      objectId,
+      ownProperties: true,
+      accessorPropertiesOnly: false,
+      generatePreview: false
+    })
+    .then((result) => {
+      const properties = [];
+      for (const property of result?.result ?? []) {
+        if (!property || !Object.hasOwn(property, "value")) {
+          continue;
+        }
+        if (property.name === "__proto__") {
+          continue;
+        }
+        properties.push({
+          name: property.name,
+          value: property.value
+        });
+        if (properties.length >= VS_SCOPE_MAX_PROPERTIES) {
+          break;
+        }
+      }
+      return properties;
+    });
+  context.propertyCache.set(objectId, pending);
+  return await pending;
+}
+
+function propertiesToMap(properties) {
+  const map = new Map();
+  for (const property of properties) {
+    if (!map.has(property.name)) {
+      map.set(property.name, property.value);
+    }
+  }
+  return map;
+}
+
+async function getRemoteArrayItems(cdp, remoteValue, context) {
+  if (!isRemoteObjectLike(remoteValue)) {
+    return [];
+  }
+  const properties = await getRemoteProperties(cdp, remoteValue, context);
+  return properties
+    .filter((property) => /^\d+$/.test(property.name))
+    .sort((left, right) => Number(left.name) - Number(right.name))
+    .slice(0, VS_SCOPE_MAX_PROPERTIES)
+    .map((property) => property.value);
+}
+
+async function getRemoteRowCells(cdp, remoteValue, context, depth = 0) {
+  if (depth > 1 || !isRemoteObjectLike(remoteValue)) {
+    return null;
+  }
+  if (isRemoteArrayLike(remoteValue)) {
+    const items = await getRemoteArrayItems(cdp, remoteValue, context);
+    if (items.length > 0) {
+      return items;
+    }
+  }
+  const propertyMap = propertiesToMap(await getRemoteProperties(cdp, remoteValue, context));
+  for (const key of ["cells", "row", "data", "cols", "entries"]) {
+    const nested = propertyMap.get(key);
+    if (nested && isRemoteObjectLike(nested)) {
+      const items = await getRemoteArrayItems(cdp, nested, context);
+      if (items.length > 0) {
+        return items;
+      }
+    }
+  }
+  const numeric = (await getRemoteProperties(cdp, remoteValue, context))
+    .filter((property) => /^\d+$/.test(property.name))
+    .sort((left, right) => Number(left.name) - Number(right.name))
+    .slice(0, VS_SCOPE_MAX_PROPERTIES)
+    .map((property) => property.value);
+  return numeric.length > 0 ? numeric : null;
+}
+
+async function isRemoteCellFilled(cdp, remoteValue, context, depth = 0) {
+  const primitive = remotePrimitiveValue(remoteValue);
+  if (
+    primitive === null ||
+    primitive === undefined ||
+    primitive === false ||
+    primitive === 0 ||
+    primitive === ""
+  ) {
+    return false;
+  }
+  if (typeof primitive === "string") {
+    const text = primitive.trim().toLowerCase();
+    return text !== "" && text !== "." && text !== "0" && text !== "empty";
+  }
+  if (!isRemoteObjectLike(remoteValue) || depth >= 1) {
+    return true;
+  }
+  const propertyMap = propertiesToMap(await getRemoteProperties(cdp, remoteValue, context));
+  const empty = remotePrimitiveValue(propertyMap.get("empty"));
+  if (typeof empty === "boolean") {
+    return !empty;
+  }
+  for (const key of ["type", "mino", "value", "id", "cell"]) {
+    if (propertyMap.has(key)) {
+      return await isRemoteCellFilled(cdp, propertyMap.get(key), context, depth + 1);
+    }
+  }
+  return true;
+}
+
+async function extractRemoteBoardShape(cdp, remoteValue, context, depth = 0) {
+  if (depth > 2 || !remoteValue) {
+    return null;
+  }
+  if (isRemoteArrayLike(remoteValue)) {
+    const items = await getRemoteArrayItems(cdp, remoteValue, context);
+    if ((items.length === 20 || items.length === 40) && items.length > 0) {
+      const rows = [];
+      for (const item of items) {
+        const cells = await getRemoteRowCells(cdp, item, context, depth + 1);
+        if (!Array.isArray(cells) || cells.length !== 10) {
+          rows.length = 0;
+          break;
+        }
+        rows.push(await Promise.all(cells.slice(0, 10).map((cell) => isRemoteCellFilled(cdp, cell, context))));
+      }
+      if (rows.length === items.length) {
+        return {
+          board: rows,
+          boardShape: `${rows.length}x10`
+        };
+      }
+    }
+    if (items.length === 10) {
+      const columns = [];
+      for (const item of items) {
+        const cells = await getRemoteRowCells(cdp, item, context, depth + 1);
+        if (!Array.isArray(cells) || (cells.length !== 20 && cells.length !== 40)) {
+          columns.length = 0;
+          break;
+        }
+        columns.push(cells);
+      }
+      if (columns.length === 10) {
+        const height = columns[0].length;
+        const rows = [];
+        for (let rowIndex = 0; rowIndex < height; rowIndex++) {
+          const row = [];
+          for (let columnIndex = 0; columnIndex < 10; columnIndex++) {
+            row.push(
+              await isRemoteCellFilled(cdp, columns[columnIndex][rowIndex], context)
+            );
+          }
+          rows.push(row);
+        }
+        return {
+          board: rows,
+          boardShape: `${height}x10`
+        };
+      }
+    }
+  }
+  if (!isRemoteObjectLike(remoteValue)) {
+    return null;
+  }
+  const propertyMap = propertiesToMap(await getRemoteProperties(cdp, remoteValue, context));
+  for (const key of ["board", "field", "rows", "grid", "matrix", "cells", "entries", "b"]) {
+    if (!propertyMap.has(key)) {
+      continue;
+    }
+    const nested = await extractRemoteBoardShape(cdp, propertyMap.get(key), context, depth + 1);
+    if (nested) {
+      return nested;
+    }
+  }
+  return null;
+}
+
+function normalizePiecePrimitive(value) {
+  if (value === null || value === undefined || value === false) {
+    return null;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return VS_PIECE_NAMES[Math.floor(value)] ?? null;
+  }
+  if (typeof value === "string") {
+    const text = value.trim().toLowerCase();
+    if (!text) {
+      return null;
+    }
+    if (VS_PIECE_NAMES.includes(text)) {
+      return text;
+    }
+    for (const token of text.split(/[^a-z0-9]+/)) {
+      if (VS_PIECE_NAMES.includes(token)) {
+        return token;
+      }
+    }
+  }
+  return null;
+}
+
+async function normalizeRemotePiece(cdp, remoteValue, context, depth = 0) {
+  const primitive = normalizePiecePrimitive(remotePrimitiveValue(remoteValue));
+  if (primitive) {
+    return primitive;
+  }
+  if (depth > 1 || !isRemoteObjectLike(remoteValue)) {
+    return null;
+  }
+  if (isRemoteArrayLike(remoteValue)) {
+    for (const item of (await getRemoteArrayItems(cdp, remoteValue, context)).slice(0, 12)) {
+      const piece = await normalizeRemotePiece(cdp, item, context, depth + 1);
+      if (piece) {
+        return piece;
+      }
+    }
+  }
+  const propertyMap = propertiesToMap(await getRemoteProperties(cdp, remoteValue, context));
+  for (const key of ["type", "symbol", "piece", "name", "mino", "id", "value", "kind"]) {
+    if (!propertyMap.has(key)) {
+      continue;
+    }
+    const piece = await normalizeRemotePiece(cdp, propertyMap.get(key), context, depth + 1);
+    if (piece) {
+      return piece;
+    }
+  }
+  return null;
+}
+
+async function extractRemoteQueue(cdp, remoteValue, context, depth = 0) {
+  if (depth > 1 || !remoteValue) {
+    return [];
+  }
+  if (isRemoteArrayLike(remoteValue)) {
+    const queue = [];
+    for (const item of (await getRemoteArrayItems(cdp, remoteValue, context)).slice(0, 12)) {
+      const piece = await normalizeRemotePiece(cdp, item, context, depth + 1);
+      if (piece) {
+        queue.push(piece);
+      }
+    }
+    return queue;
+  }
+  if (!isRemoteObjectLike(remoteValue)) {
+    return [];
+  }
+  const numericItems = await getRemoteArrayItems(cdp, remoteValue, context);
+  if (numericItems.length > 0) {
+    return await extractRemoteQueue(
+      cdp,
+      { ...remoteValue, subtype: "array" },
+      context,
+      depth + 1
+    );
+  }
+  return [];
+}
+
+function readRemoteBoolean(remoteValue) {
+  const primitive = remotePrimitiveValue(remoteValue);
+  return typeof primitive === "boolean" ? primitive : null;
+}
+
+function readRemoteScalar(remoteValue) {
+  const primitive = remotePrimitiveValue(remoteValue);
+  if (typeof primitive === "string" || typeof primitive === "number" || typeof primitive === "boolean") {
+    const text = String(primitive).trim();
+    return text.length > 0 ? text : null;
+  }
+  return null;
+}
+
+async function extractRemoteIdentity(cdp, seedObjects, context) {
+  const queue = seedObjects
+    .filter((remoteValue) => isRemoteObjectLike(remoteValue))
+    .map((remoteValue) => ({ remoteValue, depth: 0 }));
+  const visited = new Set();
+  const found = {
+    gameids: new Set(),
+    userids: new Set(),
+    usernames: new Set()
+  };
+  while (queue.length > 0) {
+    const current = queue.shift();
+    const objectId = remoteObjectId(current.remoteValue);
+    if (!objectId || visited.has(objectId)) {
+      continue;
+    }
+    visited.add(objectId);
+    const properties = await getRemoteProperties(cdp, current.remoteValue, context);
+    for (const property of properties) {
+      const lowerName = property.name.toLowerCase();
+      const scalar = readRemoteScalar(property.value);
+      if (scalar) {
+        if (lowerName === "gameid" || lowerName === "game_id") {
+          found.gameids.add(scalar);
+        } else if (lowerName === "userid" || lowerName === "user_id" || property.name === "_id") {
+          found.userids.add(scalar);
+        } else if (lowerName === "username" || lowerName === "name") {
+          found.usernames.add(scalar);
+        }
+      }
+      if (current.depth >= 2 || !isRemoteObjectLike(property.value)) {
+        continue;
+      }
+      queue.push({
+        remoteValue: property.value,
+        depth: current.depth + 1
+      });
+      if (queue.length >= 64) {
+        break;
+      }
+    }
+  }
+  return found;
+}
+
+function selectIdentityValue(values, preferred) {
+  if (preferred && values.has(preferred)) {
+    return preferred;
+  }
+  for (const value of values) {
+    return value;
+  }
+  return null;
+}
+
+function scoreVsIdentity(identityValues, identity) {
+  const localGameId = String(identity?.gameid ?? identity?.localGameId ?? "");
+  const localUserId = String(identity?.userid ?? identity?.localUserId ?? "");
+  const localUsername = String(identity?.username ?? identity?.localUsername ?? "").toLowerCase();
+  const hasLocalGameId = localGameId && identityValues.gameids.has(localGameId);
+  const hasLocalUserId = localUserId && identityValues.userids.has(localUserId);
+  const hasLocalUsername =
+    localUsername &&
+    [...identityValues.usernames].some((value) => value.toLowerCase() === localUsername);
+  const hasOpponentGameId =
+    Boolean(localGameId) &&
+    identityValues.gameids.size > 0 &&
+    !identityValues.gameids.has(localGameId);
+  return {
+    hasLocalGameId: Boolean(hasLocalGameId),
+    hasLocalUserId: Boolean(hasLocalUserId),
+    hasLocalUsername: Boolean(hasLocalUsername),
+    hasOpponentGameId: Boolean(hasOpponentGameId),
+    score:
+      (hasLocalGameId ? 120 : 0) +
+      (hasLocalUserId ? 45 : 0) +
+      (hasLocalUsername ? 20 : 0),
+    gameid: selectIdentityValue(identityValues.gameids, localGameId || null),
+    userid: selectIdentityValue(identityValues.userids, localUserId || null),
+    username: selectIdentityValue(
+      identityValues.usernames,
+      hasLocalUsername ? selectIdentityValue(identityValues.usernames, null) : null
+    )
+  };
+}
+
+async function evaluateVsCandidateObject(cdp, remoteValue, details, context) {
+  if (!isRemoteObjectLike(remoteValue) || isRemoteSkippable(remoteValue)) {
+    return null;
+  }
+  ensureVsScopeCanContinue(context);
+  const properties = await getRemoteProperties(cdp, remoteValue, context);
+  const propertyMap = propertiesToMap(properties);
+  const hasEjectState = propertyMap.has("ejectState") && propertyMap.get("ejectState")?.type === "function";
+  const hasEjectBoardState =
+    propertyMap.has("ejectBoardState") &&
+    propertyMap.get("ejectBoardState")?.type === "function";
+  const hasBoardKey =
+    propertyMap.has("board") ||
+    propertyMap.has("field") ||
+    propertyMap.has("rows") ||
+    propertyMap.has("grid") ||
+    propertyMap.has("matrix") ||
+    propertyMap.has("b");
+  const hasCurrentKey =
+    propertyMap.has("current") ||
+    propertyMap.has("active") ||
+    propertyMap.has("falling") ||
+    propertyMap.has("piece") ||
+    propertyMap.has("tetromino");
+  const hasHoldKey =
+    propertyMap.has("hold") || propertyMap.has("held") || propertyMap.has("reserve");
+  const hasQueueKey =
+    propertyMap.has("queue") ||
+    propertyMap.has("next") ||
+    propertyMap.has("preview") ||
+    propertyMap.has("previews") ||
+    propertyMap.has("pieces") ||
+    propertyMap.has("bag") ||
+    propertyMap.has("nextQueue");
+  if (!hasEjectState && !hasEjectBoardState && !hasBoardKey && !hasCurrentKey && !hasQueueKey) {
+    return null;
+  }
+  let boardInfo = null;
+  for (const key of ["board", "field", "rows", "grid", "matrix", "b"]) {
+    if (!propertyMap.has(key)) {
+      continue;
+    }
+    boardInfo = await extractRemoteBoardShape(cdp, propertyMap.get(key), context);
+    if (boardInfo) {
+      break;
+    }
+  }
+  const current = await normalizeRemotePiece(
+    cdp,
+    propertyMap.get("current") ??
+      propertyMap.get("active") ??
+      propertyMap.get("falling") ??
+      propertyMap.get("piece") ??
+      propertyMap.get("tetromino"),
+    context
+  );
+  const hold = await normalizeRemotePiece(
+    cdp,
+    propertyMap.get("hold") ?? propertyMap.get("held") ?? propertyMap.get("reserve"),
+    context
+  );
+  let queue = [];
+  for (const key of ["queue", "next", "preview", "previews", "pieces", "bag", "nextQueue"]) {
+    if (!propertyMap.has(key)) {
+      continue;
+    }
+    queue = await extractRemoteQueue(cdp, propertyMap.get(key), context);
+    if (queue.length > 0) {
+      break;
+    }
+  }
+  let active = readRemoteBoolean(
+    propertyMap.get("active") ?? propertyMap.get("alive") ?? propertyMap.get("playing")
+  );
+  if (active === null) {
+    const dead = readRemoteBoolean(
+      propertyMap.get("dead") ??
+        propertyMap.get("destroyed") ??
+        propertyMap.get("gameover") ??
+        propertyMap.get("gameOver")
+    );
+    if (dead !== null) {
+      active = !dead;
+    }
+  }
+  if (active === null) {
+    const status = readRemoteScalar(
+      propertyMap.get("state") ?? propertyMap.get("status") ?? propertyMap.get("phase")
+    )?.toLowerCase();
+    if (status) {
+      if (["active", "alive", "playing", "running", "go"].includes(status)) {
+        active = true;
+      } else if (
+        ["dead", "destroyed", "ended", "gameover", "finished", "over"].includes(status)
+      ) {
+        active = false;
+      }
+    }
+  }
+  const identityValues = await extractRemoteIdentity(
+    cdp,
+    [remoteValue, ...details.ancestors.slice(-2)],
+    context
+  );
+  const identityScore = scoreVsIdentity(identityValues, details.identity);
+  if (identityScore.hasOpponentGameId && !identityScore.hasLocalGameId) {
+    return null;
+  }
+  let score = identityScore.score;
+  if (hasEjectState) {
+    score += 40;
+  }
+  if (hasEjectBoardState) {
+    score += 30;
+  }
+  if (boardInfo?.board?.[0]?.length === 10) {
+    score += 35;
+  }
+  if (current) {
+    score += 18;
+  }
+  if (hold) {
+    score += 8;
+  }
+  if (queue.length > 0) {
+    score += 12;
+  }
+  if (typeof active === "boolean") {
+    score += 10;
+  }
+  if (!hasEjectState && !hasEjectBoardState && !boardInfo && !hasCurrentKey && !hasQueueKey) {
+    return null;
+  }
+  if (score < 35) {
+    return null;
+  }
+  return {
+    ok: true,
+    objectId: remoteObjectId(remoteValue),
+    frameIndex: details.frameIndex,
+    functionName: details.functionName,
+    scopeType: details.scopeType,
+    scopePriority: VS_SCOPE_PRIORITY.get(details.scopeType) ?? VS_SCOPE_TYPES.length,
+    variablePath: details.variablePath,
+    score,
+    gameid: identityScore.gameid,
+    userid: identityScore.userid,
+    username: identityScore.username,
+    hasEjectState,
+    hasEjectBoardState,
+    board: boardInfo?.board ?? [],
+    boardShape: boardInfo?.boardShape ?? "",
+    current,
+    hold,
+    queue,
+    active: typeof active === "boolean" ? active : false,
+    capturedAt: Date.now(),
+    identityScore: {
+      hasLocalGameId: identityScore.hasLocalGameId,
+      hasLocalUserId: identityScore.hasLocalUserId,
+      hasLocalUsername: identityScore.hasLocalUsername
+    }
+  };
+}
+
+function isBetterVsCandidate(candidate, best) {
+  if (!best) {
+    return true;
+  }
+  if (candidate.score !== best.score) {
+    return candidate.score > best.score;
+  }
+  if (candidate.identityScore.hasLocalGameId !== best.identityScore.hasLocalGameId) {
+    return candidate.identityScore.hasLocalGameId;
+  }
+  if (candidate.scopePriority !== best.scopePriority) {
+    return candidate.scopePriority < best.scopePriority;
+  }
+  if (candidate.frameIndex !== best.frameIndex) {
+    return candidate.frameIndex < best.frameIndex;
+  }
+  return candidate.variablePath.length < best.variablePath.length;
+}
+
+async function scanVsScopeObject(cdp, scopeObject, details, log, context) {
+  const queue = [];
+  const visited = new Set();
+  const properties = await getRemoteProperties(cdp, scopeObject, context);
+  for (const property of properties) {
+    if (!isRemoteObjectLike(property.value) || isRemoteSkippable(property.value)) {
+      continue;
+    }
+    queue.push({
+      remoteValue: property.value,
+      variablePath: formatVsRootPath(property.name),
+      ancestors: []
+    });
+  }
+  let best = null;
+  while (queue.length > 0) {
+    ensureVsScopeCanContinue(context);
+    const current = queue.shift();
+    const objectId = remoteObjectId(current.remoteValue);
+    if (!objectId || visited.has(objectId)) {
+      continue;
+    }
+    visited.add(objectId);
+    markVsObjectScanned(current.remoteValue, context);
+    const candidate = await evaluateVsCandidateObject(
+      cdp,
+      current.remoteValue,
+      {
+        ...details,
+        variablePath: current.variablePath,
+        ancestors: current.ancestors
+      },
+      context
+    );
+    if (candidate) {
+      logVsScopeCandidate(candidate, details.roundId, log);
+      if (isBetterVsCandidate(candidate, best)) {
+        best = candidate;
+      }
+    }
+    if (current.ancestors.length >= VS_SCOPE_MAX_DEPTH - 1) {
+      continue;
+    }
+    const childProperties = await getRemoteProperties(cdp, current.remoteValue, context);
+    for (const property of childProperties) {
+      if (!isRemoteObjectLike(property.value) || isRemoteSkippable(property.value)) {
+        continue;
+      }
+      queue.push({
+        remoteValue: property.value,
+        variablePath: appendVsPath(current.variablePath, property.name),
+        ancestors: [...current.ancestors, current.remoteValue].slice(-2)
+      });
+    }
+  }
+  return best;
+}
+
+async function inspectVsPausedScopes(cdp, pausedEvent, options) {
+  const stats = createVsScopeStats();
+  const context = {
+    propertyCache: new Map(),
+    seenObjectIds: new Set(),
+    abortState: options.abortState,
+    stats
+  };
+  let best = null;
+  const callFrames = Array.isArray(pausedEvent?.callFrames) ? pausedEvent.callFrames : [];
+  stats.framesScanned = callFrames.length;
+  for (let frameIndex = 0; frameIndex < callFrames.length; frameIndex++) {
+    const callFrame = callFrames[frameIndex];
+    const functionName = callFrame?.functionName || "(anonymous)";
+    const scopes = (callFrame?.scopeChain ?? [])
+      .filter((scope) => VS_SCOPE_PRIORITY.has(scope.type))
+      .sort(
+        (left, right) =>
+          (VS_SCOPE_PRIORITY.get(left.type) ?? VS_SCOPE_TYPES.length) -
+          (VS_SCOPE_PRIORITY.get(right.type) ?? VS_SCOPE_TYPES.length)
+      );
+    for (const scope of scopes) {
+      if (!isRemoteObjectLike(scope.object) || isRemoteSkippable(scope.object)) {
+        continue;
+      }
+      stats.scopesScanned += 1;
+      const candidate = await scanVsScopeObject(
+        cdp,
+        scope.object,
+        {
+          roundId: options.roundId,
+          frameIndex,
+          functionName,
+          scopeType: scope.type,
+          identity: options.identity
+        },
+        options.log,
+        context
+      );
+      if (candidate && isBetterVsCandidate(candidate, best)) {
+        best = candidate;
+      }
+    }
+  }
+  return { ok: Boolean(best), candidate: best, stats };
+}
+
+async function waitForVsPausedEvent(cdp, roundId, getVsRoundStatus, timeoutMs) {
+  return await new Promise((resolve, reject) => {
+    const interval = setInterval(() => {
+      if (!isVsRoundStillActive(roundId, getVsRoundStatus)) {
+        cleanup();
+        reject(new Error("VS round is no longer active"));
+      }
+    }, 10);
+    const cleanup = () => clearInterval(interval);
+    cdp
+      .waitForEvent(
+        "Debugger.paused",
+        () => true,
+        timeoutMs
+      )
+      .then((event) => {
+        cleanup();
+        resolve(event);
+      })
+      .catch((error) => {
+        cleanup();
+        reject(error);
+      });
+  });
+}
+
+export async function captureVsLocalGameObjectFromPausedScope(
+  cdp,
+  {
+    roundId,
+    identity,
+    log = (message) => console.log(message),
+    getVsRoundStatus = () => ({ active: true, roundId }),
+    attempt = 1,
+    pauseBudgetMs = resolveVsScopePauseBudgetMs(),
+    nowFn = () => Date.now()
+  }
+) {
+  const stats = createVsScopeStats();
+  let paused = false;
+  let debuggerEnabled = false;
+  let pauseStartedAt = 0;
+  let pauseResumedAt = 0;
+  let watchdog = null;
+  const abortState = {
+    aborted: false,
+    reason: ""
+  };
+  const budgetMs = resolveVsScopePauseBudgetMs(pauseBudgetMs);
+  const safeResume = async (reason = "finally") => {
+    if (pauseResumedAt) {
+      return false;
+    }
+    pauseResumedAt = nowFn();
+    abortState.aborted = true;
+    abortState.reason = reason;
+    await cdp.send("Debugger.resume").catch(() => undefined);
+    paused = false;
+    return true;
+  };
+  if (!isVsRoundStillActive(roundId, getVsRoundStatus)) {
+    return { ok: false, cancelled: true, reason: "VS round is no longer active", stats };
+  }
+  try {
+    await cdp.send("Debugger.enable").catch(() => undefined);
+    debuggerEnabled = true;
+    pauseStartedAt = nowFn();
+    log(`[vs-scope] pause started attempt=${attempt}`);
+    watchdog = setTimeout(() => {
+      const elapsedMs = measureVsPauseElapsedMs(pauseStartedAt, budgetMs, nowFn);
+      log(`[vs-scope] resume watchdog fired elapsed_ms=${elapsedMs}`);
+      void safeResume("watchdog");
+    }, budgetMs);
+    const pausedPromise = waitForVsPausedEvent(cdp, roundId, getVsRoundStatus, budgetMs);
+    await cdp.send("Debugger.pause");
+    const pausedEvent = await pausedPromise;
+    paused = true;
+    if (!isVsRoundStillActive(roundId, getVsRoundStatus)) {
+      await safeResume("round_changed");
+      return { ok: false, cancelled: true, reason: "VS round changed", stats };
+    }
+    const inspected = await Promise.race([
+      inspectVsPausedScopes(cdp, pausedEvent, {
+        roundId,
+        identity,
+        log,
+        abortState
+      }),
+      new Promise((resolve) => {
+        const interval = setInterval(() => {
+          if (!isVsRoundStillActive(roundId, getVsRoundStatus)) {
+            clearInterval(interval);
+            abortState.aborted = true;
+            abortState.reason = "round_inactive";
+            resolve({
+              ok: false,
+              cancelled: true,
+              reason: "VS round changed",
+              stats
+            });
+          }
+        }, 10);
+        setTimeout(() => clearInterval(interval), budgetMs);
+      }),
+      new Promise((resolve) =>
+        setTimeout(() => {
+          abortState.aborted = true;
+          abortState.reason = "timeout";
+          resolve({
+            ok: false,
+            timedOut: true,
+            stats
+          });
+        }, budgetMs)
+      )
+    ]);
+    accumulateVsScopeStats(stats, inspected.stats);
+    if (inspected?.cancelled) {
+      await safeResume("round_inactive");
+      return {
+        ok: false,
+        cancelled: true,
+        reason: inspected.reason ?? "VS round changed",
+        stats
+      };
+    }
+    if (inspected?.timedOut) {
+      log(`[vs-scope] scan timed out budget_ms=${budgetMs} objects_scanned=${stats.objectsScanned}`);
+      await safeResume("timeout");
+      return {
+        ok: false,
+        timedOut: true,
+        reason: "VS paused scope scan timed out",
+        stats
+      };
+    }
+    if (!inspected.ok) {
+      return {
+        ok: false,
+        reason: "TETR.IO VS local game object not found in paused scopes",
+        stats
+      };
+    }
+    logVsScopeCapture(inspected.candidate, roundId, log);
+    return {
+      ok: true,
+      objectId: inspected.candidate.objectId,
+      candidate: inspected.candidate,
+      stats
+    };
+  } catch (error) {
+    await safeResume("exception");
+    return {
+      ok: false,
+      cancelled: String(error?.message ?? "").includes("no longer active"),
+      reason: error?.message ?? String(error),
+      stats
+    };
+  } finally {
+    if (watchdog) {
+      clearTimeout(watchdog);
+    }
+    if (paused || !pauseResumedAt) {
+      await safeResume("finally");
+    }
+    if (pauseStartedAt) {
+      const elapsedMs = measureVsPauseElapsedMs(
+        pauseStartedAt,
+        budgetMs,
+        () => pauseResumedAt || nowFn()
+      );
+      log(`[vs-scope] pause resumed elapsed_ms=${elapsedMs}`);
+    }
+    if (debuggerEnabled) {
+      await cdp.send("Debugger.disable").catch(() => undefined);
+    }
+  }
+}
+
+export async function readVsLocalGameObjectFromCachedHandle(
+  cdp,
+  {
+    objectId
+  }
+) {
+  try {
+    const stats = createVsScopeStats();
+    const context = {
+      propertyCache: new Map(),
+      seenObjectIds: new Set(),
+      abortState: { aborted: false, reason: "" },
+      stats
+    };
+    markVsObjectScanned({ type: "object", objectId }, context);
+    const candidate = await evaluateVsCandidateObject(
+      cdp,
+      { type: "object", objectId },
+      {
+        frameIndex: -1,
+        functionName: "cached",
+        scopeType: "cached",
+        variablePath: "cached_object",
+        ancestors: [],
+        identity: {}
+      },
+      context
+    );
+    if (!candidate) {
+      return {
+        ok: false,
+        reason: "cached VS object is no longer readable"
+      };
+    }
+    return {
+      ...candidate,
+      ok: true,
+      source: "paused_scope"
+    };
+  } catch (error) {
+    if (isInvalidRemoteObjectError(error)) {
+      return {
+        ok: false,
+        invalidObjectId: true,
+        reason: error?.message ?? String(error)
+      };
+    }
+    throw error;
+  }
+}
+
 export async function processVsObjectDiagnostics(
   cdp,
   {
@@ -850,8 +1997,13 @@ export async function processVsObjectDiagnostics(
     liveSnapshotPath,
     vsObjectSnapshotPath = DEFAULT_VS_OBJECT_SNAPSHOT_PATH,
     traceEnabled = false,
+    scopeTraceEnabled = false,
     log = (message) => console.log(message),
-    readVsObjectStateFn = readVsLocalGameObject
+    getVsRoundStatus = () => vsRoundStatus,
+    readVsObjectStateFn = readVsLocalGameObject,
+    readVsCachedObjectStateFn = readVsLocalGameObjectFromCachedHandle,
+    captureVsObjectFromPausedScopeFn = captureVsLocalGameObjectFromPausedScope,
+    nowFn = () => Date.now()
   }
 ) {
   if (!vsRoundStatus?.active) {
@@ -859,21 +2011,102 @@ export async function processVsObjectDiagnostics(
   }
 
   const roundId = String(vsRoundStatus.roundId ?? "");
+  const now = nowFn();
   if (tracking.roundId !== roundId) {
     tracking.roundId = roundId;
     tracking.lastSnapshotSignature = "";
     tracking.lastCandidateLogSignature = "";
     tracking.lastNotFoundRoundId = "";
+    resetVsScopeRoundState(tracking, now);
     clearSnapshotFile(liveSnapshotPath);
     clearSnapshotFile(vsObjectSnapshotPath);
   }
 
-  const candidate = await readVsObjectStateFn(cdp, {
+  const identity = {
     roundId,
     gameid: vsRoundStatus.localGameId,
     userid: vsRoundStatus.localUserId,
     username: vsRoundStatus.localUsername
-  });
+  };
+
+  if (tracking.cachedObjectId) {
+    const cachedCandidate = await readVsCachedObjectStateFn(cdp, {
+      objectId: tracking.cachedObjectId
+    });
+    if (cachedCandidate?.ok) {
+      const snapshot = buildVsObjectSnapshot(cachedCandidate, vsRoundStatus, "paused_scope");
+      const signature = buildVsObjectSnapshotSignature(snapshot);
+      if (signature !== tracking.lastSnapshotSignature) {
+        writeSnapshot(vsObjectSnapshotPath, snapshot);
+        tracking.lastSnapshotSignature = signature;
+      }
+      return {
+        handled: true,
+        found: true,
+        candidate: cachedCandidate,
+        snapshot
+      };
+    }
+    if (cachedCandidate?.invalidObjectId) {
+      clearVsCachedHandle(tracking);
+      tracking.scopeCaptureLocked = true;
+    }
+    if (tracking.lastSnapshotSignature) {
+      clearSnapshotFile(vsObjectSnapshotPath);
+      tracking.lastSnapshotSignature = "";
+      tracking.lastCandidateLogSignature = "";
+    }
+    return { handled: true, found: false, candidate: null };
+  }
+
+  let candidate = await readVsObjectStateFn(cdp, identity);
+  let snapshotSource = "window_graph";
+
+  if (
+    !candidate?.ok &&
+    scopeTraceEnabled &&
+    !tracking.scopeCaptureLocked &&
+    !tracking.scopeCaptureInFlight
+  ) {
+    const readyForScopeAttempt =
+      tracking.scopeAttempts < VS_SCOPE_MAX_ATTEMPTS &&
+      now >= tracking.nextScopeAttemptAt &&
+      isVsRoundStillActive(roundId, getVsRoundStatus);
+    if (readyForScopeAttempt) {
+      tracking.scopeAttempts += 1;
+      tracking.scopeCaptureInFlight = true;
+      const scopeCapture = await captureVsObjectFromPausedScopeFn(cdp, {
+        roundId,
+        identity,
+        log,
+        getVsRoundStatus,
+        attempt: tracking.scopeAttempts
+      }).finally(() => {
+        tracking.scopeCaptureInFlight = false;
+      });
+      accumulateVsScopeStats(tracking.scopeStats, scopeCapture.stats);
+      if (scopeCapture.ok) {
+        tracking.cachedObjectId = scopeCapture.objectId;
+        tracking.cachedPath = scopeCapture.candidate.variablePath;
+        tracking.cachedScore = scopeCapture.candidate.score;
+        candidate = scopeCapture.candidate;
+        snapshotSource = "paused_scope";
+      } else {
+        tracking.nextScopeAttemptAt = nowFn() + VS_SCOPE_RETRY_DELAY_MS;
+        if (scopeCapture.cancelled) {
+          return { handled: true, found: false, candidate: null };
+        }
+        if (
+          tracking.scopeAttempts >= VS_SCOPE_MAX_ATTEMPTS &&
+          !tracking.scopeFailureLogged
+        ) {
+          tracking.scopeFailureLogged = true;
+          tracking.scopeCaptureLocked = true;
+          logVsScopeNotFound(roundId, tracking.scopeAttempts, tracking.scopeStats, log);
+        }
+      }
+    }
+  }
 
   if (!candidate?.ok) {
     if (tracking.lastSnapshotSignature) {
@@ -889,19 +2122,7 @@ export async function processVsObjectDiagnostics(
   }
 
   tracking.lastNotFoundRoundId = "";
-
-  const snapshot = {
-    roundId,
-    gameid: String(candidate.gameid ?? vsRoundStatus.localGameId ?? ""),
-    board: candidate.board,
-    current: candidate.current ? String(candidate.current).toUpperCase() : null,
-    hold: candidate.hold ? String(candidate.hold).toUpperCase() : null,
-    queue: Array.isArray(candidate.queue)
-      ? candidate.queue.map((piece) => String(piece).toUpperCase())
-      : [],
-    active: Boolean(candidate.active),
-    capturedAt: candidate.capturedAt ?? Date.now()
-  };
+  const snapshot = buildVsObjectSnapshot(candidate, vsRoundStatus, snapshotSource);
   const signature = buildVsObjectSnapshotSignature(snapshot);
   if (signature !== tracking.lastSnapshotSignature) {
     writeSnapshot(vsObjectSnapshotPath, snapshot);
