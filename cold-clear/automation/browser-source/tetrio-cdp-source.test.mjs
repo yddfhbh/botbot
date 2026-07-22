@@ -9,6 +9,7 @@ import {
   applyGameStartSignalToNetwork,
   applyBrowserControlMessage,
   armClosureCaptureWindow,
+  advanceGameStartSignalGeneration,
   buildSnapshotSignature,
   buildSnapshotToken,
   captureTetrioGame,
@@ -863,7 +864,7 @@ test("independent game-start signal state tracks unconsumed signals without game
   assert.equal(signalState.latestSource, "ddd_game_options");
   assert.deepEqual(signalState.latestDetails, { seed: "a" });
   assert.deepEqual(consumeGameStartSignal(signalState), {
-    key: "ddd:seed-a",
+    key: "0:ddd_game_options:ddd:seed-a",
     source: "ddd_game_options",
     seenAt: 60_000,
     details: { seed: "a" }
@@ -890,6 +891,32 @@ test("repeated game-start signal keys do not create duplicate transitions", () =
   assert.equal(hasUnconsumedGameStartSignal(signalState), true);
 });
 
+test("next generation accepts the same game-start signal key again", () => {
+  const signalState = createGameStartSignalState();
+  noteGameStartSignal(signalState, {
+    key: "ddd:seed-a",
+    source: "ddd_game_options",
+    now: 60_000
+  });
+
+  advanceGameStartSignalGeneration(signalState, { preserveSince: 70_000 });
+
+  assert.equal(
+    noteGameStartSignal(signalState, {
+      key: "ddd:seed-a",
+      source: "ddd_game_options",
+      now: 71_000
+    }),
+    true
+  );
+  assert.deepEqual(consumeGameStartSignal(signalState), {
+    key: "1:ddd_game_options:ddd:seed-a",
+    source: "ddd_game_options",
+    seenAt: 71_000,
+    details: null
+  });
+});
+
 test("game-start signal cutoff preserves recent next-game signals while ignoring stale prior-game ones", () => {
   const signalState = createGameStartSignalState();
   noteGameStartSignal(signalState, {
@@ -908,7 +935,7 @@ test("game-start signal cutoff preserves recent next-game signals while ignoring
   assert.deepEqual(
     consumeGameStartSignal(signalState, { since: 50_000 }),
     {
-      key: "ribbon:game-2",
+      key: "0:ribbon_seed:ribbon:game-2",
       source: "ribbon_seed",
       seenAt: 59_500,
       details: { seed: "next-seed" }
@@ -1358,10 +1385,9 @@ test("paused scan continuation preserves cursor and remaining cumulative budget"
   );
 });
 
-test("capture window limits full paused-scope scans and avoids repeated fast-locator spam", async () => {
+test("preflight retries do not prevent the first full scan attempt", async () => {
   const logs = [];
   let pausedEvents = 0;
-  const methods = [];
   const closureCaptureState = createClosureCaptureState();
   armClosureCaptureWindow(closureCaptureState, {
     reason: "bot_on",
@@ -1371,7 +1397,6 @@ test("capture window limits full paused-scope scans and avoids repeated fast-loc
   closureCaptureState.lastSuccessfulLocator = "Ai";
   const cdp = {
     async send(method, params = {}) {
-      methods.push(method);
       if (method === "Runtime.evaluate") {
         return {
           result: {
@@ -1422,6 +1447,9 @@ test("capture window limits full paused-scope scans and avoids repeated fast-loc
     },
     async waitForEvent() {
       pausedEvents += 1;
+      if (pausedEvents < 3) {
+        throw new Error("timeout");
+      }
       return {
         callFrames: [{
           callFrameId: `frame-${pausedEvents}`,
@@ -1445,20 +1473,22 @@ test("capture window limits full paused-scope scans and avoids repeated fast-loc
   });
 
   assert.equal(first.ok, false);
+  assert.equal(first.outcome, "preflight_not_visible");
   assert.equal(second.ok, false);
-  assert.equal(third.reason, "TETR.IO capture attempt window budget exhausted");
+  assert.equal(second.outcome, "preflight_not_visible");
+  assert.equal(third.ok, false);
+  assert.equal(third.outcome, "completed_not_found");
+  assert.equal(closureCaptureState.captureAttemptsInWindow, 3);
+  assert.equal(closureCaptureState.fullScanAttemptsInWindow, 1);
   assert.equal(
     logs.filter((line) => line === "[browser] fast closure locator failed; falling back to scan").length,
     1
   );
   assert.equal(
     logs.filter((line) => line.startsWith("[browser] full closure scan attempt=")).length,
-    2
-  );
-  assert.equal(
-    methods.filter((method) => method === "Debugger.evaluateOnCallFrame").length,
     1
   );
+  assert.equal(pausedEvents, 3);
 });
 
 test("partial full scan keeps the window armed and bot enabled until the second failure", async () => {

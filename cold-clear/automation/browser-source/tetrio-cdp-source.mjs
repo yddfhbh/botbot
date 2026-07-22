@@ -24,7 +24,6 @@ const DEFAULT_FULL_SCAN_CONTINUATION_BACKOFF_MS = 100;
 const DEFAULT_BOOTSTRAP_BLOCKED_LOG_INTERVAL_MS = 5000;
 const DEFAULT_GAME_START_SIGNAL_OVERLAP_MS = 10000;
 const MAX_GAME_START_SIGNALS = 16;
-const MAX_CAPTURE_ATTEMPTS_PER_WINDOW = 2;
 const MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW = 2;
 const MAX_PAUSED_SCOPE_SCAN_CANDIDATES_PER_ATTEMPT = 400;
 const MAX_SCOPE_PROPERTIES_PER_SCOPE = 80;
@@ -177,6 +176,7 @@ export function resetPausedScopeScanProgress(closureCaptureState) {
 
 export function createGameStartSignalState() {
   return {
+    generation: 0,
     latestKey: "",
     latestSource: "",
     latestSeenAt: 0,
@@ -190,12 +190,67 @@ export function resetGameStartSignalState(gameStartSignalState) {
   if (!gameStartSignalState) {
     return false;
   }
+  gameStartSignalState.generation = 0;
   gameStartSignalState.latestKey = "";
   gameStartSignalState.latestSource = "";
   gameStartSignalState.latestSeenAt = 0;
   gameStartSignalState.latestDetails = null;
   gameStartSignalState.consumedKey = "";
   gameStartSignalState.signals = [];
+  return true;
+}
+
+function buildGameStartSignalKey(generation, source, baseKey) {
+  return `${Math.max(0, Number(generation ?? 0))}:${String(source || "unknown")}:${String(baseKey || "")}`;
+}
+
+function refreshLatestGameStartSignalState(gameStartSignalState) {
+  if (!gameStartSignalState) {
+    return false;
+  }
+  const signals = Array.isArray(gameStartSignalState.signals)
+    ? gameStartSignalState.signals
+    : [];
+  const latest = signals.at(-1) ?? null;
+  gameStartSignalState.latestKey = latest?.key ?? "";
+  gameStartSignalState.latestSource = latest?.source ?? "";
+  gameStartSignalState.latestSeenAt = latest?.seenAt ?? 0;
+  gameStartSignalState.latestDetails = latest?.details ?? null;
+  return true;
+}
+
+export function advanceGameStartSignalGeneration(
+  gameStartSignalState,
+  { preserveSince = 0 } = {}
+) {
+  if (!gameStartSignalState) {
+    return false;
+  }
+  const nextGeneration = Math.max(
+    0,
+    Number(gameStartSignalState.generation ?? 0)
+  ) + 1;
+  const nextSignals = [];
+  for (const signal of Array.isArray(gameStartSignalState.signals)
+    ? gameStartSignalState.signals
+    : []) {
+    if (Number(signal?.seenAt ?? 0) < preserveSince) {
+      continue;
+    }
+    nextSignals.push({
+      ...signal,
+      generation: nextGeneration,
+      key: buildGameStartSignalKey(
+        nextGeneration,
+        signal?.source ?? "unknown",
+        signal?.baseKey ?? signal?.key ?? ""
+      )
+    });
+  }
+  gameStartSignalState.generation = nextGeneration;
+  gameStartSignalState.consumedKey = "";
+  gameStartSignalState.signals = nextSignals;
+  refreshLatestGameStartSignalState(gameStartSignalState);
   return true;
 }
 
@@ -211,13 +266,21 @@ export function noteGameStartSignal(
   if (!gameStartSignalState || !key) {
     return false;
   }
-  const normalizedKey = String(key);
+  const normalizedBaseKey = String(key);
+  const generation = Math.max(0, Number(gameStartSignalState.generation ?? 0));
+  const normalizedKey = buildGameStartSignalKey(
+    generation,
+    source,
+    normalizedBaseKey
+  );
   if ((gameStartSignalState.signals ?? []).some((signal) => signal.key === normalizedKey)) {
     return false;
   }
   const nextSignal = {
     key: normalizedKey,
+    baseKey: normalizedBaseKey,
     source: String(source || "unknown"),
+    generation,
     seenAt: now,
     details: details ?? null
   };
@@ -229,10 +292,7 @@ export function noteGameStartSignal(
     signals.shift();
   }
   gameStartSignalState.signals = signals;
-  gameStartSignalState.latestKey = normalizedKey;
-  gameStartSignalState.latestSource = nextSignal.source;
-  gameStartSignalState.latestSeenAt = nextSignal.seenAt;
-  gameStartSignalState.latestDetails = nextSignal.details;
+  refreshLatestGameStartSignalState(gameStartSignalState);
   return true;
 }
 
@@ -655,7 +715,10 @@ function logClosureCaptureWindowInitialized(
     DEFAULT_FULL_SCAN_CUMULATIVE_BUDGET_MS - pausedUsedMs
   );
   log(
-    `[browser] closure window initialized reason=${reason} attempts=${Math.max(
+    `[browser] closure window initialized reason=${reason} capture_attempts=${Math.max(
+      0,
+      Number(closureCaptureState.captureAttemptsInWindow ?? 0)
+    )} full_scan_attempts=${Math.max(
       0,
       Number(closureCaptureState.fullScanAttemptsInWindow ?? 0)
     )} paused_used_ms=${pausedUsedMs} cursor=${formatClosureCaptureCursorLabel(
@@ -1196,6 +1259,9 @@ async function main() {
         clearSnapshotFile(snapshotPath);
         waitingForNextGameSignalCutoffAt =
           Math.max(0, Date.now() - DEFAULT_GAME_START_SIGNAL_OVERLAP_MS);
+        advanceGameStartSignalGeneration(gameStartSignalState, {
+          preserveSince: waitingForNextGameSignalCutoffAt
+        });
 
         console.log(`[browser] game session ended epoch=${gameEpoch}`);
         console.log("[browser] cleared ended game cache; waiting for next game");
@@ -1874,7 +1940,10 @@ export async function readTetrioState(cdp, options) {
       Number(closureCaptureState.cumulativePausedScanBudgetUsedMs ?? 0)
     );
     log(
-      `[browser] closure scan gate attempts=${Math.max(
+      `[browser] closure scan gate capture_attempts=${Math.max(
+        0,
+        Number(closureCaptureState.captureAttemptsInWindow ?? 0)
+      )} full_scan_attempts=${Math.max(
         0,
         Number(closureCaptureState.fullScanAttemptsInWindow ?? 0)
       )} paused_used_ms=${pausedUsedMs} remaining_paused_ms=${Math.max(
@@ -1935,8 +2004,9 @@ export async function readTetrioState(cdp, options) {
           log("[browser] full closure scan paused budget reached; scheduling continuation");
         }
       } else if (
-        capture.reason === "TETR.IO capture attempt window budget exhausted" ||
         capture.reason === "TETR.IO full closure scan cumulative budget exhausted" ||
+        capture.windowBudgetExhausted === true ||
+        closureCaptureState.scanBudgetExhausted === true ||
         ((fullScanOutcome === "partial_budget_exhausted" ||
           fullScanOutcome === "completed_not_found") &&
           closureCaptureState.fullScanAttemptsInWindow >= MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW)
@@ -1985,12 +2055,6 @@ export async function captureTetrioGame(
   let paused = false;
 
   try {
-    if (
-      closureCaptureState &&
-      closureCaptureState.captureAttemptsInWindow >= MAX_CAPTURE_ATTEMPTS_PER_WINDOW
-    ) {
-      return { ok: false, reason: "TETR.IO capture attempt window budget exhausted" };
-    }
     if (closureCaptureState) {
       closureCaptureState.captureAttemptsInWindow += 1;
     }
@@ -2026,7 +2090,11 @@ export async function captureTetrioGame(
       event = null;
     }
     if (!event) {
-      return { ok: false, reason: "TETR.IO game closure not visible yet" };
+      return {
+        ok: false,
+        reason: "TETR.IO game closure not visible yet",
+        outcome: "preflight_not_visible"
+      };
     }
 
     paused = true;
@@ -2037,12 +2105,19 @@ export async function captureTetrioGame(
     await cdp.send("Debugger.resume").catch(() => undefined);
     paused = false;
     if (exposed.ok) {
-      return exposed;
+      return {
+        ...exposed,
+        outcome: exposed.outcome ?? "full_scan_found"
+      };
     }
 
     return exposed.reason
       ? exposed
-      : { ok: false, reason: "TETR.IO game closure not visible yet" };
+      : {
+          ok: false,
+          reason: "TETR.IO game closure not visible yet",
+          outcome: "preflight_not_visible"
+        };
   } finally {
     if (paused) {
       await cdp.send("Debugger.resume").catch(() => undefined);
@@ -2329,6 +2404,7 @@ export async function exposeTetrioGameViaPausedScopeScan(
           }
           return {
             ...exposed,
+            outcome: "full_scan_found",
             progress: {
               attempt: Math.max(1, Number(closureCaptureState?.fullScanAttemptsInWindow ?? 1)),
               frameIndex,
