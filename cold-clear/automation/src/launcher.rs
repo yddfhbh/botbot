@@ -434,6 +434,12 @@ enum LauncherEvent {
     BotExited(Result<(), String>),
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum BotStartMode {
+    UserInitiated,
+    AutoResume,
+}
+
 struct BrowserSession {
     host: ChromiumHostProcess,
     snapshot_provider: ProviderProcess,
@@ -472,6 +478,9 @@ pub struct LauncherApp {
     latest_snapshot_token: Option<String>,
     latest_snapshot_age_ms: Option<u128>,
     ignore_next_bot_exit: bool,
+    bot_desired_enabled: bool,
+    bot_waiting_for_next_game: bool,
+    bot_restart_pending: bool,
 }
 
 impl LauncherApp {
@@ -495,6 +504,9 @@ impl LauncherApp {
             latest_snapshot_token: None,
             latest_snapshot_age_ms: None,
             ignore_next_bot_exit: false,
+            bot_desired_enabled: false,
+            bot_waiting_for_next_game: false,
+            bot_restart_pending: false,
         }
     }
 
@@ -642,6 +654,12 @@ impl LauncherApp {
     }
 
     fn start_bot(&mut self) {
+        self.bot_desired_enabled = true;
+        self.bot_restart_pending = false;
+        self.start_bot_with_mode(BotStartMode::UserInitiated);
+    }
+
+    fn start_bot_with_mode(&mut self, mode: BotStartMode) {
         let browser_ready = self.browser_status == BrowserStatus::Ready;
         let input_ready = self.input_status == InputStatus::Ready;
         let snapshot_running = matches!(
@@ -649,8 +667,15 @@ impl LauncherApp {
             SnapshotStatus::WaitingForGame | SnapshotStatus::Ready
         );
         if self.bot_session.is_some() || !browser_ready || !input_ready || !snapshot_running {
-            self.bot_status = BotStatus::Error;
-            self.push_log("[launcher] bot on blocked: browser runtime is not ready");
+            self.bot_status = if mode == BotStartMode::AutoResume {
+                BotStatus::Starting
+            } else {
+                BotStatus::Error
+            };
+            if mode == BotStartMode::UserInitiated {
+                self.bot_desired_enabled = false;
+                self.push_log("[launcher] bot on blocked: browser runtime is not ready");
+            }
             return;
         }
 
@@ -668,22 +693,46 @@ impl LauncherApp {
             })
         else {
             self.bot_status = BotStatus::Error;
+            if mode == BotStartMode::UserInitiated {
+                self.bot_desired_enabled = false;
+            }
             self.push_log("[launcher] bot on blocked: browser session missing");
             return;
         };
 
-        self.save_state();
+        if mode == BotStartMode::UserInitiated {
+            self.save_state();
+            self.push_log("[launcher] bot on");
+            if let Some(session) = self.browser_session.as_mut() {
+                if let Err(err) = session.snapshot_provider.set_bot_enabled(true) {
+                    self.push_log(format!(
+                        "[browser] failed to forward bot on state to snapshot provider: {err:#}"
+                    ));
+                }
+            }
+        }
         self.bot_status = BotStatus::Starting;
-        self.push_log("[launcher] bot on");
         self.push_log("[bot] starting runner with prewarmed snapshot/input");
 
-        if let Some(snapshot) = self.read_latest_snapshot_info() {
+        let latest_snapshot = self.read_latest_snapshot_info();
+        if let Some(snapshot) = latest_snapshot.as_ref() {
             self.push_log(format!(
                 "[bot] latest snapshot token={} age_ms={}",
                 snapshot.token, snapshot.age_ms
             ));
         } else {
             self.push_log("[bot] latest snapshot not ready yet; waiting for provider update");
+        }
+        if mode == BotStartMode::AutoResume {
+            if let Some(snapshot) = latest_snapshot.as_ref() {
+                if let Some(epoch) = extract_snapshot_epoch(&snapshot.token) {
+                    self.push_log(format!("[bot] runner resumed for game epoch={epoch}"));
+                    self.bot_waiting_for_next_game = false;
+                }
+            } else if !self.bot_waiting_for_next_game {
+                self.push_log("[bot] waiting for next game while remaining enabled");
+                self.bot_waiting_for_next_game = true;
+            }
         }
 
         let config = self.state.to_bot_automation_config(&self.paths);
@@ -744,6 +793,7 @@ impl LauncherApp {
             live_target_pps,
             automation_thread: Some(automation_thread),
         });
+        self.bot_restart_pending = false;
         self.bot_status = BotStatus::On;
         self.push_log("[bot] planner started");
     }
@@ -753,6 +803,9 @@ impl LauncherApp {
     }
 
     fn stop_bot_with_browser_hint(&mut self, browser_remains_open: bool) {
+        self.bot_desired_enabled = false;
+        self.bot_waiting_for_next_game = false;
+        self.bot_restart_pending = false;
         if let Some(mut bot) = self.bot_session.take() {
             self.ignore_next_bot_exit = true;
             bot.stop();
@@ -764,6 +817,13 @@ impl LauncherApp {
             }
             if browser_remains_open {
                 self.push_log("[snapshot] provider remains active");
+            }
+        }
+        if let Some(session) = self.browser_session.as_mut() {
+            if let Err(err) = session.snapshot_provider.set_bot_enabled(false) {
+                self.push_log(format!(
+                    "[browser] failed to forward bot off state to snapshot provider: {err:#}"
+                ));
             }
         }
         self.bot_status = BotStatus::Off;
@@ -940,7 +1000,26 @@ impl LauncherApp {
         self.input_status = InputStatus::Closed;
         self.latest_snapshot_token = None;
         self.latest_snapshot_age_ms = None;
+        self.bot_desired_enabled = false;
+        self.bot_waiting_for_next_game = false;
+        self.bot_restart_pending = false;
         self.push_log("[launcher] browser closed");
+    }
+
+    fn maybe_resume_bot_runner(&mut self) {
+        if !self.bot_restart_pending || !self.bot_desired_enabled || self.bot_session.is_some() {
+            return;
+        }
+        let runtime_ready = self.browser_status == BrowserStatus::Ready
+            && self.input_status == InputStatus::Ready
+            && matches!(
+                self.snapshot_status,
+                SnapshotStatus::WaitingForGame | SnapshotStatus::Ready
+            );
+        if !runtime_ready {
+            return;
+        }
+        self.start_bot_with_mode(BotStartMode::AutoResume);
     }
 
     fn poll_events(&mut self) {
@@ -956,6 +1035,19 @@ impl LauncherApp {
                     self.handle_browser_exited(result);
                 }
                 LauncherEvent::BotLog(line) => {
+                    if self.bot_desired_enabled
+                        && !self.bot_waiting_for_next_game
+                        && line_reports_runner_waiting(&line)
+                    {
+                        self.bot_waiting_for_next_game = true;
+                        self.push_log("[bot] waiting for next game while remaining enabled");
+                        self.push_log("[bot] idle runner remains active");
+                    } else if let Some(epoch) = extract_resumed_epoch_from_bot_log(&line) {
+                        if self.bot_waiting_for_next_game {
+                            self.bot_waiting_for_next_game = false;
+                            self.push_log(format!("[bot] runner resumed for game epoch={epoch}"));
+                        }
+                    }
                     self.push_log(line);
                 }
                 LauncherEvent::BotExited(result) => {
@@ -966,11 +1058,26 @@ impl LauncherApp {
                     self.bot_session = None;
                     match result {
                         Ok(()) => {
-                            self.bot_status = BotStatus::Off;
-                            self.push_log("[bot] automation exited cleanly");
+                            if self.bot_desired_enabled && self.browser_session.is_some() {
+                                self.bot_status = BotStatus::Starting;
+                                self.bot_restart_pending = true;
+                                if !self.bot_waiting_for_next_game {
+                                    self.bot_waiting_for_next_game = true;
+                                    self.push_log(
+                                        "[bot] waiting for next game while remaining enabled",
+                                    );
+                                }
+                            } else {
+                                self.bot_status = BotStatus::Off;
+                                self.bot_waiting_for_next_game = false;
+                                self.bot_restart_pending = false;
+                                self.push_log("[bot] automation exited cleanly");
+                            }
                         }
                         Err(err) => {
                             self.bot_status = BotStatus::Error;
+                            self.bot_waiting_for_next_game = false;
+                            self.bot_restart_pending = false;
                             self.push_log(format!("[bot] automation failed: {err}"));
                         }
                     }
@@ -984,6 +1091,7 @@ impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_browser_runtime();
         self.poll_events();
+        self.maybe_resume_bot_runner();
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level(
             self.state.always_on_top,
         )));
@@ -1230,6 +1338,30 @@ fn extract_planned_token(line: &str) -> Option<String> {
         .find_map(|part| part.strip_prefix("token=").map(|value| value.to_owned()))
 }
 
+fn extract_snapshot_epoch(token: &str) -> Option<u64> {
+    let mut parts = token.split('-');
+    let prefix = parts.next()?;
+    let epoch = parts.next()?;
+    let _piece_counter = parts.next()?;
+    if prefix != "browser" || parts.next().is_some() {
+        return None;
+    }
+    epoch.parse().ok()
+}
+
+fn line_reports_runner_waiting(line: &str) -> bool {
+    line.contains("[automation] idle waiting for next live game after token=")
+}
+
+fn extract_resumed_epoch_from_bot_log(line: &str) -> Option<u64> {
+    if !line.contains("[automation] live game resumed token=") {
+        return None;
+    }
+    line.split_whitespace()
+        .find_map(|part| part.strip_prefix("token="))
+        .and_then(extract_snapshot_epoch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1443,5 +1575,48 @@ mod tests {
             Some("browser-10")
         );
         assert_eq!(extract_planned_token("[automation] waiting"), None);
+    }
+
+    #[test]
+    fn extract_snapshot_epoch_reads_browser_tokens() {
+        assert_eq!(extract_snapshot_epoch("browser-2-0"), Some(2));
+        assert_eq!(extract_snapshot_epoch("browser-17-42"), Some(17));
+        assert_eq!(extract_snapshot_epoch("scanner-2-0"), None);
+    }
+
+    #[test]
+    fn runner_wait_and_resume_logs_keep_bot_enabled_state() {
+        let paths = AppPaths::discover();
+        let mut app = LauncherApp::new(paths);
+        app.bot_desired_enabled = true;
+        app.bot_status = BotStatus::On;
+
+        app.event_tx
+            .send(LauncherEvent::BotLog(
+                "[automation] idle waiting for next live game after token=browser-1-116"
+                    .to_owned(),
+            ))
+            .unwrap();
+        app.poll_events();
+
+        assert!(app.bot_desired_enabled);
+        assert!(app.bot_waiting_for_next_game);
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[bot] waiting for next game while remaining enabled"));
+
+        app.event_tx
+            .send(LauncherEvent::BotLog(
+                "[automation] live game resumed token=browser-2-0 queue=I,O,T".to_owned(),
+            ))
+            .unwrap();
+        app.poll_events();
+
+        assert!(!app.bot_waiting_for_next_game);
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[bot] runner resumed for game epoch=2"));
     }
 }

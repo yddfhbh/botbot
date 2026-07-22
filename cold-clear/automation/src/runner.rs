@@ -2084,6 +2084,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration as StdDuration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct ScriptedScanner {
@@ -2098,6 +2100,27 @@ mod tests {
             };
             self.latest_age = age;
             Ok(Some(snapshot))
+        }
+
+        fn latest_snapshot_age(&self) -> Option<Duration> {
+            self.latest_age
+        }
+    }
+
+    struct IdleThenSnapshotScanner {
+        idle_reads_remaining: usize,
+        snapshot: Option<GameSnapshot>,
+        latest_age: Option<Duration>,
+    }
+
+    impl SnapshotScanner for IdleThenSnapshotScanner {
+        fn next_snapshot(&mut self) -> Result<Option<GameSnapshot>> {
+            if self.idle_reads_remaining > 0 {
+                self.idle_reads_remaining -= 1;
+                self.latest_age = None;
+                return Ok(None);
+            }
+            Ok(self.snapshot.take())
         }
 
         fn latest_snapshot_age(&self) -> Option<Duration> {
@@ -2241,6 +2264,73 @@ mod tests {
             countdown: false,
             active: None,
         }
+    }
+
+    #[test]
+    fn wait_for_next_piece_snapshot_resumes_after_idle_without_timeout() {
+        let stop = AtomicBool::new(false);
+        let mut scanner = IdleThenSnapshotScanner {
+            idle_reads_remaining: 8,
+            snapshot: Some(runner_test_snapshot("browser-2-0", 0)),
+            latest_age: None,
+        };
+        let mut vs_sim_controller =
+            VsSimulationController::new(Path::new("automation/test-live.json"));
+        let previous_snapshot = runner_test_snapshot("browser-1-103", 103);
+        let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let shared_logs = logs.clone();
+
+        let observed = wait_for_next_piece_snapshot(
+            &mut scanner,
+            &mut vs_sim_controller,
+            &previous_snapshot,
+            &stop,
+            Duration::from_millis(200),
+            Duration::ZERO,
+            &mut |line| shared_logs.lock().unwrap().push(line),
+        )
+        .unwrap();
+
+        let snapshot = observed.expect("runner should resume when a new snapshot arrives");
+        assert_eq!(snapshot.snapshot.token, "browser-2-0");
+        let collected = logs.lock().unwrap();
+        assert!(collected.iter().any(|line| {
+            line.contains("[automation] idle waiting for next live game after token=browser-1-103")
+        }));
+        assert!(collected.iter().any(|line| {
+            line.contains("[automation] live game resumed token=browser-2-0")
+        }));
+    }
+
+    #[test]
+    fn wait_for_next_piece_snapshot_only_stops_when_stop_flag_is_set() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let handle = thread::spawn(move || {
+            let mut scanner = ScriptedScanner {
+                snapshots: VecDeque::new(),
+                latest_age: None,
+            };
+            let mut vs_sim_controller =
+                VsSimulationController::new(Path::new("automation/test-live.json"));
+            let previous_snapshot = runner_test_snapshot("browser-1-103", 103);
+            wait_for_next_piece_snapshot(
+                &mut scanner,
+                &mut vs_sim_controller,
+                &previous_snapshot,
+                &thread_stop,
+                Duration::from_millis(1),
+                Duration::ZERO,
+                &mut |_| {},
+            )
+            .unwrap()
+        });
+
+        thread::sleep(StdDuration::from_millis(20));
+        assert!(!handle.is_finished());
+        stop.store(true, AtomicOrdering::Relaxed);
+        let result = handle.join().unwrap();
+        assert!(result.is_none());
     }
 
     #[test]

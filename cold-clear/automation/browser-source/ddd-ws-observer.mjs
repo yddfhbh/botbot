@@ -170,6 +170,7 @@ export async function installDddWsObserver(
     vsSimEnabled = isVsWsSimEnabled(),
     vsBridgePath = DEFAULT_VS_BRIDGE_PATH,
     onVsRoundStatus = null,
+    onGameOptions = null,
     perfEnabled = process.env.FUSION_BROWSER_PERF === "1"
   } = {}
 ) {
@@ -272,7 +273,13 @@ export async function installDddWsObserver(
         for (const chunk of split87Frame(payload)) {
           observerState.decodeAttempts += decodeAttemptCount(chunk);
         }
-        logCapturedCandidates(candidates, event?.requestId, observerState, log);
+        logCapturedCandidates(
+          candidates,
+          event?.requestId,
+          observerState,
+          log,
+          onGameOptions
+        );
         for (const decodedRoot of decodedRoots) {
           try {
             ingestVsBridgeRoot(
@@ -310,7 +317,13 @@ export async function installDddWsObserver(
         const candidates = collectOptionCandidates(decodedRoots);
         const timestamp = Date.now();
         const urlHost = resolveTraceUrlHost(event?.requestId, observerState);
-        logCapturedCandidates(candidates, event?.requestId, observerState, log);
+        logCapturedCandidates(
+          candidates,
+          event?.requestId,
+          observerState,
+          log,
+          onGameOptions
+        );
         for (const decodedRoot of decodedRoots) {
           try {
             ingestVsBridgeRoot(
@@ -592,7 +605,13 @@ function isSensitiveKey(key) {
   return SENSITIVE_KEYS.has(String(key).toLowerCase());
 }
 
-function logCapturedCandidates(candidates, requestId, observerState, log) {
+function logCapturedCandidates(
+  candidates,
+  requestId,
+  observerState,
+  log,
+  onGameOptions = null
+) {
   for (const options of candidates) {
     const signature = buildOptionsSignature(options);
     if (!signature || signature === observerState.lastOptionsSignature) {
@@ -600,6 +619,12 @@ function logCapturedCandidates(candidates, requestId, observerState, log) {
     }
     observerState.lastOptionsSignature = signature;
     observerState.optionsCaptured += 1;
+    try {
+      onGameOptions?.({
+        signature,
+        options
+      });
+    } catch {}
 
     safeLog(log, "[ws-observer] game options captured");
     if (requestId && observerState.requestUrls.has(requestId)) {

@@ -25,6 +25,7 @@ pub fn emit_log(logger: &SharedLogger, line: impl Into<String>) {
 
 pub struct ProviderProcess {
     child: Child,
+    stdin: Option<ChildStdin>,
     log_threads: Vec<JoinHandle<()>>,
     exited: bool,
 }
@@ -70,12 +71,34 @@ impl ProviderProcess {
         if self.exited {
             return;
         }
+        self.stdin.take();
         let _ = self.child.kill();
         let _ = self.child.wait();
         self.exited = true;
         for handle in self.log_threads.drain(..) {
             let _ = handle.join();
         }
+    }
+
+    pub fn set_bot_enabled(&mut self, enabled: bool) -> Result<()> {
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Ok(());
+        };
+        let payload: &[u8] = if enabled {
+            br#"{"type":"bot_enabled","enabled":true}"#
+        } else {
+            br#"{"type":"bot_enabled","enabled":false}"#
+        };
+        stdin
+            .write_all(payload)
+            .context("failed to send browser provider bot_enabled control message")?;
+        stdin
+            .write_all(b"\n")
+            .context("failed to terminate browser provider control message")?;
+        stdin
+            .flush()
+            .context("failed to flush browser provider control message")?;
+        Ok(())
     }
 
     pub fn start_prewarmed(
@@ -329,6 +352,7 @@ fn spawn_browser_provider(
         .arg("--connect-only")
         .arg(bool_flag(config.browser.connect_only))
         .current_dir(&paths.workspace_root)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -347,6 +371,7 @@ fn spawn_browser_provider(
         .stdout
         .take()
         .context("browser snapshot helper stdout was not available")?;
+    let stdin = child.stdin.take();
     let mut stdout_reader = BufReader::new(stdout);
     wait_for_helper_ready(
         &mut child,
@@ -378,6 +403,7 @@ fn spawn_browser_provider(
     );
     Ok(ProviderProcess {
         child,
+        stdin,
         log_threads,
         exited: false,
     })
@@ -413,6 +439,7 @@ fn spawn_scanner_provider(
     );
     Ok(ProviderProcess {
         child,
+        stdin: None,
         log_threads,
         exited: false,
     })

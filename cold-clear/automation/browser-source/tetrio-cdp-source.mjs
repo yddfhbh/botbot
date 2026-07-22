@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -14,6 +15,19 @@ import {
 const DEFAULT_NEXT_COUNT = 6;
 const DEFAULT_STATUS_MS = 2500;
 const DEFAULT_CAPTURE_COOLDOWN_MS = 2000;
+const DEFAULT_CAPTURE_ARMING_WINDOW_MS = 8000;
+const DEFAULT_CAPTURE_SKIP_LOG_INTERVAL_MS = 60000;
+const DEFAULT_CAPTURE_RETRY_SCHEDULE_MS = [750, 1000, 1500, 1500];
+const DEFAULT_FULL_SCAN_PAUSE_BUDGET_MS = 350;
+const DEFAULT_FULL_SCAN_CUMULATIVE_BUDGET_MS = 700;
+const DEFAULT_FULL_SCAN_CONTINUATION_BACKOFF_MS = 100;
+const DEFAULT_BOOTSTRAP_BLOCKED_LOG_INTERVAL_MS = 5000;
+const DEFAULT_GAME_START_SIGNAL_OVERLAP_MS = 10000;
+const MAX_GAME_START_SIGNALS = 16;
+const MAX_CAPTURE_ATTEMPTS_PER_WINDOW = 2;
+const MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW = 2;
+const MAX_PAUSED_SCOPE_SCAN_CANDIDATES_PER_ATTEMPT = 400;
+const MAX_SCOPE_PROPERTIES_PER_SCOPE = 80;
 const DEFAULT_SUPPRESSED_REASON = "VS WebSocket simulation owns live state";
 const PERF_LOG_INTERVAL_MS = 2000;
 const DEFAULT_BOOTSTRAP_TRANSPORT_SETTLE_MS = 1500;
@@ -75,19 +89,572 @@ export function shouldAttemptClosureCapture({
   suppressClosureCapture,
   bootstrapReady = true,
   stateOk,
+  gameplayExpected = false,
+  nextAttemptAt = null,
   lastCaptureAt = 0,
   lastPageProbeAt = 0,
   now = Date.now(),
   cooldownMs = DEFAULT_CAPTURE_COOLDOWN_MS
 }) {
+  const retryReady =
+    Number.isFinite(nextAttemptAt) && nextAttemptAt !== null
+      ? now >= nextAttemptAt
+      : now - lastCaptureAt >= cooldownMs &&
+        now - lastPageProbeAt >= cooldownMs;
   return Boolean(
     probePageState &&
+      gameplayExpected &&
       !suppressClosureCapture &&
       bootstrapReady &&
       !stateOk &&
-      now - lastCaptureAt >= cooldownMs &&
-      now - lastPageProbeAt >= cooldownMs
+      retryReady
   );
+}
+
+export function createClosureCaptureState() {
+  return {
+    armedUntil: 0,
+    armedReason: "",
+    lastSkippedLogAt: 0,
+    nextAttemptAt: 0,
+    retryCount: 0,
+    lastSuccessfulLocator: "",
+    pendingCaptureArm: null,
+    firstAttemptLoggedForReason: "",
+    captureAttemptsInWindow: 0,
+    fullScanAttemptsInWindow: 0,
+    cumulativePausedScanBudgetUsedMs: 0,
+    pausedScopeScanCursor: null,
+    windowSequence: 0,
+    scanBudgetExhausted: false,
+    fastLocatorAttempted: false
+  };
+}
+
+function createPausedScopeScanCursor() {
+  return {
+    frameIndex: 0,
+    scopeIndex: 0,
+    propertyIndex: 0,
+    completedScopeKeys: [],
+    seenCandidateKeys: []
+  };
+}
+
+function clearPausedScopeScanCursor(closureCaptureState) {
+  if (!closureCaptureState) {
+    return false;
+  }
+  closureCaptureState.pausedScopeScanCursor = null;
+  return true;
+}
+
+function resetClosureCaptureScanWindowState(
+  closureCaptureState,
+  { nextAttemptAt = 0, cursor = null } = {}
+) {
+  if (!closureCaptureState) {
+    return false;
+  }
+  closureCaptureState.fullScanAttemptsInWindow = 0;
+  closureCaptureState.cumulativePausedScanBudgetUsedMs = 0;
+  closureCaptureState.pausedScopeScanCursor = cursor;
+  closureCaptureState.scanBudgetExhausted = false;
+  closureCaptureState.fastLocatorAttempted = false;
+  closureCaptureState.nextAttemptAt = nextAttemptAt;
+  return true;
+}
+
+export function resetPausedScopeScanProgress(closureCaptureState) {
+  if (!closureCaptureState) {
+    return false;
+  }
+  closureCaptureState.cumulativePausedScanBudgetUsedMs = 0;
+  clearPausedScopeScanCursor(closureCaptureState);
+  closureCaptureState.scanBudgetExhausted = false;
+  return true;
+}
+
+export function createGameStartSignalState() {
+  return {
+    latestKey: "",
+    latestSource: "",
+    latestSeenAt: 0,
+    latestDetails: null,
+    consumedKey: "",
+    signals: []
+  };
+}
+
+export function resetGameStartSignalState(gameStartSignalState) {
+  if (!gameStartSignalState) {
+    return false;
+  }
+  gameStartSignalState.latestKey = "";
+  gameStartSignalState.latestSource = "";
+  gameStartSignalState.latestSeenAt = 0;
+  gameStartSignalState.latestDetails = null;
+  gameStartSignalState.consumedKey = "";
+  gameStartSignalState.signals = [];
+  return true;
+}
+
+export function noteGameStartSignal(
+  gameStartSignalState,
+  {
+    key,
+    source = "unknown",
+    now = Date.now(),
+    details = null
+  } = {}
+) {
+  if (!gameStartSignalState || !key) {
+    return false;
+  }
+  const normalizedKey = String(key);
+  if ((gameStartSignalState.signals ?? []).some((signal) => signal.key === normalizedKey)) {
+    return false;
+  }
+  const nextSignal = {
+    key: normalizedKey,
+    source: String(source || "unknown"),
+    seenAt: now,
+    details: details ?? null
+  };
+  const signals = Array.isArray(gameStartSignalState.signals)
+    ? gameStartSignalState.signals
+    : [];
+  signals.push(nextSignal);
+  while (signals.length > MAX_GAME_START_SIGNALS) {
+    signals.shift();
+  }
+  gameStartSignalState.signals = signals;
+  gameStartSignalState.latestKey = normalizedKey;
+  gameStartSignalState.latestSource = nextSignal.source;
+  gameStartSignalState.latestSeenAt = nextSignal.seenAt;
+  gameStartSignalState.latestDetails = nextSignal.details;
+  return true;
+}
+
+export function hasUnconsumedGameStartSignal(
+  gameStartSignalState,
+  { since = 0 } = {}
+) {
+  if (!Array.isArray(gameStartSignalState?.signals)) {
+    return false;
+  }
+  return gameStartSignalState.signals.some((signal) => signal.seenAt >= since);
+}
+
+export function consumeGameStartSignal(
+  gameStartSignalState,
+  { since = 0 } = {}
+) {
+  if (!Array.isArray(gameStartSignalState?.signals)) {
+    return null;
+  }
+  const index = gameStartSignalState.signals.findIndex((signal) => signal.seenAt >= since);
+  if (index < 0) {
+    return null;
+  }
+  const [signal] = gameStartSignalState.signals.splice(index, 1);
+  gameStartSignalState.consumedKey = signal.key;
+  return {
+    key: signal.key,
+    source: signal.source,
+    seenAt: signal.seenAt,
+    details: signal.details
+  };
+}
+
+export function applyGameStartSignalToNetwork(
+  network,
+  signal,
+  now = Date.now()
+) {
+  if (!network || !signal?.details || signal.details.seed === undefined || signal.details.seed === null) {
+    return false;
+  }
+  network.seed = String(signal.details.seed);
+  const nextCount = Number.parseInt(
+    signal.details.nextCount ?? `${DEFAULT_NEXT_COUNT}`,
+    10
+  );
+  network.nextCount = Number.isFinite(nextCount) && nextCount > 0
+    ? nextCount
+    : DEFAULT_NEXT_COUNT;
+  const readyAt = Number(signal.details.readyAt);
+  const countdownMs = Number(signal.details.countdownMs);
+  if (Number.isFinite(readyAt) && readyAt > 0) {
+    network.readyAt = readyAt;
+  } else if (Number.isFinite(countdownMs) && countdownMs >= 0) {
+    network.readyAt = now + countdownMs;
+  } else {
+    network.readyAt = 0;
+  }
+  return true;
+}
+
+export function isClosureCaptureArmed(
+  closureCaptureState,
+  now = Date.now()
+) {
+  return Boolean(closureCaptureState && closureCaptureState.armedUntil > now);
+}
+
+export function armClosureCaptureWindow(
+  closureCaptureState,
+  {
+    reason = "gameplay_signal",
+    now = Date.now(),
+    windowMs = DEFAULT_CAPTURE_ARMING_WINDOW_MS,
+    log = console.log,
+    restartWindow = false
+  } = {}
+) {
+  if (!closureCaptureState) {
+    return false;
+  }
+  const nextUntil = now + Math.max(0, windowMs);
+  const wasArmed = isClosureCaptureArmed(closureCaptureState, now);
+  const reasonChanged = closureCaptureState.armedReason !== reason;
+  closureCaptureState.armedUntil = restartWindow
+    ? nextUntil
+    : Math.max(closureCaptureState.armedUntil, nextUntil);
+  closureCaptureState.armedReason = reason;
+  closureCaptureState.lastSkippedLogAt = 0;
+  closureCaptureState.firstAttemptLoggedForReason = "";
+  if (!wasArmed || reasonChanged || restartWindow) {
+    closureCaptureState.retryCount = 0;
+    closureCaptureState.captureAttemptsInWindow = 0;
+    resetClosureCaptureScanWindowState(closureCaptureState, {
+      nextAttemptAt: now,
+      cursor: createPausedScopeScanCursor()
+    });
+    closureCaptureState.windowSequence += 1;
+  }
+  if (!wasArmed || reasonChanged || restartWindow) {
+    log(`[browser] closure capture armed reason=${reason}`);
+  }
+  return true;
+}
+
+export function disarmClosureCaptureWindow(
+  closureCaptureState,
+  {
+    reason = "gameplay_inactive",
+    log = console.log,
+    clearPending = false
+  } = {}
+) {
+  if (!closureCaptureState) {
+    return false;
+  }
+  const hadPending = Boolean(closureCaptureState.pendingCaptureArm);
+  if (clearPending) {
+    clearPendingClosureCaptureArm(closureCaptureState);
+  }
+  if (closureCaptureState.armedUntil === 0) {
+    return hadPending;
+  }
+  closureCaptureState.armedUntil = 0;
+  closureCaptureState.armedReason = "";
+  closureCaptureState.lastSkippedLogAt = 0;
+  closureCaptureState.nextAttemptAt = 0;
+  closureCaptureState.retryCount = 0;
+  closureCaptureState.firstAttemptLoggedForReason = "";
+  closureCaptureState.captureAttemptsInWindow = 0;
+  resetClosureCaptureScanWindowState(closureCaptureState);
+  log(`[browser] closure capture disarmed reason=${reason}`);
+  return true;
+}
+
+export function clearPendingClosureCaptureArm(closureCaptureState) {
+  if (!closureCaptureState?.pendingCaptureArm) {
+    return false;
+  }
+  closureCaptureState.pendingCaptureArm = null;
+  return true;
+}
+
+export function hasPendingClosureCaptureArm(closureCaptureState) {
+  return Boolean(closureCaptureState?.pendingCaptureArm);
+}
+
+export function requestClosureCaptureArm(
+  closureCaptureState,
+  {
+    reason = "gameplay_signal",
+    now = Date.now(),
+    bootstrapReady = true,
+    windowMs = DEFAULT_CAPTURE_ARMING_WINDOW_MS,
+    log = console.log
+  } = {}
+) {
+  if (!closureCaptureState) {
+    return false;
+  }
+  if (bootstrapReady) {
+    clearPendingClosureCaptureArm(closureCaptureState);
+    return armClosureCaptureWindow(closureCaptureState, {
+      reason,
+      now,
+      windowMs,
+      log
+    });
+  }
+  if (!closureCaptureState.pendingCaptureArm) {
+    closureCaptureState.pendingCaptureArm = {
+      reason,
+      requestedAt: now
+    };
+    log(`[browser] closure capture pending reason=${reason} bootstrap_not_ready`);
+    return true;
+  }
+  return false;
+}
+
+export function activatePendingClosureCaptureArm(
+  closureCaptureState,
+  {
+    now = Date.now(),
+    windowMs = DEFAULT_CAPTURE_ARMING_WINDOW_MS,
+    log = console.log
+  } = {}
+) {
+  const pending = closureCaptureState?.pendingCaptureArm;
+  if (!pending) {
+    return false;
+  }
+  clearPendingClosureCaptureArm(closureCaptureState);
+  log(`[browser] bootstrap ready; activating pending arm reason=${pending.reason}`);
+  return armClosureCaptureWindow(closureCaptureState, {
+    reason: `${pending.reason}_after_bootstrap`,
+    now,
+    windowMs,
+    log,
+    restartWindow: true
+  });
+}
+
+export function reactivateClosureCaptureArmAfterBootstrap(
+  closureCaptureState,
+  {
+    now = Date.now(),
+    windowMs = DEFAULT_CAPTURE_ARMING_WINDOW_MS,
+    log = console.log
+  } = {}
+) {
+  if (!closureCaptureState || closureCaptureState.armedUntil === 0) {
+    return false;
+  }
+  const baseReason = String(closureCaptureState.armedReason || "gameplay_signal");
+  const nextReason = baseReason.endsWith("_after_bootstrap")
+    ? baseReason
+    : `${baseReason}_after_bootstrap`;
+  return armClosureCaptureWindow(closureCaptureState, {
+    reason: nextReason,
+    now,
+    windowMs,
+    log,
+    restartWindow: true
+  });
+}
+
+export function deriveGameplayPhase(state) {
+  if (state?.playing === true) {
+    return "playing";
+  }
+  if (state?.countdown === true) {
+    return "countdown";
+  }
+  return "inactive";
+}
+
+export function isGameplayExpectedForClosureCapture({
+  state,
+  activeRoundId = "",
+  closureCaptureState = null,
+  now = Date.now()
+}) {
+  return Boolean(
+    activeRoundId ||
+      state?.countdown === true ||
+      state?.playing === true ||
+      isClosureCaptureArmed(closureCaptureState, now)
+  );
+}
+
+export function shouldLogClosureCaptureSkipped({
+  gameplayExpected,
+  lastSkippedLogAt = 0,
+  now = Date.now(),
+  intervalMs = DEFAULT_CAPTURE_SKIP_LOG_INTERVAL_MS
+}) {
+  return !gameplayExpected && now - lastSkippedLogAt >= intervalMs;
+}
+
+export function createBrowserControlState() {
+  return {
+    botEnabled: false
+  };
+}
+
+export function resetClosureCaptureLocatorHint(closureCaptureState) {
+  if (!closureCaptureState) {
+    return false;
+  }
+  closureCaptureState.lastSuccessfulLocator = "";
+  return true;
+}
+
+export function expireClosureCaptureWindow(
+  closureCaptureState,
+  now = Date.now(),
+  { log = null } = {}
+) {
+  if (!closureCaptureState || closureCaptureState.armedUntil === 0) {
+    return false;
+  }
+  if (closureCaptureState.armedUntil > now) {
+    return false;
+  }
+  const previousReason = closureCaptureState.armedReason || "gameplay_signal";
+  closureCaptureState.armedUntil = 0;
+  closureCaptureState.armedReason = "";
+  closureCaptureState.lastSkippedLogAt = 0;
+  closureCaptureState.nextAttemptAt = 0;
+  closureCaptureState.retryCount = 0;
+  closureCaptureState.firstAttemptLoggedForReason = "";
+  closureCaptureState.captureAttemptsInWindow = 0;
+  resetClosureCaptureScanWindowState(closureCaptureState);
+  if (typeof log === "function") {
+    log(
+      `[browser] closure capture disarmed reason=window_expired previous_reason=${previousReason}`
+    );
+  }
+  return true;
+}
+
+export function scheduleNextClosureCaptureAttempt(
+  closureCaptureState,
+  now = Date.now(),
+  retryScheduleMs = DEFAULT_CAPTURE_RETRY_SCHEDULE_MS
+) {
+  if (!closureCaptureState) {
+    return 0;
+  }
+  const index = Math.min(
+    closureCaptureState.retryCount,
+    Math.max(0, retryScheduleMs.length - 1)
+  );
+  const delayMs = Math.max(0, retryScheduleMs[index] ?? DEFAULT_CAPTURE_COOLDOWN_MS);
+  closureCaptureState.retryCount += 1;
+  closureCaptureState.nextAttemptAt = now + delayMs;
+  return delayMs;
+}
+
+export function scheduleClosureCaptureContinuation(
+  closureCaptureState,
+  now = Date.now(),
+  delayMs = DEFAULT_FULL_SCAN_CONTINUATION_BACKOFF_MS
+) {
+  if (!closureCaptureState) {
+    return 0;
+  }
+  const nextDelayMs = Math.max(0, delayMs);
+  closureCaptureState.nextAttemptAt = now + nextDelayMs;
+  return nextDelayMs;
+}
+
+function formatScanCursor(cursor = null) {
+  return {
+    frameIndex: Math.max(0, Number(cursor?.frameIndex ?? 0)),
+    scopeIndex: Math.max(0, Number(cursor?.scopeIndex ?? 0)),
+    candidateIndex: Math.max(
+      0,
+      Number(cursor?.candidateIndex ?? cursor?.propertyIndex ?? 0)
+    )
+  };
+}
+
+function logPausedScopeScanProgress(log, progress) {
+  if (typeof log !== "function" || !progress) {
+    return;
+  }
+  log(
+    `[browser] full closure scan progress attempt=${progress.attempt}/${MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW} frame=${progress.frameIndex} scope=${progress.scopeIndex} candidate=${progress.candidateIndex} inspected_objects=${progress.inspectedObjects} paused_ms=${progress.pausedMs}`
+  );
+}
+
+function logPausedScopeScanContinuation(log, cursor) {
+  if (typeof log !== "function" || !cursor) {
+    return;
+  }
+  const formatted = formatScanCursor(cursor);
+  log(
+    `[browser] full closure scan continuation from frame=${formatted.frameIndex} scope=${formatted.scopeIndex} candidate=${formatted.candidateIndex}`
+  );
+}
+
+function scorePausedScopeDescriptor(descriptor) {
+  const locator = String(descriptor?.name ?? "").trim().toLowerCase();
+  if (!locator) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  let score = 0;
+  if (locator === "game") score += 200;
+  if (locator.includes("game")) score += 120;
+  if (locator.includes("field")) score += 50;
+  if (locator.includes("queue")) score += 50;
+  if (locator.includes("hold")) score += 50;
+  if (locator.includes("board")) score += 35;
+  if (locator.includes("current")) score += 35;
+  if (locator.includes("piece")) score += 20;
+  if (locator.length >= 4) score += 5;
+  return score;
+}
+
+export function applyBrowserControlMessage({
+  message,
+  controlState,
+  closureCaptureState,
+  now = Date.now(),
+  log = console.log,
+  windowMs = DEFAULT_CAPTURE_ARMING_WINDOW_MS,
+  bootstrapReady = true
+}) {
+  if (
+    !message ||
+    typeof message !== "object" ||
+    message.type !== "bot_enabled" ||
+    typeof message.enabled !== "boolean"
+  ) {
+    return false;
+  }
+  if (!controlState) {
+    return false;
+  }
+  if (controlState.botEnabled === message.enabled) {
+    return false;
+  }
+  controlState.botEnabled = message.enabled;
+  if (message.enabled) {
+    requestClosureCaptureArm(closureCaptureState, {
+      reason: "bot_on",
+      now,
+      bootstrapReady,
+      windowMs,
+      log
+    });
+  } else {
+    disarmClosureCaptureWindow(closureCaptureState, {
+      reason: "bot_off",
+      log,
+      clearPending: true
+    });
+  }
+  return true;
 }
 
 export function createBootstrapState(now = Date.now()) {
@@ -96,7 +663,12 @@ export function createBootstrapState(now = Date.now()) {
     documentCompleteAt: 0,
     transportReadyAt: 0,
     waitingLogged: false,
-    readyLogged: false
+    readyLogged: false,
+    lastDocumentReadyState: "loading",
+    lastReadHref: "",
+    lastBlockedReason: "",
+    lastBlockedLogAt: 0,
+    lastReady: false
   };
 }
 
@@ -111,6 +683,11 @@ export function resetBootstrapState(
   bootstrapState.transportReadyAt = 0;
   bootstrapState.waitingLogged = false;
   bootstrapState.readyLogged = false;
+  bootstrapState.lastDocumentReadyState = "loading";
+  bootstrapState.lastReadHref = "";
+  bootstrapState.lastBlockedReason = "";
+  bootstrapState.lastBlockedLogAt = 0;
+  bootstrapState.lastReady = false;
   return bootstrapState;
 }
 
@@ -130,9 +707,16 @@ export function updateBootstrapDocumentState(
   pageState,
   now = Date.now()
 ) {
+  if (bootstrapState) {
+    bootstrapState.lastDocumentReadyState = String(
+      pageState?.readyState ?? "loading"
+    );
+    bootstrapState.lastReadHref = String(pageState?.href ?? "");
+  }
   if (
     bootstrapState &&
-    pageState?.readyState === "complete" &&
+    pageState?.readyState &&
+    pageState.readyState !== "loading" &&
     bootstrapState.documentCompleteAt === 0
   ) {
     bootstrapState.documentCompleteAt = now;
@@ -140,7 +724,7 @@ export function updateBootstrapDocumentState(
   return bootstrapState;
 }
 
-export function isBootstrapReadyForClosureCapture(
+export function getBootstrapReadinessStatus(
   bootstrapState,
   now = Date.now(),
   {
@@ -149,12 +733,65 @@ export function isBootstrapReadyForClosureCapture(
   } = {}
 ) {
   if (!bootstrapState?.documentCompleteAt) {
-    return false;
+    return {
+      ready: false,
+      reason: `document_ready_state_${bootstrapState?.lastDocumentReadyState ?? "loading"}`
+    };
   }
   if (bootstrapState.transportReadyAt > 0) {
-    return now - bootstrapState.transportReadyAt >= transportSettleMs;
+    const elapsedMs = now - bootstrapState.transportReadyAt;
+    if (elapsedMs >= transportSettleMs) {
+      return { ready: true, reason: "transport_settled" };
+    }
+    return {
+      ready: false,
+      reason: `transport_settling_${Math.max(0, transportSettleMs - elapsedMs)}ms_remaining`
+    };
   }
-  return now - bootstrapState.connectedAt >= fallbackMs;
+  const elapsedSinceConnectMs = now - bootstrapState.connectedAt;
+  if (elapsedSinceConnectMs >= fallbackMs) {
+    return { ready: true, reason: "fallback_elapsed" };
+  }
+  return {
+    ready: false,
+    reason: `fallback_waiting_${Math.max(0, fallbackMs - elapsedSinceConnectMs)}ms_remaining`
+  };
+}
+
+export function isBootstrapReadyForClosureCapture(
+  bootstrapState,
+  now = Date.now(),
+  options = {}
+) {
+  return getBootstrapReadinessStatus(bootstrapState, now, options).ready;
+}
+
+export function shouldLogBootstrapBlocked(
+  bootstrapState,
+  reason,
+  now = Date.now(),
+  intervalMs = DEFAULT_BOOTSTRAP_BLOCKED_LOG_INTERVAL_MS
+) {
+  if (!bootstrapState) {
+    return false;
+  }
+  return (
+    bootstrapState.lastBlockedReason !== reason ||
+    now - bootstrapState.lastBlockedLogAt >= intervalMs
+  );
+}
+
+export function markBootstrapBlockedLogged(
+  bootstrapState,
+  reason,
+  now = Date.now()
+) {
+  if (!bootstrapState) {
+    return false;
+  }
+  bootstrapState.lastBlockedReason = reason;
+  bootstrapState.lastBlockedLogAt = now;
+  return true;
 }
 
 export function isTransientRuntimeError(error) {
@@ -270,6 +907,9 @@ async function main() {
   let dddWsObserverCleanup = null;
   let vsRoundActive = false;
   let vsRoundId = "";
+  const browserControlState = createBrowserControlState();
+  const closureCaptureState = createClosureCaptureState();
+  const gameStartSignalState = createGameStartSignalState();
   let lastPerfLoggedAt = Date.now();
   let loopStartedAt = Date.now();
   let maxEventLoopDelayMs = 0;
@@ -291,12 +931,33 @@ async function main() {
           return;
         }
         if (vsRoundActive) {
+          disarmClosureCaptureWindow(closureCaptureState, {
+            reason: "vs_round_active"
+          });
           console.log(
             `[browser] VS round active; closure capture probe suspended roundId=${vsRoundId}`
           );
         } else {
+          disarmClosureCaptureWindow(closureCaptureState, {
+            reason: "vs_round_inactive"
+          });
           console.log("[browser] VS round inactive; closure capture probe restored");
         }
+      },
+      onGameOptions: ({ signature, options }) => {
+        const now = Date.now();
+        noteGameStartSignal(gameStartSignalState, {
+          key: `ddd:${signature}`,
+          source: "ddd_game_options",
+          now,
+          details: {
+            seed: options?.seed ?? null,
+            gameid: options?.gameid ?? null,
+            nextCount: options?.nextcount ?? DEFAULT_NEXT_COUNT,
+            countdownMs: estimateCountdownWait(options),
+            readyAt: now + estimateCountdownWait(options)
+          }
+        });
       },
       perfEnabled: browserPerfEnabled
     });
@@ -318,23 +979,69 @@ async function main() {
   const network = createTetrioNetworkState();
   const bootstrapState = createBootstrapState();
   const transientState = { lastRuntimeError: "" };
+  console.log("[browser] browser target state reset");
   if (useRibbonWebsocket) {
-    await installRibbonMonitor(cdp, network, msgpack, bootstrapState);
+    await installRibbonMonitor(cdp, network, msgpack, bootstrapState, {
+      onGameplaySignal: ({ key, source, details }) =>
+        noteGameStartSignal(gameStartSignalState, {
+          key,
+          source,
+          now: Date.now(),
+          details
+        })
+    });
   }
+  const resetBrowserTargetState = ({ resetConnectedAt = false } = {}) => {
+    resetBootstrapState(bootstrapState, { resetConnectedAt });
+    resetTetrioNetworkState(network);
+    resetClosureCaptureLocatorHint(closureCaptureState);
+    resetPausedScopeScanProgress(closureCaptureState);
+    clearPendingClosureCaptureArm(closureCaptureState);
+    resetGameStartSignalState(gameStartSignalState);
+    console.log("[browser] browser target state reset");
+  };
   cdp.on("Page.frameNavigated", (event) => {
     if (event?.frame?.parentId) {
       return;
     }
-    resetBootstrapState(bootstrapState, { resetConnectedAt: true });
-    network.lastPageProbeAt = 0;
+    resetBrowserTargetState({ resetConnectedAt: true });
+    disarmClosureCaptureWindow(closureCaptureState, {
+      reason: "page_navigated"
+    });
   });
   cdp.on("Runtime.executionContextsCleared", () => {
-    resetBootstrapState(bootstrapState);
-    network.lastPageProbeAt = 0;
+    resetBrowserTargetState();
+    disarmClosureCaptureWindow(closureCaptureState, {
+      reason: "execution_context_cleared"
+    });
+  });
+  const control = createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+    terminal: false
+  });
+  control.on("line", (line) => {
+    if (!line?.trim()) {
+      return;
+    }
+    let message = null;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      return;
+    }
+    applyBrowserControlMessage({
+      message,
+      controlState: browserControlState,
+      closureCaptureState,
+      bootstrapReady: isBootstrapReadyForClosureCapture(bootstrapState),
+      log: (entry) => console.log(entry)
+    });
   });
 
   let gameEpoch = 1;
   let waitingForNextGame = false;
+  let waitingForNextGameSignalCutoffAt = 0;
   let endedHandled = false;
   let lastReason = "";
   let lastReasonAt = 0;
@@ -350,6 +1057,8 @@ async function main() {
       } catch {}
       dddWsObserverCleanup = null;
     }
+    resetBrowserTargetState();
+    clearPendingClosureCaptureArm(closureCaptureState);
     await cdp.close().catch(() => undefined);
     if (ownsChromium && browserProcess) {
       await shutdownChromium(browserProcess);
@@ -373,7 +1082,10 @@ async function main() {
         probeState,
         bootstrapState,
         transientState,
+        browserControlState,
         suppressClosureCapture: vsWsSimEnabled && vsRoundActive,
+        activeRoundId: vsRoundActive ? vsRoundId : "",
+        closureCaptureState,
         suppressedReason: DEFAULT_SUPPRESSED_REASON,
         perfEnabled: browserPerfEnabled
       });
@@ -386,10 +1098,42 @@ async function main() {
 
         resetSnapshotTracking(snapshotTracking);
         probeState.lastCaptureAt = 0;
+        resetTetrioNetworkState(network);
+        resetClosureCaptureLocatorHint(closureCaptureState);
+        disarmClosureCaptureWindow(closureCaptureState, {
+          reason: "game_ended"
+        });
         clearSnapshotFile(snapshotPath);
+        waitingForNextGameSignalCutoffAt =
+          Math.max(0, Date.now() - DEFAULT_GAME_START_SIGNAL_OVERLAP_MS);
 
         console.log(`[browser] game session ended epoch=${gameEpoch}`);
         console.log("[browser] cleared ended game cache; waiting for next game");
+      }
+
+      if (
+        browserControlState.botEnabled &&
+        waitingForNextGame &&
+        hasUnconsumedGameStartSignal(gameStartSignalState, {
+          since: waitingForNextGameSignalCutoffAt
+        })
+      ) {
+        const signal = consumeGameStartSignal(gameStartSignalState, {
+          since: waitingForNextGameSignalCutoffAt
+        });
+        if (signal) {
+          console.log(`[browser] game-start signal source=${signal.source}`);
+          applyGameStartSignalToNetwork(network, signal);
+          requestClosureCaptureArm(closureCaptureState, {
+            reason: "game_start_signal",
+            now: Date.now(),
+            bootstrapReady: isBootstrapReadyForClosureCapture(bootstrapState),
+            log: (message) => console.log(message)
+          });
+          console.log(
+            `[browser] game-start transition armed epoch_candidate=${gameEpoch + 1}`
+          );
+        }
       }
 
       if (isTetrioGameEndedState(state)) {
@@ -442,6 +1186,7 @@ async function main() {
       if (shouldAdvanceGameEpoch(state, waitingForNextGame)) {
         gameEpoch += 1;
         waitingForNextGame = false;
+        waitingForNextGameSignalCutoffAt = 0;
         endedHandled = false;
         resetSnapshotTracking(snapshotTracking);
         console.log(`[browser] new game detected epoch=${gameEpoch}`);
@@ -705,6 +1450,18 @@ function createTetrioNetworkState() {
   };
 }
 
+export function resetTetrioNetworkState(network) {
+  if (!network) {
+    return false;
+  }
+  network.seed = null;
+  network.nextCount = DEFAULT_NEXT_COUNT;
+  network.readyAt = 0;
+  network.ribbonSeen = false;
+  network.lastPageProbeAt = 0;
+  return true;
+}
+
 async function installBackgroundInputKeepalive(cdp) {
   const source = `(() => {
     if (window.__fusionBackgroundInputKeepalive) return window.__fusionBackgroundInputKeepalive;
@@ -754,7 +1511,13 @@ async function installBackgroundInputKeepalive(cdp) {
   }).catch(() => undefined);
 }
 
-async function installRibbonMonitor(cdp, network, msgpack, bootstrapState) {
+async function installRibbonMonitor(
+  cdp,
+  network,
+  msgpack,
+  bootstrapState,
+  { onGameplaySignal = null } = {}
+) {
   await cdp.send("Network.enable").catch(() => undefined);
   cdp.on("Network.webSocketCreated", (event) => {
     if (/spool\.tetr\.io\/ribbon/i.test(event?.url ?? "")) {
@@ -768,13 +1531,18 @@ async function installRibbonMonitor(cdp, network, msgpack, bootstrapState) {
     const payload = event?.response?.payloadData;
     if (!payload) return;
     const buffer = event?.response?.opcode === 2 ? Buffer.from(payload, "base64") : Buffer.from(payload, "utf8");
-    inspectRibbonPayload(buffer, network, msgpack.unpack);
+    inspectRibbonPayload(buffer, network, msgpack.unpack, onGameplaySignal);
   };
   cdp.on("Network.webSocketFrameReceived", handleFrame);
   cdp.on("Network.webSocketFrameSent", handleFrame);
 }
 
-function inspectRibbonPayload(payload, network, unpack) {
+function inspectRibbonPayload(
+  payload,
+  network,
+  unpack,
+  onGameplaySignal = null
+) {
   const candidates = [];
   for (let offset = 0; offset <= Math.min(24, payload.length - 1); offset++) {
     try {
@@ -784,13 +1552,25 @@ function inspectRibbonPayload(payload, network, unpack) {
   for (const decoded of candidates) {
     const options = findOptionsObject(decoded);
     if (options?.seed !== undefined && options?.bagtype !== undefined) {
+      const countdownMs = estimateCountdownWait(options);
       network.seed = String(options.seed);
       network.nextCount = Math.max(
         1,
         Number.parseInt(options.nextcount ?? `${DEFAULT_NEXT_COUNT}`, 10) || DEFAULT_NEXT_COUNT
       );
-      network.readyAt = Date.now() + estimateCountdownWait(options);
+      network.readyAt = Date.now() + countdownMs;
       console.log(`[browser] ribbon seed captured seed=${network.seed}`);
+      onGameplaySignal?.({
+        key: `ribbon:${String(options.seed)}:${String(options.gameid ?? "")}`,
+        source: "ribbon_seed",
+        details: {
+          seed: String(options.seed),
+          gameid: options.gameid ?? null,
+          nextCount: network.nextCount,
+          countdownMs,
+          readyAt: network.readyAt
+        }
+      });
       return;
     }
   }
@@ -877,6 +1657,11 @@ export async function readTetrioState(cdp, options) {
   const now = options.now ?? Date.now();
   const log = options.log ?? console.log;
   const bootstrapState = options.bootstrapState ?? createBootstrapState(now);
+  const browserControlState =
+    options.browserControlState ?? createBrowserControlState();
+  const closureCaptureState =
+    options.closureCaptureState ?? createClosureCaptureState();
+  expireClosureCaptureWindow(closureCaptureState, now, { log });
   const pageState = await readBootstrapPageState(
     cdp,
     bootstrapState,
@@ -884,7 +1669,10 @@ export async function readTetrioState(cdp, options) {
     options.transientState,
     log
   );
-  const bootstrapReady = isBootstrapReadyForClosureCapture(bootstrapState, now);
+  const bootstrapStatus = getBootstrapReadinessStatus(bootstrapState, now);
+  const bootstrapReady = bootstrapStatus.ready;
+  const bootstrapReason = bootstrapStatus.reason;
+  const bootstrapJustBecameReady = bootstrapReady && !bootstrapState.lastReady;
   if (
     options.probePageState &&
     !options.suppressClosureCapture &&
@@ -897,7 +1685,20 @@ export async function readTetrioState(cdp, options) {
   if (
     options.probePageState &&
     !options.suppressClosureCapture &&
-    bootstrapReady &&
+    !bootstrapReady &&
+    (browserControlState.botEnabled ||
+      hasPendingClosureCaptureArm(closureCaptureState) ||
+      isClosureCaptureArmed(closureCaptureState, now)) &&
+    shouldLogBootstrapBlocked(bootstrapState, bootstrapReason, now)
+  ) {
+    log("[browser] closure capture blocked reason=bootstrap_not_ready");
+    log(`[browser] bootstrap readiness check failed reason=${bootstrapReason}`);
+    markBootstrapBlockedLogged(bootstrapState, bootstrapReason, now);
+  }
+  if (
+    options.probePageState &&
+    !options.suppressClosureCapture &&
+    bootstrapJustBecameReady &&
     !bootstrapState.readyLogged
   ) {
     log("[browser] TETR.IO bootstrap ready; closure capture enabled");
@@ -924,24 +1725,72 @@ export async function readTetrioState(cdp, options) {
   };
 
   let state = await read();
+  if (
+    options.probePageState &&
+    !options.suppressClosureCapture &&
+    bootstrapJustBecameReady &&
+    browserControlState.botEnabled &&
+    !state.ok
+  ) {
+    if (hasPendingClosureCaptureArm(closureCaptureState)) {
+      activatePendingClosureCaptureArm(closureCaptureState, {
+        now,
+        log
+      });
+    } else if (isClosureCaptureArmed(closureCaptureState, now)) {
+      reactivateClosureCaptureArmAfterBootstrap(closureCaptureState, {
+        now,
+        log
+      });
+    }
+  }
+  const gameplayExpected = isGameplayExpectedForClosureCapture({
+    state,
+    activeRoundId: options.activeRoundId ?? "",
+    closureCaptureState,
+    now
+  });
+  if (
+    options.probePageState &&
+    !options.suppressClosureCapture &&
+    bootstrapReady &&
+    !state.ok &&
+    shouldLogClosureCaptureSkipped({
+      gameplayExpected,
+      lastSkippedLogAt: closureCaptureState.lastSkippedLogAt,
+      now
+    })
+  ) {
+    log("[browser] closure capture skipped; gameplay not expected");
+    closureCaptureState.lastSkippedLogAt = now;
+  }
   const shouldCapture = shouldAttemptClosureCapture({
     probePageState: options.probePageState,
     suppressClosureCapture: options.suppressClosureCapture,
     bootstrapReady,
     stateOk: state.ok,
+    gameplayExpected,
+    nextAttemptAt: closureCaptureState.nextAttemptAt,
     lastCaptureAt: options.probeState?.lastCaptureAt ?? 0,
     lastPageProbeAt: options.network?.lastPageProbeAt ?? 0,
     now
   });
 
   if (shouldCapture) {
+    if (closureCaptureState.firstAttemptLoggedForReason !== closureCaptureState.armedReason) {
+      log(`[browser] closure capture first attempt reason=${closureCaptureState.armedReason}`);
+      closureCaptureState.firstAttemptLoggedForReason = closureCaptureState.armedReason;
+    }
     const captureStartedAt = Date.now();
-    options.probeState.lastCaptureAt = captureStartedAt;
+    options.probeState.lastCaptureAt = now;
     if (options.network) {
-      options.network.lastPageProbeAt = captureStartedAt;
+      options.network.lastPageProbeAt = now;
     }
     const captureFn = options.captureGameFn ?? captureTetrioGame;
-    const capture = await captureFn(cdp).catch((error) => ({
+    const capture = await captureFn(cdp, {
+      closureCaptureState,
+      log
+    }).catch((error) => ({
       ok: false,
       reason: error?.message ?? String(error)
     }));
@@ -951,15 +1800,53 @@ export async function readTetrioState(cdp, options) {
       );
     }
     if (capture.ok) {
+      if (capture.locator) {
+        closureCaptureState.lastSuccessfulLocator = String(capture.locator);
+      }
+      disarmClosureCaptureWindow(closureCaptureState, {
+        reason: "capture_success",
+        log
+      });
       console.log(`[browser] page probe exposed game object via ${capture.source}`);
       state = await read();
     } else if (state.reason) {
+      const fullScanOutcome = String(capture.outcome ?? "");
+      const continuationEligible =
+        (fullScanOutcome === "partial_budget_exhausted" ||
+          fullScanOutcome === "completed_not_found") &&
+        !capture.windowBudgetExhausted &&
+        closureCaptureState.fullScanAttemptsInWindow < MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW &&
+        isClosureCaptureArmed(closureCaptureState, now);
+      if (continuationEligible) {
+        scheduleClosureCaptureContinuation(closureCaptureState, now);
+        if (capture.reason === "TETR.IO paused scope scan limit reached") {
+          log("[browser] full closure scan paused scope limit reached; scheduling continuation");
+        } else {
+          log("[browser] full closure scan paused budget reached; scheduling continuation");
+        }
+      } else if (
+        capture.reason === "TETR.IO capture attempt window budget exhausted" ||
+        capture.reason === "TETR.IO full closure scan cumulative budget exhausted" ||
+        ((fullScanOutcome === "partial_budget_exhausted" ||
+          fullScanOutcome === "completed_not_found") &&
+          closureCaptureState.fullScanAttemptsInWindow >= MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW)
+      ) {
+        disarmClosureCaptureWindow(closureCaptureState, {
+          reason: "scan_budget_exhausted",
+          log
+        });
+      } else {
+        scheduleNextClosureCaptureAttempt(closureCaptureState, now);
+      }
       state = {
         ...state,
         reason: `${state.reason}; page probe: ${capture.reason}`
       };
     }
   }
+
+  bootstrapState.lastReady = bootstrapReady;
+  options.probeState.lastGameplayPhase = deriveGameplayPhase(state);
 
   if (options.suppressClosureCapture && !state.ok) {
     return {
@@ -977,11 +1864,26 @@ export async function readTetrioState(cdp, options) {
   return buildSeedFallbackState(options.network);
 }
 
-async function captureTetrioGame(cdp) {
+export async function captureTetrioGame(
+  cdp,
+  {
+    closureCaptureState = null,
+    log = console.log
+  } = {}
+) {
   const breakpointIds = [];
   let paused = false;
 
   try {
+    if (
+      closureCaptureState &&
+      closureCaptureState.captureAttemptsInWindow >= MAX_CAPTURE_ATTEMPTS_PER_WINDOW
+    ) {
+      return { ok: false, reason: "TETR.IO capture attempt window budget exhausted" };
+    }
+    if (closureCaptureState) {
+      closureCaptureState.captureAttemptsInWindow += 1;
+    }
     await cdp.send("Debugger.enable");
     for (const expression of ["window.requestAnimationFrame", "window.setTimeout"]) {
       const evaluated = await safeRuntimeEvaluate(cdp, {
@@ -1003,27 +1905,34 @@ async function captureTetrioGame(cdp) {
       return { ok: false, reason: "TETR.IO probe could not attach function breakpoints" };
     }
 
-    const deadline = Date.now() + 900;
-    while (Date.now() < deadline) {
-      let event;
-      try {
-        event = await cdp.waitForEvent(
-          "Debugger.paused",
-          () => true,
-          Math.max(50, deadline - Date.now())
-        );
-      } catch {
-        break;
-      }
-
-      paused = true;
-      const exposed = await exposeTetrioGameFromPausedCallFrames(cdp, event);
-      await cdp.send("Debugger.resume").catch(() => undefined);
-      paused = false;
-      if (exposed.ok) return exposed;
+    let event;
+    try {
+      event = await cdp.waitForEvent(
+        "Debugger.paused",
+        () => true,
+        900
+      );
+    } catch {
+      event = null;
+    }
+    if (!event) {
+      return { ok: false, reason: "TETR.IO game closure not visible yet" };
     }
 
-    return { ok: false, reason: "TETR.IO game closure not visible yet" };
+    paused = true;
+    const exposed = await exposeTetrioGameFromPausedCallFrames(cdp, event, {
+      closureCaptureState,
+      log
+    });
+    await cdp.send("Debugger.resume").catch(() => undefined);
+    paused = false;
+    if (exposed.ok) {
+      return exposed;
+    }
+
+    return exposed.reason
+      ? exposed
+      : { ok: false, reason: "TETR.IO game closure not visible yet" };
   } finally {
     if (paused) {
       await cdp.send("Debugger.resume").catch(() => undefined);
@@ -1055,33 +1964,355 @@ export async function safeRuntimeEvaluate(
   }
 }
 
-async function exposeTetrioGameFromPausedCallFrames(cdp, pausedEvent) {
+export async function exposeTetrioGameFromPausedCallFrames(
+  cdp,
+  pausedEvent,
+  {
+    closureCaptureState = null,
+    log = console.log
+  } = {}
+) {
+  const locatorHint = String(closureCaptureState?.lastSuccessfulLocator ?? "").trim();
+  if (locatorHint) {
+    if (closureCaptureState) {
+      closureCaptureState.fastLocatorAttempted = true;
+    }
+    const hinted = await exposeTetrioGameViaLocatorHint(cdp, pausedEvent, locatorHint);
+    if (hinted.ok) {
+      log(`[browser] fast closure locator succeeded locator=${locatorHint}`);
+      return hinted;
+    }
+    if (closureCaptureState) {
+      closureCaptureState.lastSuccessfulLocator = "";
+    }
+    log("[browser] fast closure locator failed; falling back to scan");
+  }
+  const nextFullScanAttempt = (closureCaptureState?.fullScanAttemptsInWindow ?? 0) + 1;
+  if (closureCaptureState?.fullScanAttemptsInWindow >= MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW) {
+    if (closureCaptureState) {
+      closureCaptureState.scanBudgetExhausted = true;
+    }
+    return {
+      ok: false,
+      reason: "TETR.IO full closure scan cumulative budget exhausted",
+      outcome: "partial_budget_exhausted",
+      windowBudgetExhausted: true
+    };
+  }
+  log(
+    `[browser] full closure scan attempt=${nextFullScanAttempt}/${MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW}`
+  );
+  if (closureCaptureState) {
+    closureCaptureState.fullScanAttemptsInWindow = nextFullScanAttempt;
+  }
+  const scanStartedAt = Date.now();
+  const scanned = await exposeTetrioGameViaPausedScopeScan(cdp, pausedEvent, {
+    closureCaptureState
+  });
+  logPausedScopeScanProgress(log, scanned.progress ?? null);
+  if (!scanned.ok && scanned.outcome === "partial_budget_exhausted") {
+    logPausedScopeScanContinuation(log, scanned.continuationCursor ?? null);
+  }
+  if (!scanned.ok && scanned.outcome === "partial_budget_exhausted") {
+    log(
+      `[browser] full closure scan aborted budget_ms=${Math.max(0, Date.now() - scanStartedAt)}`
+    );
+  }
+  return scanned;
+}
+
+export async function exposeTetrioGameViaLocatorHint(cdp, pausedEvent, locatorName) {
   for (const callFrame of pausedEvent.callFrames ?? []) {
     const result = await cdp.send("Debugger.evaluateOnCallFrame", {
       callFrameId: callFrame.callFrameId,
-      expression: pausedFrameExposureExpression(),
+      expression: pausedFrameExposureExpression(locatorName),
       returnByValue: true,
       silent: true
     }).catch(() => null);
-
     const value = result?.result?.value;
-    if (value?.ok) return value;
+    if (value?.ok) {
+      return value;
+    }
   }
-  return { ok: false, reason: "TETR.IO active game variable was not in paused scopes" };
+  return { ok: false, reason: `TETR.IO locator ${locatorName} was not visible in paused scopes` };
 }
 
-export function pausedFrameExposureExpression() {
+export async function exposeTetrioGameViaPausedScopeScan(
+  cdp,
+  pausedEvent,
+  {
+    closureCaptureState = null,
+    perScanBudgetMs = DEFAULT_FULL_SCAN_PAUSE_BUDGET_MS,
+    cumulativeBudgetMs = DEFAULT_FULL_SCAN_CUMULATIVE_BUDGET_MS
+  } = {}
+) {
+  const callFrames = pausedEvent?.callFrames ?? [];
+  const persistedCursor =
+    closureCaptureState?.pausedScopeScanCursor ?? createPausedScopeScanCursor();
+  const completedScopeKeys = new Set(persistedCursor.completedScopeKeys ?? []);
+  const seenCandidateKeys = new Set(persistedCursor.seenCandidateKeys ?? []);
+  const budgetUsedMs = Math.max(
+    0,
+    Number(closureCaptureState?.cumulativePausedScanBudgetUsedMs ?? 0)
+  );
+  const remainingWindowBudgetMs = Math.max(0, cumulativeBudgetMs - budgetUsedMs);
+  if (remainingWindowBudgetMs <= 0) {
+    if (closureCaptureState) {
+      closureCaptureState.scanBudgetExhausted = true;
+    }
+    return {
+      ok: false,
+      reason: "TETR.IO full closure scan cumulative budget exhausted",
+      outcome: "partial_budget_exhausted",
+      windowBudgetExhausted: true,
+      progress: {
+        attempt: Math.max(1, Number(closureCaptureState?.fullScanAttemptsInWindow ?? 1)),
+        ...formatScanCursor(persistedCursor),
+        inspectedObjects: seenCandidateKeys.size,
+        pausedMs: 0
+      },
+      continuationCursor: formatScanCursor(persistedCursor)
+    };
+  }
+
+  const scanStartedAt = Date.now();
+  const scanBudgetMs = Math.max(
+    1,
+    Math.min(Math.max(1, perScanBudgetMs), remainingWindowBudgetMs)
+  );
+  let candidatesVisited = 0;
+
+  const updateBudgetUsed = () => {
+    if (closureCaptureState) {
+      closureCaptureState.cumulativePausedScanBudgetUsedMs = Math.min(
+        cumulativeBudgetMs,
+        budgetUsedMs + Math.max(0, Date.now() - scanStartedAt)
+      );
+    }
+  };
+
+  const persistPartial = ({ frameIndex, scopeIndex, propertyIndex, reason }) => {
+    updateBudgetUsed();
+    const windowBudgetExhausted =
+      (closureCaptureState?.cumulativePausedScanBudgetUsedMs ?? 0) >= cumulativeBudgetMs;
+    if (closureCaptureState) {
+      closureCaptureState.pausedScopeScanCursor = {
+        frameIndex,
+        scopeIndex,
+        propertyIndex,
+        completedScopeKeys: Array.from(completedScopeKeys),
+        seenCandidateKeys: Array.from(seenCandidateKeys)
+      };
+      closureCaptureState.scanBudgetExhausted = windowBudgetExhausted;
+    }
+    return {
+      ok: false,
+      reason: windowBudgetExhausted
+        ? "TETR.IO full closure scan cumulative budget exhausted"
+        : reason,
+      outcome: "partial_budget_exhausted",
+      windowBudgetExhausted,
+      progress: {
+        attempt: Math.max(1, Number(closureCaptureState?.fullScanAttemptsInWindow ?? 1)),
+        frameIndex,
+        scopeIndex,
+        candidateIndex: propertyIndex,
+        inspectedObjects: seenCandidateKeys.size,
+        pausedMs: Math.max(0, Date.now() - scanStartedAt)
+      },
+      continuationCursor: formatScanCursor({
+        frameIndex,
+        scopeIndex,
+        propertyIndex
+      })
+    };
+  };
+
+  const isScanBudgetExhausted = () => Date.now() - scanStartedAt >= scanBudgetMs;
+
+  for (let frameIndex = persistedCursor.frameIndex ?? 0; frameIndex < callFrames.length; frameIndex += 1) {
+    const callFrame = callFrames[frameIndex];
+    const scopeChain = callFrame?.scopeChain ?? [];
+    const initialScopeIndex =
+      frameIndex === (persistedCursor.frameIndex ?? 0)
+        ? persistedCursor.scopeIndex ?? 0
+        : 0;
+    for (let scopeIndex = initialScopeIndex; scopeIndex < scopeChain.length; scopeIndex += 1) {
+      const scope = scopeChain[scopeIndex];
+      const scopeObjectId = scope?.object?.objectId;
+      const scopeKey = `${frameIndex}:${scopeIndex}:${scopeObjectId ?? ""}`;
+      if (!scopeObjectId || completedScopeKeys.has(scopeKey)) {
+        continue;
+      }
+      const initialPropertyIndex =
+        frameIndex === (persistedCursor.frameIndex ?? 0) &&
+        scopeIndex === (persistedCursor.scopeIndex ?? 0)
+          ? persistedCursor.propertyIndex ?? 0
+          : 0;
+      if (isScanBudgetExhausted()) {
+        return persistPartial({
+          frameIndex,
+          scopeIndex,
+          propertyIndex: initialPropertyIndex,
+          reason: "TETR.IO paused scope scan pause budget reached"
+        });
+      }
+      const properties = await cdp.send("Runtime.getProperties", {
+        objectId: scopeObjectId,
+        ownProperties: true,
+        accessorPropertiesOnly: false,
+        generatePreview: false
+      }).catch(() => null);
+      const descriptors = (properties?.result ?? [])
+        .slice(0, MAX_SCOPE_PROPERTIES_PER_SCOPE)
+        .map((descriptor, index) => ({ descriptor, index }))
+        .sort((left, right) => {
+          const scoreDelta =
+            scorePausedScopeDescriptor(right.descriptor) -
+            scorePausedScopeDescriptor(left.descriptor);
+          return scoreDelta !== 0 ? scoreDelta : left.index - right.index;
+        })
+        .map(({ descriptor }) => descriptor);
+      for (
+        let propertyIndex = initialPropertyIndex;
+        propertyIndex < descriptors.length;
+        propertyIndex += 1
+      ) {
+        if (isScanBudgetExhausted()) {
+          return persistPartial({
+            frameIndex,
+            scopeIndex,
+            propertyIndex,
+            reason: "TETR.IO paused scope scan pause budget reached"
+          });
+        }
+        const descriptor = descriptors[propertyIndex];
+        if (descriptor?.get || descriptor?.set) {
+          continue;
+        }
+        const valueObjectId = descriptor?.value?.objectId;
+        const locator = String(descriptor?.name ?? "").trim();
+        if (!valueObjectId || !locator) {
+          continue;
+        }
+        const candidateKey =
+          `${frameIndex}:${scopeIndex}:${scopeObjectId}:${locator}:${valueObjectId}`;
+        if (seenCandidateKeys.has(candidateKey)) {
+          continue;
+        }
+        candidatesVisited += 1;
+        if (candidatesVisited > MAX_PAUSED_SCOPE_SCAN_CANDIDATES_PER_ATTEMPT) {
+          return persistPartial({
+            frameIndex,
+            scopeIndex,
+            propertyIndex,
+            reason: "TETR.IO paused scope scan limit reached"
+          });
+        }
+        seenCandidateKeys.add(candidateKey);
+        const exposed = await exposeTetrioCandidateObject(cdp, valueObjectId, locator);
+        if (exposed.ok) {
+          updateBudgetUsed();
+          clearPausedScopeScanCursor(closureCaptureState);
+          if (closureCaptureState) {
+            closureCaptureState.scanBudgetExhausted = false;
+          }
+          return {
+            ...exposed,
+            progress: {
+              attempt: Math.max(1, Number(closureCaptureState?.fullScanAttemptsInWindow ?? 1)),
+              frameIndex,
+              scopeIndex,
+              candidateIndex: propertyIndex,
+              inspectedObjects: seenCandidateKeys.size,
+              pausedMs: Math.max(0, Date.now() - scanStartedAt)
+            }
+          };
+        }
+      }
+      completedScopeKeys.add(scopeKey);
+    }
+  }
+
+  updateBudgetUsed();
+  clearPausedScopeScanCursor(closureCaptureState);
+  if (closureCaptureState) {
+    closureCaptureState.scanBudgetExhausted = false;
+  }
+  return {
+    ok: false,
+    reason: "TETR.IO active game variable was not in paused scopes",
+    outcome: "completed_not_found",
+    progress: {
+      attempt: Math.max(1, Number(closureCaptureState?.fullScanAttemptsInWindow ?? 1)),
+      frameIndex: callFrames.length === 0 ? 0 : Math.max(0, callFrames.length - 1),
+      scopeIndex: 0,
+      candidateIndex: 0,
+      inspectedObjects: seenCandidateKeys.size,
+      pausedMs: Math.max(0, Date.now() - scanStartedAt)
+    }
+  };
+}
+
+export async function exposeTetrioCandidateObject(cdp, objectId, locatorName) {
+  const result = await cdp.send("Runtime.callFunctionOn", {
+    objectId,
+    functionDeclaration: `function() {
+      try {
+        if (
+          !this ||
+          typeof this !== "object" ||
+          typeof this.ejectState !== "function" ||
+          typeof this.ejectBoardState !== "function"
+        ) {
+          return { ok: false };
+        }
+        const exported = this.ejectState();
+        const state =
+          exported && typeof exported === "object" && exported.game
+            ? exported.game
+            : exported;
+        if (state?.destroyed || state?.dead || state?.gameover) {
+          return { ok: false };
+        }
+        window.__fusionTetrioGame = this;
+        window.__fusionTetrioBridge = {
+          ok: true,
+          source: ${JSON.stringify("closure:" + locatorName)},
+          locator: ${JSON.stringify(locatorName)},
+          at: Date.now(),
+          href: location.href
+        };
+        return window.__fusionTetrioBridge;
+      } catch {
+        return { ok: false };
+      }
+    }`,
+    returnByValue: true,
+    silent: true
+  }).catch(() => null);
+  return result?.result?.value ?? { ok: false };
+}
+
+export function pausedFrameExposureExpression(locatorName = "Ai") {
   return `(() => {
     try {
+      const locator = ${JSON.stringify(locatorName)};
+      const candidate = locator ? (() => {
+        try {
+          return eval(locator);
+        } catch {
+          return undefined;
+        }
+      })() : undefined;
       if (
-        typeof Ai !== "undefined" &&
-        Ai &&
-        typeof Ai.ejectState === "function" &&
-        typeof Ai.ejectBoardState === "function"
+        candidate &&
+        typeof candidate.ejectState === "function" &&
+        typeof candidate.ejectBoardState === "function"
       ) {
-        if (Ai === window.__fusionEndedTetrioGame) {
+        if (candidate === window.__fusionEndedTetrioGame) {
           try {
-            const exported = Ai.ejectState();
+            const exported = candidate.ejectState();
             const state =
               exported && typeof exported === "object" && exported.game
                 ? exported.game
@@ -1096,10 +2327,11 @@ export function pausedFrameExposureExpression() {
           delete window.__fusionEndedTetrioGame;
         }
 
-        window.__fusionTetrioGame = Ai;
+        window.__fusionTetrioGame = candidate;
         window.__fusionTetrioBridge = {
           ok: true,
-          source: "closure:Ai",
+          source: locator ? "closure:" + locator : "closure",
+          locator: locator || null,
           at: Date.now(),
           href: location.href
         };
