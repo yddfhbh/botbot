@@ -1058,6 +1058,14 @@ impl LauncherApp {
                     self.bot_session = None;
                     match result {
                         Ok(()) => {
+                            let exit_reason = if !self.bot_desired_enabled {
+                                "stop_flag"
+                            } else if self.browser_session.is_none() {
+                                "browser_closed"
+                            } else {
+                                "wait_function_returned"
+                            };
+                            self.push_log(format!("[bot] idle runner exit reason={exit_reason}"));
                             if self.bot_desired_enabled && self.browser_session.is_some() {
                                 self.bot_status = BotStatus::Starting;
                                 self.bot_restart_pending = true;
@@ -1075,6 +1083,9 @@ impl LauncherApp {
                             }
                         }
                         Err(err) => {
+                            self.push_log(format!(
+                                "[bot] idle runner exit reason=provider_error error={err}"
+                            ));
                             self.bot_status = BotStatus::Error;
                             self.bot_waiting_for_next_game = false;
                             self.bot_restart_pending = false;

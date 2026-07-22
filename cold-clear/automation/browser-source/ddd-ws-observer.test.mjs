@@ -310,6 +310,72 @@ test("same option signature logs only once", async () => {
   assert.ok(logs.includes("[ws-observer] url_host=spool.tetr.io"));
 });
 
+test("same option signature can be captured again after the dedupe window", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const captured = [];
+  const payload = JSON.stringify({
+    gameid: "g-1",
+    options: {
+      seed: 7,
+      bagtype: "7-bag",
+      nextcount: 5,
+      boardwidth: 10,
+      boardheight: 40
+    }
+  });
+  const originalDateNow = Date.now;
+  let now = 10_000;
+
+  Date.now = () => now;
+  try {
+    await installDddWsObserver(cdp, {
+      unpack: () => {
+        throw new Error("unused");
+      },
+      log: (line) => logs.push(line),
+      onGameOptions: (entry) => captured.push(entry)
+    });
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      requestId: "req-1",
+      response: {
+        opcode: 1,
+        payloadData: payload
+      }
+    });
+    now += 500;
+    cdp.emit("Network.webSocketFrameReceived", {
+      requestId: "req-1",
+      response: {
+        opcode: 1,
+        payloadData: payload
+      }
+    });
+    now += 2_500;
+    cdp.emit("Network.webSocketFrameReceived", {
+      requestId: "req-1",
+      response: {
+        opcode: 1,
+        payloadData: payload
+      }
+    });
+  } finally {
+    Date.now = originalDateNow;
+  }
+
+  assert.equal(captured.length, 2);
+  assert.equal(
+    logs.filter((line) => line === "[ws-observer] game options captured").length,
+    2
+  );
+  assert.ok(
+    logs.includes(
+      "[browser] solo signal ignored reason=duplicate_signature_window signature=7|7-bag|g-1|10|40|5"
+    )
+  );
+});
+
 test("observer does not modify unrelated network objects", async () => {
   const cdp = new FakeCdp();
   const network = {

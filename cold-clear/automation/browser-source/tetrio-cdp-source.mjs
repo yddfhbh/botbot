@@ -236,6 +236,57 @@ export function noteGameStartSignal(
   return true;
 }
 
+function logSoloSignalCandidate(
+  log,
+  {
+    source = "unknown",
+    key = "",
+    details = null
+  } = {}
+) {
+  if (typeof log !== "function") {
+    return;
+  }
+  log(
+    `[browser] solo signal candidate type=${source} path=${source} seed=${String(
+      details?.seed ?? "missing"
+    )} bagtype=${String(details?.bagtype ?? "missing")} nextcount=${String(
+      details?.nextCount ?? "missing"
+    )} signature=${key || "missing"}`
+  );
+}
+
+function noteSoloGameStartSignal(
+  gameStartSignalState,
+  {
+    key,
+    source = "unknown",
+    now = Date.now(),
+    details = null,
+    log = console.log
+  } = {}
+) {
+  logSoloSignalCandidate(log, { source, key, details });
+  const queued = noteGameStartSignal(gameStartSignalState, {
+    key,
+    source,
+    now,
+    details
+  });
+  if (!queued) {
+    if (typeof log === "function") {
+      log(
+        `[browser] solo signal ignored reason=duplicate_key signature=${String(key || "missing")}`
+      );
+    }
+    return false;
+  }
+  if (typeof log === "function") {
+    log(`[browser] solo signal queued key=${key} source=${source}`);
+  }
+  return true;
+}
+
 export function hasUnconsumedGameStartSignal(
   gameStartSignalState,
   { since = 0 } = {}
@@ -335,6 +386,7 @@ export function armClosureCaptureWindow(
   }
   if (!wasArmed || reasonChanged || restartWindow) {
     log(`[browser] closure capture armed reason=${reason}`);
+    logClosureCaptureWindowInitialized(closureCaptureState, reason, log);
   }
   return true;
 }
@@ -576,6 +628,40 @@ function formatScanCursor(cursor = null) {
       Number(cursor?.candidateIndex ?? cursor?.propertyIndex ?? 0)
     )
   };
+}
+
+function formatClosureCaptureCursorLabel(cursor = null) {
+  if (!cursor) {
+    return "none";
+  }
+  const formatted = formatScanCursor(cursor);
+  return `${formatted.frameIndex}:${formatted.scopeIndex}:${formatted.candidateIndex}`;
+}
+
+function logClosureCaptureWindowInitialized(
+  closureCaptureState,
+  reason,
+  log = console.log
+) {
+  if (typeof log !== "function" || !closureCaptureState) {
+    return;
+  }
+  const pausedUsedMs = Math.max(
+    0,
+    Number(closureCaptureState.cumulativePausedScanBudgetUsedMs ?? 0)
+  );
+  const remainingPausedMs = Math.max(
+    0,
+    DEFAULT_FULL_SCAN_CUMULATIVE_BUDGET_MS - pausedUsedMs
+  );
+  log(
+    `[browser] closure window initialized reason=${reason} attempts=${Math.max(
+      0,
+      Number(closureCaptureState.fullScanAttemptsInWindow ?? 0)
+    )} paused_used_ms=${pausedUsedMs} cursor=${formatClosureCaptureCursorLabel(
+      closureCaptureState.pausedScopeScanCursor
+    )} exhausted=${closureCaptureState.scanBudgetExhausted ? "true" : "false"} remaining_paused_ms=${remainingPausedMs}`
+  );
 }
 
 function logPausedScopeScanProgress(log, progress) {
@@ -944,18 +1030,21 @@ async function main() {
           console.log("[browser] VS round inactive; closure capture probe restored");
         }
       },
-      onGameOptions: ({ signature, options }) => {
-        const now = Date.now();
-        noteGameStartSignal(gameStartSignalState, {
+      onGameOptions: ({ signature, options, capturedAt }) => {
+        const now = Number.isFinite(capturedAt) ? capturedAt : Date.now();
+        const countdownMs = estimateCountdownWait(options);
+        noteSoloGameStartSignal(gameStartSignalState, {
           key: `ddd:${signature}`,
           source: "ddd_game_options",
           now,
+          log: (message) => console.log(message),
           details: {
             seed: options?.seed ?? null,
+            bagtype: options?.bagtype ?? null,
             gameid: options?.gameid ?? null,
             nextCount: options?.nextcount ?? DEFAULT_NEXT_COUNT,
-            countdownMs: estimateCountdownWait(options),
-            readyAt: now + estimateCountdownWait(options)
+            countdownMs,
+            readyAt: now + countdownMs
           }
         });
       },
@@ -983,11 +1072,12 @@ async function main() {
   if (useRibbonWebsocket) {
     await installRibbonMonitor(cdp, network, msgpack, bootstrapState, {
       onGameplaySignal: ({ key, source, details }) =>
-        noteGameStartSignal(gameStartSignalState, {
+        noteSoloGameStartSignal(gameStartSignalState, {
           key,
           source,
           now: Date.now(),
-          details
+          details,
+          log: (message) => console.log(message)
         })
     });
   }
@@ -1122,6 +1212,9 @@ async function main() {
           since: waitingForNextGameSignalCutoffAt
         });
         if (signal) {
+          console.log(
+            `[browser] solo signal consumed key=${signal.key} source=${signal.source}`
+          );
           console.log(`[browser] game-start signal source=${signal.source}`);
           applyGameStartSignalToNetwork(network, signal);
           requestClosureCaptureArm(closureCaptureState, {
@@ -1775,6 +1868,23 @@ export async function readTetrioState(cdp, options) {
     lastPageProbeAt: options.network?.lastPageProbeAt ?? 0,
     now
   });
+  if (shouldCapture) {
+    const pausedUsedMs = Math.max(
+      0,
+      Number(closureCaptureState.cumulativePausedScanBudgetUsedMs ?? 0)
+    );
+    log(
+      `[browser] closure scan gate attempts=${Math.max(
+        0,
+        Number(closureCaptureState.fullScanAttemptsInWindow ?? 0)
+      )} paused_used_ms=${pausedUsedMs} remaining_paused_ms=${Math.max(
+        0,
+        DEFAULT_FULL_SCAN_CUMULATIVE_BUDGET_MS - pausedUsedMs
+      )} cursor=${formatClosureCaptureCursorLabel(
+        closureCaptureState.pausedScopeScanCursor
+      )} exhausted=${closureCaptureState.scanBudgetExhausted ? "true" : "false"} gameplay_expected=${gameplayExpected ? "true" : "false"}`
+    );
+  }
 
   if (shouldCapture) {
     if (closureCaptureState.firstAttemptLoggedForReason !== closureCaptureState.armedReason) {

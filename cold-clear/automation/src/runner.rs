@@ -142,6 +142,7 @@ where
 
     loop {
         if stop.load(AtomicOrdering::Relaxed) {
+            log("[automation] idle runner exit reason=stop_flag".to_owned());
             return Ok(());
         }
         let snapshot_option = if let Some(snapshot) = buffered_snapshot.take() {
@@ -247,6 +248,7 @@ where
                                         stop,
                                         &mut log,
                                     ) {
+                                        log("[automation] idle runner exit reason=stop_flag".to_owned());
                                         return Ok(());
                                     }
                                     let hard_drop_started_at = Instant::now();
@@ -318,6 +320,7 @@ where
                                     if buffered_snapshot.is_none()
                                         && stop.load(AtomicOrdering::Relaxed)
                                     {
+                                        log("[automation] idle runner exit reason=stop_flag".to_owned());
                                         return Ok(());
                                     }
                                 }
@@ -398,6 +401,7 @@ where
 
     loop {
         if stop.load(AtomicOrdering::Relaxed) {
+            log("[automation] idle runner exit reason=stop_flag".to_owned());
             return Ok(None);
         }
         match next_observed_snapshot(scanner, vs_sim_controller, log)? {

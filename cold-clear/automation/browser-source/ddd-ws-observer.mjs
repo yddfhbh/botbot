@@ -14,6 +14,7 @@ const MAX_VISITED_OBJECTS = 5000;
 const MAX_TRACE_RECORDS = 500;
 const MAX_TRACE_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_TRACE_RECORD_BYTES = 32 * 1024;
+const OPTIONS_SIGNATURE_DEDUPE_WINDOW_MS = 2000;
 const DEFAULT_TRACE_FILE_PATH = path.join("automation", "ws-live-candidates.jsonl");
 const DEFAULT_VS_BRIDGE_PATH = DEFAULT_BRIDGE_PATH;
 const SENSITIVE_KEYS = new Set([
@@ -195,11 +196,12 @@ export async function installDddWsObserver(
 
   const observerState = {
     requestUrls: new Map(),
-    lastOptionsSignature: "",
+    recentOptionsSignatures: new Map(),
     framesReceived: 0,
     binaryFramesReceived: 0,
     decodeAttempts: 0,
     optionsCaptured: 0,
+    optionsCaptureSequence: 0,
     trace: null,
     vsBridge,
     lastVsRoundStatusKey: "",
@@ -614,18 +616,41 @@ function logCapturedCandidates(
 ) {
   for (const options of candidates) {
     const signature = buildOptionsSignature(options);
-    if (!signature || signature === observerState.lastOptionsSignature) {
+    const now = Date.now();
+    const summary = summarizeOptionsForSignalLog(options);
+    safeLog(
+      log,
+      `[browser] solo signal candidate type=ddd_game_options path=ws_observer seed=${summary.seed} bagtype=${summary.bagtype} nextcount=${summary.nextcount} signature=${summary.signature}`
+    );
+    if (!signature) {
+      safeLog(
+        log,
+        "[browser] solo signal ignored reason=missing_signature signature=missing"
+      );
       continue;
     }
-    observerState.lastOptionsSignature = signature;
+    pruneRecentOptionSignatures(observerState, now);
+    const lastSeenAt = observerState.recentOptionsSignatures.get(signature) ?? 0;
+    if (lastSeenAt > 0 && now - lastSeenAt < OPTIONS_SIGNATURE_DEDUPE_WINDOW_MS) {
+      safeLog(
+        log,
+        `[browser] solo signal ignored reason=duplicate_signature_window signature=${signature}`
+      );
+      continue;
+    }
+    observerState.recentOptionsSignatures.set(signature, now);
     observerState.optionsCaptured += 1;
+    observerState.optionsCaptureSequence += 1;
     try {
       onGameOptions?.({
         signature,
-        options
+        options,
+        sequence: observerState.optionsCaptureSequence,
+        capturedAt: now
       });
     } catch {}
 
+    safeLog(log, `[browser] solo signal queued key=ddd:${signature} source=ddd_game_options`);
     safeLog(log, "[ws-observer] game options captured");
     if (requestId && observerState.requestUrls.has(requestId)) {
       safeLog(
@@ -653,6 +678,29 @@ function logCapturedCandidates(
     }
     if (Object.prototype.hasOwnProperty.call(options, "gameid")) {
       safeLog(log, `[ws-observer] gameid=${String(options.gameid)}`);
+    }
+  }
+}
+
+function summarizeOptionsForSignalLog(options) {
+  return {
+    seed: options?.seed === undefined || options?.seed === null ? "missing" : String(options.seed),
+    bagtype:
+      options?.bagtype === undefined || options?.bagtype === null
+        ? "missing"
+        : String(options.bagtype),
+    nextcount:
+      options?.nextcount === undefined || options?.nextcount === null
+        ? "missing"
+        : String(options.nextcount),
+    signature: buildOptionsSignature(options) || "missing"
+  };
+}
+
+function pruneRecentOptionSignatures(observerState, now) {
+  for (const [signature, seenAt] of observerState.recentOptionsSignatures ?? []) {
+    if (now - seenAt >= OPTIONS_SIGNATURE_DEDUPE_WINDOW_MS) {
+      observerState.recentOptionsSignatures.delete(signature);
     }
   }
 }
