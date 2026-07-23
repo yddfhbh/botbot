@@ -23,6 +23,15 @@ const DEFAULT_FULL_SCAN_CUMULATIVE_BUDGET_MS = 700;
 const DEFAULT_FULL_SCAN_CONTINUATION_BACKOFF_MS = 100;
 const DEFAULT_BOOTSTRAP_BLOCKED_LOG_INTERVAL_MS = 5000;
 const DEFAULT_GAME_START_SIGNAL_OVERLAP_MS = 10000;
+const DEFAULT_NEXT_GAME_FAST_LOCATOR_INTERVAL_MS = 350;
+const DEFAULT_NEXT_GAME_FAST_LOCATOR_MISS_LOG_INTERVAL_MS = 5000;
+const DEFAULT_NEXT_GAME_INTERACTION_POLL_MS = 75;
+const DEFAULT_NEXT_GAME_INTERACTION_BURST_DEDUPE_MS = 150;
+const DEFAULT_NEXT_GAME_INTERACTION_CAPTURE_DELAY_MS = 300;
+const DEFAULT_TARGETED_PAUSED_PROBE_DELAY_MS = 450;
+const DEFAULT_TARGETED_PAUSED_PROBE_BACKOFF_MS = 800;
+const DEFAULT_FOLLOWUP_FAST_CAPTURE_TIMEOUT_MS = 100;
+const DEFAULT_AGAIN_PROVISIONAL_HARD_FALLBACK_MS = 1200;
 const MAX_GAME_START_SIGNALS = 16;
 const MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW = 2;
 const MAX_PAUSED_SCOPE_SCAN_CANDIDATES_PER_ATTEMPT = 400;
@@ -31,6 +40,12 @@ const DEFAULT_SUPPRESSED_REASON = "VS WebSocket simulation owns live state";
 const PERF_LOG_INTERVAL_MS = 2000;
 const DEFAULT_BOOTSTRAP_TRANSPORT_SETTLE_MS = 1500;
 const DEFAULT_BOOTSTRAP_FALLBACK_MS = 15000;
+const NEXT_GAME_INTERACTION_PHASE_INACTIVE = "inactive";
+const NEXT_GAME_INTERACTION_PHASE_POST_GAME_WATCH = "post_game_watch";
+const NEXT_GAME_INTERACTION_PHASE_REACQUIRING = "reacquiring";
+const NEXT_GAME_INTERACTION_PHASE_WAITING_TRANSITION_READY = "waiting_transition_ready";
+const NEXT_GAME_INTERACTION_PHASE_CAPTURE_ARMED = "capture_armed";
+const NEXT_GAME_INTERACTION_PHASE_CAPTURED_WAITING_START = "captured_waiting_start";
 
 export function determineChromiumOwnership({ connectOnly, alreadyOpen }) {
   return !connectOnly && !alreadyOpen;
@@ -126,8 +141,447 @@ export function createClosureCaptureState() {
     pausedScopeScanCursor: null,
     windowSequence: 0,
     scanBudgetExhausted: false,
-    fastLocatorAttempted: false
+    fastLocatorAttempted: false,
+    lastSuccessfulPausedLocation: null,
+    pendingFollowupFullScan: false,
+    pendingFollowupFastCapture: false,
+    windowArmedAt: 0,
+    windowFirstInteractionAt: 0,
+    windowTargetedProbeAt: 0,
+    provisionalNonHeavyAttemptConsumed: false
   };
+}
+
+function hasActiveClosureCaptureWindowState(closureCaptureState) {
+  if (!closureCaptureState) {
+    return false;
+  }
+  return Boolean(
+    Number(closureCaptureState.armedUntil ?? 0) > 0 ||
+      Number(closureCaptureState.captureAttemptsInWindow ?? 0) > 0 ||
+      Number(closureCaptureState.fullScanAttemptsInWindow ?? 0) > 0 ||
+      Number(closureCaptureState.cumulativePausedScanBudgetUsedMs ?? 0) > 0 ||
+      closureCaptureState.pausedScopeScanCursor ||
+      closureCaptureState.scanBudgetExhausted === true ||
+      closureCaptureState.fastLocatorAttempted === true ||
+      Number(closureCaptureState.nextAttemptAt ?? 0) > 0 ||
+      Number(closureCaptureState.retryCount ?? 0) > 0 ||
+      String(closureCaptureState.armedReason ?? "").trim() ||
+      String(closureCaptureState.firstAttemptLoggedForReason ?? "").trim()
+  );
+}
+
+function formatClosureWindowResetReason(reason = "") {
+  if (reason === "next_game_carried_interaction") {
+    return "carried interaction";
+  }
+  if (reason === "next_game_user_interaction") {
+    return "next-game interaction";
+  }
+  return String(reason || "gameplay_signal");
+}
+
+export function initializeFreshClosureCaptureWindow(
+  closureCaptureState,
+  {
+    reason = "gameplay_signal",
+    log = console.log
+  } = {}
+) {
+  if (!closureCaptureState) {
+    return false;
+  }
+  const previousCaptureAttempts = Math.max(
+    0,
+    Number(closureCaptureState.captureAttemptsInWindow ?? 0)
+  );
+  const previousFullScanAttempts = Math.max(
+    0,
+    Number(closureCaptureState.fullScanAttemptsInWindow ?? 0)
+  );
+  const previousPausedUsedMs = Math.max(
+    0,
+    Number(closureCaptureState.cumulativePausedScanBudgetUsedMs ?? 0)
+  );
+  const hadActiveState = hasActiveClosureCaptureWindowState(closureCaptureState);
+  if (hadActiveState && typeof log === "function") {
+    log(
+      `[browser] resetting closure window for ${formatClosureWindowResetReason(reason)} previous_capture_attempts=${previousCaptureAttempts} previous_full_scan_attempts=${previousFullScanAttempts} previous_paused_used_ms=${previousPausedUsedMs}`
+    );
+  }
+  closureCaptureState.armedUntil = 0;
+  closureCaptureState.armedReason = "";
+  closureCaptureState.lastSkippedLogAt = 0;
+  closureCaptureState.nextAttemptAt = 0;
+  closureCaptureState.retryCount = 0;
+  closureCaptureState.pendingCaptureArm = null;
+  closureCaptureState.firstAttemptLoggedForReason = "";
+  closureCaptureState.captureAttemptsInWindow = 0;
+  closureCaptureState.pendingFollowupFullScan = false;
+  closureCaptureState.pendingFollowupFastCapture = false;
+  closureCaptureState.windowArmedAt = 0;
+  closureCaptureState.windowFirstInteractionAt = 0;
+  closureCaptureState.windowTargetedProbeAt = 0;
+  closureCaptureState.provisionalNonHeavyAttemptConsumed = false;
+  resetClosureCaptureScanWindowState(closureCaptureState, {
+    nextAttemptAt: 0,
+    cursor: createPausedScopeScanCursor()
+  });
+  return true;
+}
+
+export function createNextGameReacquireState() {
+  return {
+    active: false,
+    interactionPhase: NEXT_GAME_INTERACTION_PHASE_INACTIVE,
+    startedAt: 0,
+    lastFastAttemptAt: 0,
+    lastFastMissLoggedAt: 0,
+    lastEndedObjectCheckAt: 0,
+    lastEndedObjectProbeStatus: "",
+    lastEndedObjectProbeLogAt: 0,
+    lastCheapSignalState: false,
+    lastCheapSignalLogAt: 0,
+    lastCheapSignalLabel: "",
+    lastCheapSampledAt: 0,
+    lastCheapAggregateState: "",
+    interactionBaselineGeneration: 0,
+    lastInteractionGenerationSeen: 0,
+    lastInteractionGenerationHandled: 0,
+    interactionWindowGeneration: 0,
+    interactionWindowArmedAt: 0,
+    pendingInteractionGeneration: 0,
+    pendingInteractionTimestamp: 0,
+    pendingInteractionSource: "",
+    pendingArmReason: "",
+    pendingInteractionType: "",
+    pendingInteractionKey: "",
+    pendingInteractionTargetTag: "",
+    pendingInteractionTargetId: "",
+    pendingInteractionTargetClass: "",
+    pendingInteractionKind: "",
+    provisionalInteractionGeneration: 0,
+    provisionalInteractionTimestamp: 0,
+    provisionalInteractionKey: "",
+    provisionalInteractionTrusted: false,
+    provisionalInteractionKind: "",
+    provisionalTransitionReady: false,
+    provisionalTransitionReadyLoggedAt: 0
+  };
+}
+
+export function createPostGameInteractionWatchState() {
+  return {
+    active: false,
+    firstNotPlayingAt: 0,
+    interactionBaselineGeneration: 0,
+    lastInteractionGenerationSeen: 0,
+    lastPollAt: 0,
+    pendingGeneration: 0,
+    pendingTimestamp: 0,
+    pendingType: "",
+    pendingKey: "",
+    pendingTargetTag: "",
+    pendingTargetId: "",
+    pendingTargetClass: "",
+    provisionalArmedGeneration: 0
+  };
+}
+
+function setNextGameInteractionPhase(
+  nextGameReacquireState,
+  phase = NEXT_GAME_INTERACTION_PHASE_INACTIVE
+) {
+  if (!nextGameReacquireState) {
+    return phase;
+  }
+  nextGameReacquireState.interactionPhase = String(phase || NEXT_GAME_INTERACTION_PHASE_INACTIVE);
+  return nextGameReacquireState.interactionPhase;
+}
+
+function clearPostGameInteractionPending(postGameInteractionWatchState) {
+  if (!postGameInteractionWatchState) {
+    return false;
+  }
+  postGameInteractionWatchState.pendingGeneration = 0;
+  postGameInteractionWatchState.pendingTimestamp = 0;
+  postGameInteractionWatchState.pendingType = "";
+  postGameInteractionWatchState.pendingKey = "";
+  postGameInteractionWatchState.pendingTargetTag = "";
+  postGameInteractionWatchState.pendingTargetId = "";
+  postGameInteractionWatchState.pendingTargetClass = "";
+  return true;
+}
+
+export function resetPostGameInteractionWatch(
+  postGameInteractionWatchState,
+  {
+    clearPending = true
+  } = {}
+) {
+  if (!postGameInteractionWatchState) {
+    return null;
+  }
+  postGameInteractionWatchState.active = false;
+  postGameInteractionWatchState.firstNotPlayingAt = 0;
+  postGameInteractionWatchState.interactionBaselineGeneration = 0;
+  postGameInteractionWatchState.lastInteractionGenerationSeen = 0;
+  postGameInteractionWatchState.lastPollAt = 0;
+  if (clearPending) {
+    clearPostGameInteractionPending(postGameInteractionWatchState);
+  }
+  return postGameInteractionWatchState;
+}
+
+export function startPostGameInteractionWatch(
+  postGameInteractionWatchState,
+  {
+    now = Date.now(),
+    baselineGeneration = 0,
+    log = console.log
+  } = {}
+) {
+  if (!postGameInteractionWatchState) {
+    return false;
+  }
+  postGameInteractionWatchState.active = true;
+  postGameInteractionWatchState.firstNotPlayingAt = now;
+  postGameInteractionWatchState.interactionBaselineGeneration = Math.max(
+    0,
+    Number(baselineGeneration ?? 0)
+  );
+  postGameInteractionWatchState.lastInteractionGenerationSeen =
+    postGameInteractionWatchState.interactionBaselineGeneration;
+  postGameInteractionWatchState.lastPollAt = 0;
+  clearPostGameInteractionPending(postGameInteractionWatchState);
+  if (typeof log === "function") {
+    log(
+      `[browser] post-game interaction watch started baseline=${postGameInteractionWatchState.interactionBaselineGeneration} first_not_playing_at=${now}`
+    );
+  }
+  return true;
+}
+
+export function cancelPostGameInteractionWatch(
+  postGameInteractionWatchState,
+  {
+    reason = "cancelled",
+    log = console.log
+  } = {}
+) {
+  if (!postGameInteractionWatchState?.active && !postGameInteractionWatchState?.pendingGeneration) {
+    return false;
+  }
+  resetPostGameInteractionWatch(postGameInteractionWatchState);
+  if (typeof log === "function") {
+    log(`[browser] post-game interaction watch cancelled reason=${reason}`);
+  }
+  return true;
+}
+
+export function resetNextGameReacquireInteractionState(
+  nextGameReacquireState,
+  {
+    baselineGeneration = 0
+  } = {}
+) {
+  if (!nextGameReacquireState) {
+    return null;
+  }
+  const normalizedBaseline = Math.max(0, Number(baselineGeneration ?? 0));
+  nextGameReacquireState.interactionBaselineGeneration = normalizedBaseline;
+  nextGameReacquireState.lastInteractionGenerationSeen = normalizedBaseline;
+  nextGameReacquireState.lastInteractionGenerationHandled = normalizedBaseline;
+  nextGameReacquireState.interactionWindowGeneration = 0;
+  nextGameReacquireState.interactionWindowArmedAt = 0;
+  nextGameReacquireState.pendingInteractionGeneration = 0;
+  nextGameReacquireState.pendingInteractionTimestamp = 0;
+  nextGameReacquireState.pendingInteractionSource = "";
+  nextGameReacquireState.pendingArmReason = "";
+  nextGameReacquireState.pendingInteractionType = "";
+  nextGameReacquireState.pendingInteractionKey = "";
+  nextGameReacquireState.pendingInteractionTargetTag = "";
+  nextGameReacquireState.pendingInteractionTargetId = "";
+  nextGameReacquireState.pendingInteractionTargetClass = "";
+  nextGameReacquireState.pendingInteractionKind = "";
+  nextGameReacquireState.provisionalInteractionGeneration = 0;
+  nextGameReacquireState.provisionalInteractionTimestamp = 0;
+  nextGameReacquireState.provisionalInteractionKey = "";
+  nextGameReacquireState.provisionalInteractionTrusted = false;
+  nextGameReacquireState.provisionalInteractionKind = "";
+  nextGameReacquireState.provisionalTransitionReady = false;
+  nextGameReacquireState.provisionalTransitionReadyLoggedAt = 0;
+  return nextGameReacquireState;
+}
+
+export function setNextGameInteractionBaseline(
+  nextGameReacquireState,
+  interactionState = null
+) {
+  const generation = Math.max(
+    0,
+    Number(interactionState?.generation ?? interactionState ?? 0)
+  );
+  resetNextGameReacquireInteractionState(nextGameReacquireState, {
+    baselineGeneration: generation
+  });
+  return generation;
+}
+
+export function createEndedGameCandidateState() {
+  return {
+    objectId: "",
+    locator: "",
+    epoch: 0,
+    endedAt: 0,
+    lastPlaying: false,
+    lastPieceCounter: -1,
+    lastSignature: "",
+    releaseReason: ""
+  };
+}
+
+export function startNextGameReacquire(
+  nextGameReacquireState,
+  {
+    now = Date.now(),
+    locator = "",
+    epoch = null,
+    interactionBaselineGeneration = 0,
+    log = console.log
+  } = {}
+) {
+  if (!nextGameReacquireState) {
+    return false;
+  }
+  nextGameReacquireState.active = true;
+  setNextGameInteractionPhase(
+    nextGameReacquireState,
+    NEXT_GAME_INTERACTION_PHASE_REACQUIRING
+  );
+  nextGameReacquireState.startedAt = now;
+  nextGameReacquireState.lastFastAttemptAt = 0;
+  nextGameReacquireState.lastFastMissLoggedAt = 0;
+  nextGameReacquireState.lastEndedObjectCheckAt = 0;
+  nextGameReacquireState.lastEndedObjectProbeStatus = "";
+  nextGameReacquireState.lastEndedObjectProbeLogAt = 0;
+  nextGameReacquireState.lastCheapSignalState = false;
+  nextGameReacquireState.lastCheapSignalLogAt = 0;
+  nextGameReacquireState.lastCheapSignalLabel = "";
+  nextGameReacquireState.lastCheapSampledAt = 0;
+  nextGameReacquireState.lastCheapAggregateState = "";
+  resetNextGameReacquireInteractionState(nextGameReacquireState, {
+    baselineGeneration: interactionBaselineGeneration
+  });
+  if (typeof log === "function") {
+    const epochLabel = Number.isFinite(epoch) ? ` epoch=${epoch}` : "";
+    const locatorLabel = locator ? ` locator=${locator}` : "";
+    log(`[browser] next-game reacquire started${epochLabel}${locatorLabel}`);
+  }
+  return true;
+}
+
+export function cancelNextGameReacquire(
+  nextGameReacquireState,
+  {
+    reason = "cancelled",
+    log = console.log
+  } = {}
+) {
+  if (!nextGameReacquireState?.active) {
+    return false;
+  }
+  nextGameReacquireState.active = false;
+  setNextGameInteractionPhase(
+    nextGameReacquireState,
+    NEXT_GAME_INTERACTION_PHASE_INACTIVE
+  );
+  nextGameReacquireState.startedAt = 0;
+  nextGameReacquireState.lastFastAttemptAt = 0;
+  nextGameReacquireState.lastEndedObjectCheckAt = 0;
+  nextGameReacquireState.lastEndedObjectProbeStatus = "";
+  nextGameReacquireState.lastEndedObjectProbeLogAt = 0;
+  nextGameReacquireState.lastCheapSignalState = false;
+  nextGameReacquireState.lastCheapSignalLogAt = 0;
+  nextGameReacquireState.lastCheapSignalLabel = "";
+  nextGameReacquireState.lastCheapSampledAt = 0;
+  nextGameReacquireState.lastCheapAggregateState = "";
+  resetNextGameReacquireInteractionState(nextGameReacquireState);
+  if (typeof log === "function") {
+    log(`[browser] next-game reacquire cancelled reason=${reason}`);
+  }
+  return true;
+}
+
+export function completeNextGameReacquire(
+  nextGameReacquireState,
+  {
+    epoch = null,
+    log = console.log
+  } = {}
+) {
+  if (!nextGameReacquireState) {
+    return false;
+  }
+  const wasActive = nextGameReacquireState.active;
+  nextGameReacquireState.active = false;
+  setNextGameInteractionPhase(
+    nextGameReacquireState,
+    NEXT_GAME_INTERACTION_PHASE_INACTIVE
+  );
+  nextGameReacquireState.startedAt = 0;
+  nextGameReacquireState.lastFastAttemptAt = 0;
+  nextGameReacquireState.lastEndedObjectCheckAt = 0;
+  nextGameReacquireState.lastEndedObjectProbeStatus = "";
+  nextGameReacquireState.lastEndedObjectProbeLogAt = 0;
+  nextGameReacquireState.lastCheapSignalState = false;
+  nextGameReacquireState.lastCheapSignalLogAt = 0;
+  nextGameReacquireState.lastCheapSignalLabel = "";
+  nextGameReacquireState.lastCheapSampledAt = 0;
+  nextGameReacquireState.lastCheapAggregateState = "";
+  resetNextGameReacquireInteractionState(nextGameReacquireState);
+  if (wasActive && typeof log === "function" && Number.isFinite(epoch)) {
+    log(`[browser] next-game reacquire completed epoch=${epoch}`);
+  }
+  return wasActive;
+}
+
+export function clearEndedGameCandidate(endedGameCandidate, reason = "") {
+  if (!endedGameCandidate) {
+    return "";
+  }
+  const previousObjectId = String(endedGameCandidate.objectId ?? "");
+  endedGameCandidate.objectId = "";
+  endedGameCandidate.locator = "";
+  endedGameCandidate.epoch = 0;
+  endedGameCandidate.endedAt = 0;
+  endedGameCandidate.lastPlaying = false;
+  endedGameCandidate.lastPieceCounter = -1;
+  endedGameCandidate.lastSignature = "";
+  endedGameCandidate.releaseReason = reason ? String(reason) : "";
+  return previousObjectId;
+}
+
+export async function releaseEndedGameCandidateHandle(
+  cdp,
+  endedGameCandidate,
+  {
+    reason = "released",
+    log = console.log
+  } = {}
+) {
+  const objectId = clearEndedGameCandidate(endedGameCandidate, reason);
+  if (!objectId || !cdp?.send) {
+    return false;
+  }
+  await cdp.send("Runtime.releaseObject", { objectId }).catch(() => undefined);
+  await cdp.send("Runtime.releaseObjectGroup", {
+    objectGroup: "fusion-ended-game"
+  }).catch(() => undefined);
+  if (typeof log === "function") {
+    log(`[browser] ended game object released reason=${reason}`);
+  }
+  return true;
 }
 
 function createPausedScopeScanCursor() {
@@ -476,6 +930,12 @@ export function disarmClosureCaptureWindow(
   closureCaptureState.retryCount = 0;
   closureCaptureState.firstAttemptLoggedForReason = "";
   closureCaptureState.captureAttemptsInWindow = 0;
+  closureCaptureState.pendingFollowupFullScan = false;
+  closureCaptureState.pendingFollowupFastCapture = false;
+  closureCaptureState.windowArmedAt = 0;
+  closureCaptureState.windowFirstInteractionAt = 0;
+  closureCaptureState.windowTargetedProbeAt = 0;
+  closureCaptureState.provisionalNonHeavyAttemptConsumed = false;
   resetClosureCaptureScanWindowState(closureCaptureState);
   log(`[browser] closure capture disarmed reason=${reason}`);
   return true;
@@ -587,14 +1047,44 @@ export function isGameplayExpectedForClosureCapture({
   state,
   activeRoundId = "",
   closureCaptureState = null,
+  carriedInteractionExpected = false,
   now = Date.now()
 }) {
   return Boolean(
     activeRoundId ||
+      carriedInteractionExpected ||
       state?.countdown === true ||
       state?.playing === true ||
       isClosureCaptureArmed(closureCaptureState, now)
   );
+}
+
+function hasUnhandledCarriedPostGameInteraction(nextGameReacquireState) {
+  if (!nextGameReacquireState?.active) {
+    return false;
+  }
+  const pendingGeneration = Math.max(
+    0,
+    Number(nextGameReacquireState.pendingInteractionGeneration ?? 0)
+  );
+  const handledGeneration = Math.max(
+    0,
+    Number(nextGameReacquireState.lastInteractionGenerationHandled ?? 0)
+  );
+  return (
+    nextGameReacquireState.interactionPhase ===
+      NEXT_GAME_INTERACTION_PHASE_REACQUIRING &&
+    String(nextGameReacquireState.pendingInteractionSource ?? "") === "post_game" &&
+    pendingGeneration > handledGeneration
+  );
+}
+
+function isProvisionalClosureCaptureReason(reason = "") {
+  return String(reason ?? "").startsWith("next_game_provisional_interaction");
+}
+
+function isCarriedClosureCaptureReason(reason = "") {
+  return String(reason ?? "").startsWith("next_game_carried_interaction");
 }
 
 export function shouldLogClosureCaptureSkipped({
@@ -617,7 +1107,690 @@ export function resetClosureCaptureLocatorHint(closureCaptureState) {
     return false;
   }
   closureCaptureState.lastSuccessfulLocator = "";
+  closureCaptureState.lastSuccessfulPausedLocation = null;
   return true;
+}
+
+function shouldAttemptNextGameFastLocator(
+  nextGameReacquireState,
+  now = Date.now(),
+  intervalMs = DEFAULT_NEXT_GAME_FAST_LOCATOR_INTERVAL_MS
+) {
+  if (!nextGameReacquireState?.active) {
+    return false;
+  }
+  return now - Number(nextGameReacquireState.lastFastAttemptAt ?? 0) >= intervalMs;
+}
+
+function shouldLogNextGameFastLocatorMiss(
+  nextGameReacquireState,
+  now = Date.now(),
+  intervalMs = DEFAULT_NEXT_GAME_FAST_LOCATOR_MISS_LOG_INTERVAL_MS
+) {
+  if (!nextGameReacquireState) {
+    return false;
+  }
+  return now - Number(nextGameReacquireState.lastFastMissLoggedAt ?? 0) >= intervalMs;
+}
+
+function shouldLogReacquireStatus(
+  previousStatus,
+  nextStatus,
+  lastLoggedAt,
+  now = Date.now(),
+  intervalMs = DEFAULT_NEXT_GAME_FAST_LOCATOR_MISS_LOG_INTERVAL_MS
+) {
+  return previousStatus !== nextStatus || now - Number(lastLoggedAt ?? 0) >= intervalMs;
+}
+
+export function nextGameInteractionTrackerExpression() {
+  return `(() => {
+    try {
+      if (window.__fusionNextGameInteractionTrackerInstalled) {
+        return { ok: true, installed: true, deduped: true };
+      }
+      const state = window.__fusionNextGameInteraction = window.__fusionNextGameInteraction || {
+        generation: 0,
+        type: null,
+        key: null,
+        interactionKind: null,
+        timestamp: 0,
+        targetTag: null,
+        targetId: null,
+        targetClass: null
+      };
+      const capture = (event) => {
+        try {
+          const type = String(event?.type || "");
+          if (!type) return;
+          if (type === "keydown") {
+            if (event?.repeat === true) {
+              return;
+            }
+            const key = String(event?.key || "");
+            if (!["Enter", " ", "Spacebar", "Space", "r", "R"].includes(key)) {
+              return;
+            }
+          }
+          const now = Date.now();
+          if (
+            now - Number(state.timestamp || 0) <= ${DEFAULT_NEXT_GAME_INTERACTION_BURST_DEDUPE_MS} &&
+            (
+              (type === "click" && state.type === "pointerup") ||
+              (type === "click" && state.type === "pointerdown") ||
+              (type === "pointerup" && state.type === "click") ||
+              (type === "pointerup" && state.type === "pointerdown") ||
+              (type === "pointerdown" && state.type === "pointerup") ||
+              (type === "pointerdown" && state.type === "click") ||
+              type === state.type
+            )
+          ) {
+            state.timestamp = now;
+            return;
+          }
+          const target = event?.target && typeof event.target === "object" ? event.target : null;
+          const targetTag = String(target?.tagName || "");
+          const targetId = String(target?.id || "");
+          let interactionKind = "other";
+          if ((type === "pointerdown" || type === "click") && targetTag === "DIV" && targetId === "start_results") {
+            interactionKind = "again_button";
+          } else if (type === "keydown" && (String(event?.key || "") === "r" || String(event?.key || "") === "R")) {
+            interactionKind = "restart_key";
+          }
+          state.generation = Math.max(0, Number(state.generation || 0)) + 1;
+          state.type = type;
+          state.key = type === "keydown" ? String(event?.key || "") : null;
+          state.interactionKind = interactionKind;
+          state.timestamp = now;
+          state.targetTag = targetTag;
+          state.targetId = targetId;
+          state.targetClass =
+            typeof target?.className === "string" ? target.className : "";
+        } catch {}
+      };
+      document.addEventListener("pointerdown", capture, true);
+      document.addEventListener("click", capture, true);
+      document.addEventListener("pointerup", capture, true);
+      document.addEventListener("keydown", capture, true);
+      window.__fusionNextGameInteractionTrackerInstalled = true;
+      return { ok: true, installed: true, deduped: false };
+    } catch (error) {
+      return { ok: false, reason: String(error?.message || error || "install_failed") };
+    }
+  })()`;
+}
+
+export function createInteractionTrackerInstallState() {
+  return {
+    futureDocumentsRegistered: false,
+    currentDocumentInstalls: 0
+  };
+}
+
+export async function registerNextGameInteractionTrackerForFutureDocuments(
+  cdp
+) {
+  await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+    source: nextGameInteractionTrackerExpression()
+  }).catch(() => undefined);
+  return true;
+}
+
+export async function installNextGameInteractionTracker(
+  cdp,
+  {
+    transientState = null,
+    log = console.log
+  } = {}
+) {
+  const raw = await safeRuntimeEvaluate(cdp, {
+    expression: nextGameInteractionTrackerExpression(),
+    returnByValue: true
+  }, {
+    result: {
+      value: { ok: false, reason: "install_failed" }
+    }
+  }, {
+    transientState,
+    log
+  });
+  return raw?.result?.value ?? { ok: false, reason: "install_failed" };
+}
+
+export async function ensureNextGameInteractionTrackerInstalled(
+  cdp,
+  interactionTrackerInstallState,
+  {
+    transientState = null,
+    log = console.log
+  } = {}
+) {
+  if (!interactionTrackerInstallState?.futureDocumentsRegistered) {
+    await registerNextGameInteractionTrackerForFutureDocuments(cdp);
+    if (interactionTrackerInstallState) {
+      interactionTrackerInstallState.futureDocumentsRegistered = true;
+    }
+  }
+  if (interactionTrackerInstallState) {
+    interactionTrackerInstallState.currentDocumentInstalls = Math.max(
+      0,
+      Number(interactionTrackerInstallState.currentDocumentInstalls ?? 0)
+    ) + 1;
+  }
+  return installNextGameInteractionTracker(cdp, {
+    transientState,
+    log
+  });
+}
+
+function nextGameInteractionStateExpression() {
+  return `(() => {
+    const state = window.__fusionNextGameInteraction || null;
+    return {
+      generation: Math.max(0, Number(state?.generation || 0)),
+      type: state?.type || null,
+      key: state?.key || null,
+      interactionKind: state?.interactionKind || null,
+      timestamp: Math.max(0, Number(state?.timestamp || 0)),
+      targetTag: state?.targetTag || null,
+      targetId: state?.targetId || null,
+      targetClass: state?.targetClass || null
+    };
+  })()`;
+}
+
+export async function readNextGameInteractionState(
+  cdp,
+  {
+    transientState = null,
+    log = console.log
+  } = {}
+) {
+  const raw = await safeRuntimeEvaluate(cdp, {
+    expression: nextGameInteractionStateExpression(),
+    returnByValue: true
+  }, {
+    result: {
+      value: {
+        generation: 0,
+        type: null,
+        key: null,
+        interactionKind: null,
+        timestamp: 0,
+        targetTag: null,
+        targetId: null,
+        targetClass: null
+      }
+    }
+  }, {
+    transientState,
+    log
+  });
+  return raw?.result?.value ?? {
+    generation: 0,
+    type: null,
+    key: null,
+    interactionKind: null,
+    timestamp: 0,
+    targetTag: null,
+    targetId: null,
+    targetClass: null
+  };
+}
+
+export async function primeNextGameInteractionBaseline(
+  cdp,
+  nextGameReacquireState,
+  {
+    transientState = null,
+    log = console.log,
+    readNextGameInteractionStateFn = readNextGameInteractionState
+  } = {}
+) {
+  const interaction = await readNextGameInteractionStateFn(cdp, {
+    transientState,
+    log
+  }).catch(() => ({
+    generation: 0
+  }));
+  const baselineGeneration = setNextGameInteractionBaseline(
+    nextGameReacquireState,
+    interaction
+  );
+  if (typeof log === "function") {
+    log(`[browser] next-game interaction baseline generation=${baselineGeneration}`);
+  }
+  return baselineGeneration;
+}
+
+export async function primePostGameInteractionWatchBaseline(
+  cdp,
+  postGameInteractionWatchState,
+  {
+    now = Date.now(),
+    transientState = null,
+    log = console.log,
+    readNextGameInteractionStateFn = readNextGameInteractionState,
+    nextGameReacquireState = null
+  } = {}
+) {
+  const interaction = await readNextGameInteractionStateFn(cdp, {
+    transientState,
+    log
+  }).catch(() => ({
+    generation: 0
+  }));
+  const baselineGeneration = Math.max(
+    0,
+    Number(interaction?.generation ?? 0)
+  );
+  startPostGameInteractionWatch(postGameInteractionWatchState, {
+    now,
+    baselineGeneration,
+    log
+  });
+  setNextGameInteractionPhase(
+    nextGameReacquireState,
+    NEXT_GAME_INTERACTION_PHASE_POST_GAME_WATCH
+  );
+  return baselineGeneration;
+}
+
+function rememberPendingNextGameInteraction(
+  nextGameReacquireState,
+  interaction = null
+) {
+  if (!nextGameReacquireState) {
+    return false;
+  }
+  const generation = Math.max(0, Number(interaction?.generation ?? 0));
+  if (
+    generation <= 0 ||
+    generation <= Math.max(0, Number(nextGameReacquireState.pendingInteractionGeneration ?? 0))
+  ) {
+    return false;
+  }
+  nextGameReacquireState.pendingInteractionGeneration = generation;
+  nextGameReacquireState.pendingInteractionTimestamp = Math.max(
+    0,
+    Number(interaction?.timestamp ?? 0)
+  );
+  nextGameReacquireState.pendingInteractionSource = "rearm";
+  nextGameReacquireState.pendingArmReason = "";
+  nextGameReacquireState.pendingInteractionType = String(interaction?.type ?? "");
+  nextGameReacquireState.pendingInteractionKey = String(interaction?.key ?? "");
+  nextGameReacquireState.pendingInteractionKind = deriveInteractionKind(interaction);
+  nextGameReacquireState.pendingInteractionTargetTag = String(
+    interaction?.targetTag ?? ""
+  );
+  nextGameReacquireState.pendingInteractionTargetId = String(
+    interaction?.targetId ?? ""
+  );
+  nextGameReacquireState.pendingInteractionTargetClass = String(
+    interaction?.targetClass ?? ""
+  );
+  return true;
+}
+
+function clearPendingNextGameInteraction(nextGameReacquireState) {
+  if (!nextGameReacquireState) {
+    return false;
+  }
+  nextGameReacquireState.pendingInteractionGeneration = 0;
+  nextGameReacquireState.pendingInteractionTimestamp = 0;
+  nextGameReacquireState.pendingInteractionSource = "";
+  nextGameReacquireState.pendingArmReason = "";
+  nextGameReacquireState.pendingInteractionType = "";
+  nextGameReacquireState.pendingInteractionKey = "";
+  nextGameReacquireState.pendingInteractionKind = "";
+  nextGameReacquireState.pendingInteractionTargetTag = "";
+  nextGameReacquireState.pendingInteractionTargetId = "";
+  nextGameReacquireState.pendingInteractionTargetClass = "";
+  return true;
+}
+
+function rememberPendingPostGameInteraction(
+  postGameInteractionWatchState,
+  interaction = null
+) {
+  if (!postGameInteractionWatchState?.active) {
+    return false;
+  }
+  const generation = Math.max(0, Number(interaction?.generation ?? 0));
+  const timestamp = Math.max(0, Number(interaction?.timestamp ?? 0));
+  if (
+    generation <= Math.max(0, Number(postGameInteractionWatchState.interactionBaselineGeneration ?? 0)) ||
+    generation <= Math.max(0, Number(postGameInteractionWatchState.pendingGeneration ?? 0)) ||
+    timestamp <= Math.max(0, Number(postGameInteractionWatchState.firstNotPlayingAt ?? 0))
+  ) {
+    return false;
+  }
+  postGameInteractionWatchState.pendingGeneration = generation;
+  postGameInteractionWatchState.pendingTimestamp = timestamp;
+  postGameInteractionWatchState.pendingType = String(interaction?.type ?? "");
+  postGameInteractionWatchState.pendingKey = String(interaction?.key ?? "");
+  postGameInteractionWatchState.pendingTargetTag = String(interaction?.targetTag ?? "");
+  postGameInteractionWatchState.pendingTargetId = String(interaction?.targetId ?? "");
+  postGameInteractionWatchState.pendingTargetClass = String(interaction?.targetClass ?? "");
+  return true;
+}
+
+function isTrustedNextGameInteraction(interaction = null) {
+  const kind = deriveInteractionKind(interaction);
+  return kind === "again_button" || kind === "restart_key";
+}
+
+function deriveInteractionKind(interaction = null) {
+  const type = String(interaction?.type ?? "");
+  const key = String(interaction?.key ?? "");
+  const targetTag = String(interaction?.targetTag ?? "").toUpperCase();
+  const targetId = String(interaction?.targetId ?? "");
+  if ((type === "pointerdown" || type === "click") && targetTag === "DIV" && targetId === "start_results") {
+    return "again_button";
+  }
+  if (type === "keydown" && (key === "r" || key === "R")) {
+    return "restart_key";
+  }
+  return "other";
+}
+
+function recordProvisionalInteraction(
+  nextGameReacquireState,
+  interaction = null
+) {
+  if (!nextGameReacquireState) {
+    return false;
+  }
+  const generation = Math.max(0, Number(interaction?.generation ?? 0));
+  if (generation <= 0) {
+    return false;
+  }
+  nextGameReacquireState.provisionalInteractionGeneration = generation;
+  nextGameReacquireState.provisionalInteractionTimestamp = Math.max(
+    0,
+    Number(interaction?.timestamp ?? 0)
+  );
+  nextGameReacquireState.provisionalInteractionKey = String(interaction?.key ?? "");
+  nextGameReacquireState.provisionalInteractionTrusted = true;
+  nextGameReacquireState.provisionalInteractionKind = deriveInteractionKind(interaction);
+  nextGameReacquireState.provisionalTransitionReady = false;
+  nextGameReacquireState.provisionalTransitionReadyLoggedAt = 0;
+  return true;
+}
+
+function isAgainButtonProvisionalInteraction(nextGameReacquireState) {
+  return (
+    nextGameReacquireState?.provisionalInteractionTrusted === true &&
+    String(nextGameReacquireState?.provisionalInteractionKind ?? "") === "again_button"
+  );
+}
+
+function isTransitionReadyForAgainProvisional(cheapSignal = null) {
+  const sources = Array.isArray(cheapSignal?.sources) ? cheapSignal.sources : [];
+  const byName = new Map(
+    sources.map((entry) => [String(entry?.source ?? ""), Boolean(entry?.value)])
+  );
+  const resultHidden = byName.get("result_dom") === false;
+  const countdownVisible = byName.get("countdown_dom") === true;
+  const gameplayVisible = byName.get("gameplay_dom") === true;
+  const routeGame = byName.get("route_game") === true;
+  if (countdownVisible || gameplayVisible) {
+    return true;
+  }
+  return resultHidden && routeGame;
+}
+
+export function carryPendingPostGameInteractionIntoReacquire(
+  postGameInteractionWatchState,
+  nextGameReacquireState,
+  {
+    log = console.log
+  } = {}
+) {
+  if (
+    !postGameInteractionWatchState ||
+    !nextGameReacquireState ||
+    Math.max(0, Number(postGameInteractionWatchState.pendingGeneration ?? 0)) <= 0
+  ) {
+    return false;
+  }
+  nextGameReacquireState.lastInteractionGenerationSeen = Math.max(
+    Math.max(0, Number(nextGameReacquireState.lastInteractionGenerationSeen ?? 0)),
+    Math.max(0, Number(postGameInteractionWatchState.pendingGeneration ?? 0))
+  );
+  nextGameReacquireState.pendingInteractionGeneration = Math.max(
+    0,
+    Number(postGameInteractionWatchState.pendingGeneration ?? 0)
+  );
+  nextGameReacquireState.pendingInteractionTimestamp = Math.max(
+    0,
+    Number(postGameInteractionWatchState.pendingTimestamp ?? 0)
+  );
+  nextGameReacquireState.pendingInteractionSource = "post_game";
+  nextGameReacquireState.pendingArmReason = "";
+  nextGameReacquireState.pendingInteractionType = String(
+    postGameInteractionWatchState.pendingType ?? ""
+  );
+  nextGameReacquireState.pendingInteractionKey = String(
+    postGameInteractionWatchState.pendingKey ?? ""
+  );
+  nextGameReacquireState.pendingInteractionKind = deriveInteractionKind({
+    type: postGameInteractionWatchState.pendingType,
+    key: postGameInteractionWatchState.pendingKey,
+    targetTag: postGameInteractionWatchState.pendingTargetTag,
+    targetId: postGameInteractionWatchState.pendingTargetId
+  });
+  nextGameReacquireState.pendingInteractionTargetTag = String(
+    postGameInteractionWatchState.pendingTargetTag ?? ""
+  );
+  nextGameReacquireState.pendingInteractionTargetId = String(
+    postGameInteractionWatchState.pendingTargetId ?? ""
+  );
+  nextGameReacquireState.pendingInteractionTargetClass = String(
+    postGameInteractionWatchState.pendingTargetClass ?? ""
+  );
+  if (typeof log === "function") {
+    log(
+      `[browser] pending post-game interaction carried into reacquire generation=${nextGameReacquireState.pendingInteractionGeneration}`
+    );
+  }
+  return true;
+}
+
+function armNextGameInteractionWindow(
+  closureCaptureState,
+  nextGameReacquireState,
+  {
+    generation = 0,
+    now = Date.now(),
+    bootstrapReady = true,
+    armReason = "next_game_user_interaction",
+    log = console.log
+  } = {}
+) {
+  if (
+    nextGameReacquireState?.interactionPhase !== NEXT_GAME_INTERACTION_PHASE_REACQUIRING
+  ) {
+    return false;
+  }
+  if (
+    nextGameReacquireState?.interactionWindowGeneration === generation &&
+    isClosureCaptureArmed(closureCaptureState, now) &&
+    (
+      closureCaptureState?.armedReason === "next_game_user_interaction" ||
+      closureCaptureState?.armedReason === "next_game_carried_interaction"
+    )
+  ) {
+    return false;
+  }
+  initializeFreshClosureCaptureWindow(closureCaptureState, {
+    reason: armReason,
+    log
+  });
+  const armed = requestClosureCaptureArm(closureCaptureState, {
+    reason: armReason,
+    now,
+    bootstrapReady,
+    log: () => {}
+  });
+  if (!armed) {
+    return false;
+  }
+  const initialDelayMs =
+    isProvisionalClosureCaptureReason(armReason)
+      ? DEFAULT_TARGETED_PAUSED_PROBE_DELAY_MS
+      : armReason === "bot_on"
+        ? 600
+        : DEFAULT_NEXT_GAME_INTERACTION_CAPTURE_DELAY_MS;
+  closureCaptureState.nextAttemptAt = now + initialDelayMs;
+  closureCaptureState.windowArmedAt = now;
+  if (nextGameReacquireState) {
+    nextGameReacquireState.interactionWindowGeneration = generation;
+    nextGameReacquireState.interactionWindowArmedAt = now;
+    setNextGameInteractionPhase(
+      nextGameReacquireState,
+      NEXT_GAME_INTERACTION_PHASE_CAPTURE_ARMED
+    );
+  }
+  if (typeof log === "function") {
+    log(
+      `[browser] closure capture armed reason=${armReason} generation=${generation}`
+    );
+    logClosureCaptureWindowInitialized(closureCaptureState, armReason, log);
+  }
+  return true;
+}
+
+function consumeNextGameInteractionWindow(
+  closureCaptureState,
+  nextGameReacquireState,
+  {
+    reason = "completed",
+    log = console.log
+  } = {}
+) {
+  if (!nextGameReacquireState) {
+    return false;
+  }
+  const generation = Math.max(
+    0,
+    Number(nextGameReacquireState.interactionWindowGeneration ?? 0)
+  );
+  const armedReason = String(closureCaptureState?.armedReason ?? "");
+  const isCarriedWindow = isCarriedClosureCaptureReason(armedReason);
+  if (generation > 0) {
+    nextGameReacquireState.lastInteractionGenerationHandled = Math.max(
+      Math.max(0, Number(nextGameReacquireState.lastInteractionGenerationHandled ?? 0)),
+      generation
+    );
+  }
+  if (
+    generation > 0 &&
+    Math.max(0, Number(nextGameReacquireState.pendingInteractionGeneration ?? 0)) === generation
+  ) {
+    clearPendingNextGameInteraction(nextGameReacquireState);
+  }
+  nextGameReacquireState.pendingArmReason = "";
+  nextGameReacquireState.interactionWindowGeneration = 0;
+  nextGameReacquireState.interactionWindowArmedAt = 0;
+  if (
+    nextGameReacquireState.interactionPhase ===
+    NEXT_GAME_INTERACTION_PHASE_CAPTURE_ARMED
+  ) {
+    setNextGameInteractionPhase(
+      nextGameReacquireState,
+      NEXT_GAME_INTERACTION_PHASE_REACQUIRING
+    );
+  }
+  if (typeof log === "function" && generation > 0 && reason === "scan_budget_exhausted") {
+    if (isCarriedWindow) {
+      log(`[browser] carried interaction capture exhausted generation=${generation}`);
+    }
+    log("[browser] waiting for fresh next-game interaction after capture exhaustion");
+  }
+  return generation > 0;
+}
+
+function armPendingNextGameInteractionWindow(
+  closureCaptureState,
+  nextGameReacquireState,
+  {
+    now = Date.now(),
+    bootstrapReady = true,
+    log = console.log,
+    logPrefix = "",
+    armReason = ""
+  } = {}
+) {
+  if (
+    !nextGameReacquireState ||
+    nextGameReacquireState.interactionPhase !== NEXT_GAME_INTERACTION_PHASE_REACQUIRING
+  ) {
+    return false;
+  }
+  const pendingGeneration = Math.max(
+    0,
+    Number(nextGameReacquireState.pendingInteractionGeneration ?? 0)
+  );
+  const pendingSource = String(nextGameReacquireState.pendingInteractionSource ?? "");
+  if (
+    pendingGeneration <=
+      Math.max(0, Number(nextGameReacquireState.lastInteractionGenerationHandled ?? 0)) ||
+    Math.max(0, Number(nextGameReacquireState.pendingInteractionTimestamp ?? 0)) <=
+      Math.max(0, Number(nextGameReacquireState.startedAt ?? 0))
+  ) {
+    return { armed: false, reason: "already_handled_or_stale" };
+  }
+  if (!bootstrapReady) {
+    nextGameReacquireState.pendingArmReason =
+      armReason || (
+        pendingSource === "post_game"
+          ? "next_game_carried_interaction"
+          : "next_game_user_interaction"
+      );
+    if (typeof log === "function") {
+      log(
+        `[browser] carried interaction arm deferred generation=${pendingGeneration} reason=bootstrap_not_ready`
+      );
+    }
+    return { armed: false, reason: "bootstrap_not_ready" };
+  }
+  const armed = armNextGameInteractionWindow(
+    closureCaptureState,
+    nextGameReacquireState,
+    {
+      generation: pendingGeneration,
+      now,
+      bootstrapReady,
+      armReason:
+        armReason || (
+          pendingSource === "post_game"
+            ? "next_game_carried_interaction"
+            : "next_game_user_interaction"
+        ),
+      log
+    }
+  );
+  if (!armed) {
+    if (typeof log === "function") {
+      log(
+        `[browser] carried interaction arm blocked generation=${pendingGeneration} reason=arm_request_rejected`
+      );
+    }
+    return { armed: false, reason: "arm_request_rejected" };
+  }
+  nextGameReacquireState.lastInteractionGenerationHandled = pendingGeneration;
+  nextGameReacquireState.pendingArmReason = "";
+  clearPendingNextGameInteraction(nextGameReacquireState);
+  if (typeof log === "function") {
+    const nextLogPrefix = logPrefix || (
+      pendingSource === "post_game"
+        ? "carried interaction armed"
+        : "closure capture armed reason=next_game_user_interaction"
+    );
+    log(`[browser] ${nextLogPrefix} generation=${pendingGeneration}`);
+  }
+  return { armed: true, reason: "armed" };
 }
 
 export function expireClosureCaptureWindow(
@@ -646,6 +1819,17 @@ export function expireClosureCaptureWindow(
     );
   }
   return true;
+}
+
+function isClosureCaptureWindowExhausted(closureCaptureState) {
+  if (!closureCaptureState) {
+    return false;
+  }
+  return Boolean(
+    closureCaptureState.scanBudgetExhausted === true ||
+      Math.max(0, Number(closureCaptureState.fullScanAttemptsInWindow ?? 0)) >=
+        MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW
+  );
 }
 
 export function scheduleNextClosureCaptureAttempt(
@@ -679,6 +1863,34 @@ export function scheduleClosureCaptureContinuation(
   return nextDelayMs;
 }
 
+function saveClosureCaptureContinuationCursor(
+  closureCaptureState,
+  resumeCursor,
+  log = console.log
+) {
+  if (!closureCaptureState || !resumeCursor) {
+    return false;
+  }
+  closureCaptureState.pausedScopeScanCursor = {
+    frameIndex: Math.max(0, Number(resumeCursor.frameIndex ?? 0)),
+    scopeIndex: Math.max(0, Number(resumeCursor.scopeIndex ?? 0)),
+    propertyIndex: Math.max(
+      0,
+      Number(resumeCursor.propertyIndex ?? resumeCursor.candidateIndex ?? 0)
+    ),
+    completedScopeKeys: Array.from(closureCaptureState.pausedScopeScanCursor?.completedScopeKeys ?? []),
+    seenCandidateKeys: Array.from(closureCaptureState.pausedScopeScanCursor?.seenCandidateKeys ?? [])
+  };
+  if (typeof log === "function") {
+    log(
+      `[browser] full closure scan continuation saved cursor=${formatClosureCaptureCursorLabel(
+        closureCaptureState.pausedScopeScanCursor
+      )}`
+    );
+  }
+  return true;
+}
+
 function formatScanCursor(cursor = null) {
   return {
     frameIndex: Math.max(0, Number(cursor?.frameIndex ?? 0)),
@@ -696,6 +1908,154 @@ function formatClosureCaptureCursorLabel(cursor = null) {
   }
   const formatted = formatScanCursor(cursor);
   return `${formatted.frameIndex}:${formatted.scopeIndex}:${formatted.candidateIndex}`;
+}
+
+function getPausedScopeScanFrameOrder(callFrames = []) {
+  return Array.from({ length: callFrames.length }, (_, index) => callFrames.length - 1 - index);
+}
+
+function nextPausedScopeScanFrameIndex(callFrames = [], frameIndex = 0) {
+  const order = getPausedScopeScanFrameOrder(callFrames);
+  const currentOrderIndex = order.indexOf(frameIndex);
+  if (currentOrderIndex < 0) {
+    return null;
+  }
+  return order[currentOrderIndex + 1] ?? null;
+}
+
+function computePausedScopeScanResumeCursor(
+  callFrames = [],
+  {
+    frameIndex = 0,
+    scopeIndex = 0,
+    propertyIndex = 0,
+    descriptorsLength = 0,
+    advancePastCurrentProperty = false
+  } = {}
+) {
+  const currentFrame = callFrames[frameIndex];
+  const currentScopeChain = currentFrame?.scopeChain ?? [];
+  const currentPropertyIndex =
+    Math.max(0, Number(propertyIndex ?? 0)) + (advancePastCurrentProperty ? 1 : 0);
+  if (currentPropertyIndex < Math.max(0, Number(descriptorsLength ?? 0))) {
+    return {
+      frameIndex,
+      scopeIndex,
+      propertyIndex: currentPropertyIndex
+    };
+  }
+  if (scopeIndex + 1 < currentScopeChain.length) {
+    return {
+      frameIndex,
+      scopeIndex: scopeIndex + 1,
+      propertyIndex: 0
+    };
+  }
+  const nextFrameIndex = nextPausedScopeScanFrameIndex(callFrames, frameIndex);
+  if (nextFrameIndex === null || nextFrameIndex === undefined) {
+    return null;
+  }
+  return {
+    frameIndex: nextFrameIndex,
+    scopeIndex: 0,
+    propertyIndex: 0
+  };
+}
+
+async function probeTargetedPausedLocation(
+  cdp,
+  pausedEvent,
+  closureCaptureState,
+  {
+    log = console.log,
+    requireActiveGame = false
+  } = {}
+) {
+  const hint = closureCaptureState?.lastSuccessfulPausedLocation ?? null;
+  if (!hint) {
+    return { ok: false, reason: "missing_hint" };
+  }
+  const callFrames = pausedEvent?.callFrames ?? [];
+  const callFrame = callFrames[hint.frameIndex];
+  const scope = callFrame?.scopeChain?.[hint.scopeIndex];
+  const scopeObjectId = scope?.object?.objectId;
+  if (!scopeObjectId) {
+    if (typeof log === "function") {
+      log("[browser] targeted paused locator miss reason=scope_missing");
+    }
+    return { ok: false, reason: "scope_missing" };
+  }
+  const properties = await cdp.send("Runtime.getProperties", {
+    objectId: scopeObjectId,
+    ownProperties: true,
+    accessorPropertiesOnly: false,
+    generatePreview: false
+  }).catch(() => null);
+  const descriptors = (properties?.result ?? [])
+    .slice(0, MAX_SCOPE_PROPERTIES_PER_SCOPE)
+    .map((descriptor, index) => ({ descriptor, index }))
+    .sort((left, right) => {
+      const scoreDelta =
+        scorePausedScopeDescriptor(right.descriptor) -
+        scorePausedScopeDescriptor(left.descriptor);
+      return scoreDelta !== 0 ? scoreDelta : left.index - right.index;
+    })
+    .map(({ descriptor }) => descriptor);
+  const expectedLocator = String(hint.locator ?? "");
+  const candidates = [];
+  if (Number.isFinite(hint.candidateIndex) && descriptors[hint.candidateIndex]) {
+    candidates.push({
+      descriptor: descriptors[hint.candidateIndex],
+      candidateIndex: hint.candidateIndex
+    });
+  }
+  for (let index = 0; index < descriptors.length; index += 1) {
+    if (index === hint.candidateIndex) {
+      continue;
+    }
+    const descriptor = descriptors[index];
+    if (String(descriptor?.name ?? "") === expectedLocator) {
+      candidates.push({ descriptor, candidateIndex: index });
+      break;
+    }
+  }
+  for (const candidate of candidates) {
+    const valueObjectId = candidate.descriptor?.value?.objectId;
+    const locator = String(candidate.descriptor?.name ?? "").trim();
+    if (!valueObjectId || !locator || locator !== expectedLocator) {
+      continue;
+    }
+    const exposed = await exposeTetrioCandidateObjectWithOptions(
+      cdp,
+      valueObjectId,
+      locator,
+      { requireActiveGame }
+    );
+    if (exposed.ok) {
+      if (typeof log === "function") {
+        log(
+          `[browser] targeted paused locator hit frame=${hint.frameIndex} scope=${hint.scopeIndex} candidate=${candidate.candidateIndex}`
+        );
+      }
+      return {
+        ...exposed,
+        outcome: "targeted_hint_found",
+        progress: {
+          frameIndex: hint.frameIndex,
+          scopeIndex: hint.scopeIndex,
+          candidateIndex: candidate.candidateIndex,
+          inspectedObjects: 1,
+          pausedMs: 0
+        }
+      };
+    }
+  }
+  if (typeof log === "function") {
+    log(
+      `[browser] targeted paused locator miss frame=${hint.frameIndex} scope=${hint.scopeIndex} candidate=${hint.candidateIndex}`
+    );
+  }
+  return { ok: false, reason: "targeted_hint_miss" };
 }
 
 function logClosureCaptureWindowInitialized(
@@ -768,6 +2128,7 @@ export function applyBrowserControlMessage({
   message,
   controlState,
   closureCaptureState,
+  nextGameReacquireState = null,
   now = Date.now(),
   log = console.log,
   windowMs = DEFAULT_CAPTURE_ARMING_WINDOW_MS,
@@ -797,6 +2158,10 @@ export function applyBrowserControlMessage({
       log
     });
   } else {
+    cancelNextGameReacquire(nextGameReacquireState, {
+      reason: "bot_off",
+      log
+    });
     disarmClosureCaptureWindow(closureCaptureState, {
       reason: "bot_off",
       log,
@@ -1059,6 +2424,9 @@ async function main() {
   const browserControlState = createBrowserControlState();
   const closureCaptureState = createClosureCaptureState();
   const gameStartSignalState = createGameStartSignalState();
+  const nextGameReacquireState = createNextGameReacquireState();
+  const postGameInteractionWatchState = createPostGameInteractionWatchState();
+  const endedGameCandidate = createEndedGameCandidateState();
   let lastPerfLoggedAt = Date.now();
   let loopStartedAt = Date.now();
   let maxEventLoopDelayMs = 0;
@@ -1131,6 +2499,13 @@ async function main() {
   const network = createTetrioNetworkState();
   const bootstrapState = createBootstrapState();
   const transientState = { lastRuntimeError: "" };
+  const interactionTrackerInstallState = createInteractionTrackerInstallState();
+  const installInteractionTrackerForCurrentDocument = () =>
+    ensureNextGameInteractionTrackerInstalled(cdp, interactionTrackerInstallState, {
+      transientState,
+      log: (message) => console.log(message)
+    }).catch(() => undefined);
+  await installInteractionTrackerForCurrentDocument();
   console.log("[browser] browser target state reset");
   if (useRibbonWebsocket) {
     await installRibbonMonitor(cdp, network, msgpack, bootstrapState, {
@@ -1151,6 +2526,18 @@ async function main() {
     resetPausedScopeScanProgress(closureCaptureState);
     clearPendingClosureCaptureArm(closureCaptureState);
     resetGameStartSignalState(gameStartSignalState);
+    void releaseEndedGameCandidateHandle(cdp, endedGameCandidate, {
+      reason: resetConnectedAt ? "navigation" : "execution_context_reset",
+      log: (message) => console.log(message)
+    }).catch(() => undefined);
+    cancelNextGameReacquire(nextGameReacquireState, {
+      reason: "browser_reset",
+      log: (message) => console.log(message)
+    });
+    cancelPostGameInteractionWatch(postGameInteractionWatchState, {
+      reason: "browser_reset",
+      log: (message) => console.log(message)
+    });
     console.log("[browser] browser target state reset");
   };
   cdp.on("Page.frameNavigated", (event) => {
@@ -1161,12 +2548,21 @@ async function main() {
     disarmClosureCaptureWindow(closureCaptureState, {
       reason: "page_navigated"
     });
+    void installInteractionTrackerForCurrentDocument();
   });
   cdp.on("Runtime.executionContextsCleared", () => {
     resetBrowserTargetState();
     disarmClosureCaptureWindow(closureCaptureState, {
       reason: "execution_context_cleared"
     });
+    void installInteractionTrackerForCurrentDocument();
+  });
+  cdp.on("Runtime.executionContextCreated", (event) => {
+    const auxData = event?.context?.auxData ?? null;
+    if (auxData && auxData.isDefault === false) {
+      return;
+    }
+    void installInteractionTrackerForCurrentDocument();
   });
   const control = createInterface({
     input: process.stdin,
@@ -1187,9 +2583,20 @@ async function main() {
       message,
       controlState: browserControlState,
       closureCaptureState,
+      nextGameReacquireState,
       bootstrapReady: isBootstrapReadyForClosureCapture(bootstrapState),
       log: (entry) => console.log(entry)
     });
+    if (message?.type === "bot_enabled" && message.enabled === false) {
+      cancelPostGameInteractionWatch(postGameInteractionWatchState, {
+        reason: "bot_off",
+        log: (entry) => console.log(entry)
+      });
+      void releaseEndedGameCandidateHandle(cdp, endedGameCandidate, {
+        reason: "bot_off",
+        log: (entry) => console.log(entry)
+      }).catch(() => undefined);
+    }
   });
 
   let gameEpoch = 1;
@@ -1212,6 +2619,10 @@ async function main() {
     }
     resetBrowserTargetState();
     clearPendingClosureCaptureArm(closureCaptureState);
+    await releaseEndedGameCandidateHandle(cdp, endedGameCandidate, {
+      reason: "chromium_shutdown",
+      log: (message) => console.log(message)
+    }).catch(() => undefined);
     await cdp.close().catch(() => undefined);
     if (ownsChromium && browserProcess) {
       await shutdownChromium(browserProcess);
@@ -1228,6 +2639,7 @@ async function main() {
         Math.max(0, loopNow - (loopStartedAt + pollMs))
       );
       loopStartedAt = loopNow;
+      const previousGameplayPhase = String(probeState.lastGameplayPhase ?? "inactive");
       const state = await readTetrioState(cdp, {
         probePageState,
         useSeedSimulationFallback,
@@ -1239,23 +2651,79 @@ async function main() {
         suppressClosureCapture: vsWsSimEnabled && vsRoundActive,
         activeRoundId: vsRoundActive ? vsRoundId : "",
         closureCaptureState,
+        nextGameReacquireState,
+        postGameInteractionWatchState,
+        endedGameCandidate,
+        waitingForNextGame,
         suppressedReason: DEFAULT_SUPPRESSED_REASON,
         perfEnabled: browserPerfEnabled
       });
 
+      if (
+        browserControlState.botEnabled &&
+        !waitingForNextGame &&
+        !postGameInteractionWatchState.active &&
+        previousGameplayPhase === "playing" &&
+        state?.playing !== true
+      ) {
+        await primePostGameInteractionWatchBaseline(cdp, postGameInteractionWatchState, {
+          now: Date.now(),
+          transientState,
+          log: (message) => console.log(message),
+          nextGameReacquireState
+        });
+      }
+
+      if (
+        postGameInteractionWatchState.active &&
+        !waitingForNextGame &&
+        state?.playing === true
+      ) {
+        setNextGameInteractionPhase(
+          nextGameReacquireState,
+          NEXT_GAME_INTERACTION_PHASE_INACTIVE
+        );
+        cancelPostGameInteractionWatch(postGameInteractionWatchState, {
+          reason: "playing_resumed",
+          log: (message) => console.log(message)
+        });
+      }
+
       if (shouldHandleEndedGame(state, endedHandled)) {
         endedHandled = true;
         waitingForNextGame = true;
+        const preserveProvisionalWindow =
+          isClosureCaptureArmed(closureCaptureState, Date.now()) &&
+          isAgainButtonProvisionalInteraction(nextGameReacquireState) &&
+          Math.max(0, Number(nextGameReacquireState.interactionWindowGeneration ?? 0)) > 0;
+        const preservedWindowGeneration = Math.max(
+          0,
+          Number(nextGameReacquireState.interactionWindowGeneration ?? 0)
+        );
+        const preservedWindowArmedAt = Math.max(
+          0,
+          Number(nextGameReacquireState.interactionWindowArmedAt ?? 0)
+        );
+        const preservedProvisionalInteraction = {
+          generation: Math.max(0, Number(nextGameReacquireState.provisionalInteractionGeneration ?? 0)),
+          timestamp: Math.max(0, Number(nextGameReacquireState.provisionalInteractionTimestamp ?? 0)),
+          key: String(nextGameReacquireState.provisionalInteractionKey ?? ""),
+          trusted: nextGameReacquireState.provisionalInteractionTrusted === true,
+          kind: String(nextGameReacquireState.provisionalInteractionKind ?? ""),
+          transitionReady: nextGameReacquireState.provisionalTransitionReady === true,
+          transitionReadyLoggedAt: Math.max(0, Number(nextGameReacquireState.provisionalTransitionReadyLoggedAt ?? 0))
+        };
 
         await markCurrentGameAsEnded(cdp);
 
         resetSnapshotTracking(snapshotTracking);
         probeState.lastCaptureAt = 0;
         resetTetrioNetworkState(network);
-        resetClosureCaptureLocatorHint(closureCaptureState);
-        disarmClosureCaptureWindow(closureCaptureState, {
-          reason: "game_ended"
-        });
+        if (!preserveProvisionalWindow) {
+          disarmClosureCaptureWindow(closureCaptureState, {
+            reason: "game_ended"
+          });
+        }
         clearSnapshotFile(snapshotPath);
         waitingForNextGameSignalCutoffAt =
           Math.max(0, Date.now() - DEFAULT_GAME_START_SIGNAL_OVERLAP_MS);
@@ -1265,6 +2733,98 @@ async function main() {
 
         console.log(`[browser] game session ended epoch=${gameEpoch}`);
         console.log("[browser] cleared ended game cache; waiting for next game");
+        await retainEndedGameCandidateHandle(cdp, endedGameCandidate, {
+          locator: closureCaptureState.lastSuccessfulLocator,
+          epoch: gameEpoch,
+          endedAt: Date.now(),
+          lastPlaying: false,
+          lastPieceCounter: Number(state.pieceCounter ?? -1),
+          lastSignature: snapshotTracking.lastWrittenSignature,
+          transientState,
+          log: (message) => console.log(message)
+        });
+        if (browserControlState.botEnabled) {
+          startNextGameReacquire(nextGameReacquireState, {
+            now: Date.now(),
+            epoch: gameEpoch,
+            locator: endedGameCandidate.locator
+              ? `closure:${endedGameCandidate.locator}`
+              : "",
+            interactionBaselineGeneration: Math.max(
+              0,
+              Number(postGameInteractionWatchState.interactionBaselineGeneration ?? 0)
+            ),
+            log: (message) => console.log(message)
+          });
+          const carriedPending = carryPendingPostGameInteractionIntoReacquire(
+            postGameInteractionWatchState,
+            nextGameReacquireState,
+            {
+              log: (message) => console.log(message)
+            }
+          );
+          if (!carriedPending && !postGameInteractionWatchState.active) {
+            await primeNextGameInteractionBaseline(cdp, nextGameReacquireState, {
+              transientState,
+              log: (message) => console.log(message)
+            });
+          } else {
+            nextGameReacquireState.lastInteractionGenerationSeen = Math.max(
+              Math.max(0, Number(nextGameReacquireState.lastInteractionGenerationSeen ?? 0)),
+              Math.max(0, Number(postGameInteractionWatchState.lastInteractionGenerationSeen ?? 0))
+            );
+          }
+          if (preserveProvisionalWindow) {
+            nextGameReacquireState.interactionWindowGeneration = preservedWindowGeneration;
+            nextGameReacquireState.interactionWindowArmedAt = preservedWindowArmedAt;
+            nextGameReacquireState.provisionalInteractionGeneration = preservedProvisionalInteraction.generation;
+            nextGameReacquireState.provisionalInteractionTimestamp = preservedProvisionalInteraction.timestamp;
+            nextGameReacquireState.provisionalInteractionKey = preservedProvisionalInteraction.key;
+            nextGameReacquireState.provisionalInteractionTrusted = preservedProvisionalInteraction.trusted;
+            nextGameReacquireState.provisionalInteractionKind = preservedProvisionalInteraction.kind;
+            nextGameReacquireState.provisionalTransitionReady = preservedProvisionalInteraction.transitionReady;
+            nextGameReacquireState.provisionalTransitionReadyLoggedAt = preservedProvisionalInteraction.transitionReadyLoggedAt;
+            setNextGameInteractionPhase(
+              nextGameReacquireState,
+              preservedProvisionalInteraction.transitionReady
+                ? NEXT_GAME_INTERACTION_PHASE_REACQUIRING
+                : NEXT_GAME_INTERACTION_PHASE_WAITING_TRANSITION_READY
+            );
+            console.log(
+              `[browser] provisional capture promoted after end confirmation generation=${preservedWindowGeneration}`
+            );
+            console.log(
+              `[browser] provisional window preserved across game end confirmation generation=${preservedWindowGeneration}`
+            );
+          }
+          if (carriedPending && isBootstrapReadyForClosureCapture(bootstrapState)) {
+            console.log(
+              `[browser] carried interaction requesting capture generation=${Math.max(
+                0,
+                Number(nextGameReacquireState.pendingInteractionGeneration ?? 0)
+              )}`
+            );
+            armPendingNextGameInteractionWindow(
+              closureCaptureState,
+              nextGameReacquireState,
+              {
+                now: Date.now(),
+                bootstrapReady: true,
+                log: (message) => console.log(message),
+                logPrefix: "carried interaction armed"
+              }
+            );
+          } else if (carriedPending) {
+            nextGameReacquireState.pendingArmReason = "next_game_carried_interaction";
+            console.log(
+              `[browser] carried interaction arm deferred generation=${Math.max(
+                0,
+                Number(nextGameReacquireState.pendingInteractionGeneration ?? 0)
+              )} reason=bootstrap_not_ready`
+            );
+          }
+        }
+        resetPostGameInteractionWatch(postGameInteractionWatchState);
       }
 
       if (
@@ -1347,8 +2907,17 @@ async function main() {
         waitingForNextGame = false;
         waitingForNextGameSignalCutoffAt = 0;
         endedHandled = false;
+        setNextGameInteractionPhase(
+          nextGameReacquireState,
+          NEXT_GAME_INTERACTION_PHASE_INACTIVE
+        );
+        resetPostGameInteractionWatch(postGameInteractionWatchState);
         resetSnapshotTracking(snapshotTracking);
         console.log(`[browser] new game detected epoch=${gameEpoch}`);
+        completeNextGameReacquire(nextGameReacquireState, {
+          epoch: gameEpoch,
+          log: (message) => console.log(message)
+        });
       }
 
       lastReason = "";
@@ -1812,6 +3381,472 @@ async function readBootstrapPageState(
   return pageState;
 }
 
+async function retainEndedGameCandidateHandle(
+  cdp,
+  endedGameCandidate,
+  {
+    locator = "",
+    epoch = 0,
+    endedAt = Date.now(),
+    lastPlaying = false,
+    lastPieceCounter = -1,
+    lastSignature = "",
+    transientState = null,
+    log = console.log
+  } = {}
+) {
+  if (!endedGameCandidate) {
+    return false;
+  }
+  const raw = await safeRuntimeEvaluate(cdp, {
+    expression: "window.__fusionEndedTetrioGame || window.__fusionTetrioGame || null",
+    objectGroup: "fusion-ended-game",
+    silent: true
+  }, null, {
+    transientState,
+    log
+  });
+  const objectId = String(raw?.result?.objectId ?? "");
+  if (!objectId) {
+    if (typeof log === "function") {
+      log("[browser] ended game object retained epoch=0 object_id_present=false locator=");
+    }
+    return false;
+  }
+  endedGameCandidate.objectId = objectId;
+  endedGameCandidate.locator = String(locator ?? "");
+  endedGameCandidate.epoch = Math.max(0, Number(epoch ?? 0));
+  endedGameCandidate.endedAt = endedAt;
+  endedGameCandidate.lastPlaying = Boolean(lastPlaying);
+  endedGameCandidate.lastPieceCounter = Number.isFinite(lastPieceCounter)
+    ? Math.max(0, Math.floor(lastPieceCounter))
+    : -1;
+  endedGameCandidate.lastSignature = String(lastSignature ?? "");
+  if (typeof log === "function") {
+    log(
+      `[browser] ended game object retained epoch=${endedGameCandidate.epoch} object_id_present=true locator=${
+        endedGameCandidate.locator ? `closure:${endedGameCandidate.locator}` : ""
+      }`
+    );
+  }
+  return true;
+}
+
+function endedGameCandidateProbeExpression() {
+  return `function(lastEndedPieceCounter, lastSignature) {
+    try {
+      const normalizePiece = (piece) => {
+        if (typeof piece === "string") {
+          const token = piece.trim().toLowerCase();
+          return ["i", "o", "t", "s", "z", "j", "l"].includes(token) ? token : null;
+        }
+        if (piece && typeof piece === "object") {
+          return normalizePiece(piece.type ?? piece.name ?? piece.kind ?? piece.id);
+        }
+        return null;
+      };
+      const numberFrom = (...values) => {
+        for (const value of values) {
+          const next = Number(value);
+          if (Number.isFinite(next)) return next;
+        }
+        return null;
+      };
+      const rowCells = (row) => Array.isArray(row) ? row : Array.isArray(row?.cells) ? row.cells : null;
+      const filled = (cell) => cell !== null && cell !== undefined && cell !== 0 && cell !== false;
+      const queueFrom = (...sources) => {
+        for (const source of sources) {
+          if (!Array.isArray(source)) continue;
+          const queue = source.map((piece) => normalizePiece(piece)).filter(Boolean);
+          if (queue.length > 0) return queue;
+        }
+        return [];
+      };
+      if (
+        !this ||
+        typeof this !== "object" ||
+        typeof this.ejectState !== "function" ||
+        typeof this.ejectBoardState !== "function"
+      ) {
+        return { status: "invalid_shape" };
+      }
+      const exported = this.ejectState();
+      const boardState = this.ejectBoardState();
+      const state = exported && typeof exported === "object" && exported.game ? exported.game : exported;
+      if (!state || typeof state !== "object") {
+        return { status: "invalid_shape" };
+      }
+      const activeState = state.falling ?? state.active ?? state.current ?? state.piece;
+      const current = normalizePiece(activeState);
+      const hold = normalizePiece(state.hold ?? state.held);
+      const queue = queueFrom(state.bag, state.queue, state.next, state.preview, state.previews, state.pieces);
+      const board = Array.isArray(state.board) ? state.board : Array.isArray(boardState?.b) ? boardState.b : null;
+      const playing =
+        typeof this.isPlaying === "function" ? Boolean(this.isPlaying()) :
+        typeof state.playing === "boolean" ? state.playing :
+        typeof state.paused === "boolean" ? !state.paused :
+        true;
+      const started =
+        typeof this.isStarted === "function" ? Boolean(this.isStarted()) :
+        Boolean(state.started ?? true);
+      const destroyed = Boolean(state.destroyed || state.dead || state.gameover);
+      const countdown = started && !destroyed && !playing;
+      const ready = started && !destroyed;
+      const pieceCounter = Math.max(0, Math.floor(numberFrom(
+        state?.stats?.piecesplaced,
+        state?.stats?.piecesPlaced,
+        state?.stats?.pieces,
+        state.piecesplaced,
+        state.piecesPlaced,
+        state.pieceCounter,
+        state.piececount,
+        0
+      ) ?? 0));
+      if (!ready || (!playing && !countdown)) {
+        return {
+          status: "valid_ended",
+          playing,
+          countdown,
+          pieceCounter
+        };
+      }
+      if (!current || queue.length === 0 || !Array.isArray(board) || board.length === 0) {
+        return { status: "invalid_shape" };
+      }
+      const field = Array.from({ length: 40 }, (_, rowIndex) => {
+        const sourceRow = board[board.length - 1 - rowIndex];
+        const cells = rowCells(sourceRow);
+        return Array.from({ length: 10 }, (_, x) => filled(cells ? cells[x] : null));
+      });
+      const signature =
+        String(pieceCounter) + "|" + String(current) + "|" + String(hold ?? "-") + "|" + queue.join(",");
+      return {
+        status: playing ? "valid_playing" : "valid_countdown",
+        reactivated:
+          pieceCounter <= 3 ||
+          (Number.isFinite(lastEndedPieceCounter) && lastEndedPieceCounter >= 0 && pieceCounter < lastEndedPieceCounter) ||
+          signature !== String(lastSignature || ""),
+        state: {
+          ok: true,
+          ready,
+          reason: null,
+          field,
+          current,
+          hold,
+          queue,
+          b2b: Math.max(0, numberFrom(state?.stats?.b2b, state.b2b, 0) ?? 0) > 0,
+          combo: Math.max(0, numberFrom(state?.stats?.combo, state.combo, 0) ?? 0),
+          incoming: Math.max(0, numberFrom(state?.stats?.impendingdamage, state.incoming, 0) ?? 0),
+          pieceCounter,
+          playing,
+          countdown
+        }
+      };
+    } catch {
+      return { status: "transient_error" };
+    }
+  }`;
+}
+
+async function readEndedGameCandidateState(
+  cdp,
+  endedGameCandidate,
+  {
+    log = console.log
+  } = {}
+) {
+  const objectId = String(endedGameCandidate?.objectId ?? "");
+  if (!objectId) {
+    return { status: "object_released" };
+  }
+  try {
+    const result = await cdp.send("Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: endedGameCandidateProbeExpression(),
+      arguments: [
+        { value: endedGameCandidate?.lastPieceCounter ?? -1 },
+        { value: endedGameCandidate?.lastSignature ?? "" }
+      ],
+      returnByValue: true,
+      silent: true
+    });
+    return result?.result?.value ?? { status: "transient_error" };
+  } catch (error) {
+    const message = String(error?.message ?? error ?? "");
+    if (/Cannot find context with specified id|Execution context was destroyed/i.test(message)) {
+      return { status: "execution_context_destroyed" };
+    }
+    if (/objectId|object id/i.test(message) && /invalid|missing|null|undefined/i.test(message)) {
+      return { status: "invalid_object_id" };
+    }
+    if (/Could not find object with given id|Cannot find object with id|Invalid remote object id/i.test(message)) {
+      return { status: "object_released" };
+    }
+    return { status: "transient_error", reason: message };
+  }
+}
+
+export function cheapGameSignalExpression() {
+  return `(() => {
+      const isVisible = (node, depth = 2) => {
+        if (!node || typeof node !== "object" || node.isConnected !== true) return false;
+        let current = node;
+        let remaining = depth;
+        while (current && remaining >= 0) {
+          const style = window.getComputedStyle ? window.getComputedStyle(current) : null;
+          if (!style) return false;
+          if (
+            style.display === "none" ||
+            style.visibility === "hidden" ||
+            style.visibility === "collapse" ||
+            Number(style.opacity) <= 0
+          ) {
+            return false;
+          }
+          current = current.parentElement;
+          remaining -= 1;
+        }
+        const rect = typeof node.getBoundingClientRect === "function" ? node.getBoundingClientRect() : null;
+        return Boolean(rect && rect.width > 0 && rect.height > 0);
+      };
+      const firstVisible = (selector) =>
+        Array.from(document.querySelectorAll(selector)).find((node) => isVisible(node)) || null;
+      const textIncludes = (tokens) => {
+        const text = String(document.body?.innerText ?? "").toLowerCase();
+        return tokens.some((token) => text.includes(token));
+      };
+      const routeText = (String(location.pathname || "") + String(location.hash || "")).toLowerCase();
+      const countdownNode = firstVisible("[class*='countdown'],[class*='ready'],[class*='start']");
+      const resultNode = firstVisible("[class*='result'],[class*='summary'],[class*='finish']");
+      const retryNode = firstVisible(
+        "[class*='retry'],[data-action*='retry'],button[id*='retry'],button[class*='restart']"
+      );
+      const canvasNode = firstVisible("canvas");
+      const gameplayNode = firstVisible("[class*='board'],[class*='matrix'],[class*='playfield'],[class*='hud'],[data-screen='game']");
+      const countdownByText = textIncludes(["go!", "ready"]);
+      const resultByText = textIncludes(["result", "finished"]);
+      const routeGame = /play|solo|40l/.test(routeText) && !/result|summary|finish/.test(routeText);
+      const routeResult = /result|summary|finish/.test(routeText);
+      const resultVisible = Boolean(resultNode) || Boolean(retryNode) || resultByText || routeResult;
+      const countdownVisible = Boolean(countdownNode) || countdownByText;
+      const gameplayVisible = Boolean(gameplayNode) && routeGame;
+      const canvasVisible = Boolean(canvasNode);
+      const sources = [
+        { source: "route_game", value: routeGame, state: routeGame ? "playing" : "inactive" },
+        { source: "countdown_dom", value: countdownVisible, state: countdownVisible ? "countdown" : "inactive" },
+        { source: "result_dom", value: resultVisible, state: resultVisible ? "result" : "inactive" },
+        { source: "gameplay_dom", value: gameplayVisible, state: gameplayVisible ? "playing" : "inactive" },
+        { source: "canvas_visible", value: canvasVisible, state: canvasVisible ? "visible" : "inactive" }
+      ];
+      let active = false;
+      let source = "none";
+      let label = "inactive";
+      if (resultVisible && countdownVisible) {
+        label = "ambiguous";
+      } else if (resultVisible) {
+        label = "result";
+      } else if (countdownVisible) {
+        active = true;
+        source = "countdown_dom";
+        label = "countdown";
+      } else if (gameplayVisible) {
+        active = true;
+        source = "gameplay_dom";
+        label = "playing";
+      }
+      return { active, source, label, sources };
+    })()`;
+}
+
+async function readCheapGameSignal(
+  cdp,
+  {
+    transientState = null,
+    log = console.log
+  } = {}
+) {
+  const raw = await safeRuntimeEvaluate(cdp, {
+    expression: cheapGameSignalExpression(),
+    returnByValue: true
+  }, {
+    result: {
+      value: { active: false, source: "none", label: "inactive", sources: [] }
+    }
+  }, {
+    transientState,
+    log
+  });
+  return raw?.result?.value ?? { active: false, source: "none", label: "inactive", sources: [] };
+}
+
+function nextGameFastLocatorExpression(locatorName = "closure:Ai") {
+  return `(() => {
+    const normalizePiece = (piece) => {
+      if (typeof piece === "string") {
+        const token = piece.trim().toLowerCase();
+        return ["i", "o", "t", "s", "z", "j", "l"].includes(token) ? token : null;
+      }
+      if (piece && typeof piece === "object") {
+        return normalizePiece(piece.type ?? piece.name ?? piece.kind ?? piece.id);
+      }
+      return null;
+    };
+    const numberFrom = (...values) => {
+      for (const value of values) {
+        const next = Number(value);
+        if (Number.isFinite(next)) return next;
+      }
+      return null;
+    };
+    const rowCells = (row) => Array.isArray(row) ? row : Array.isArray(row?.cells) ? row.cells : null;
+    const filled = (cell) => cell !== null && cell !== undefined && cell !== 0 && cell !== false;
+    const queueFrom = (...sources) => {
+      for (const source of sources) {
+        if (!Array.isArray(source)) continue;
+        const queue = source.map((piece) => normalizePiece(piece)).filter(Boolean);
+        if (queue.length > 0) return queue;
+      }
+      return [];
+    };
+    const readCandidate = (game) => {
+      if (!game || typeof game !== "object" || typeof game.ejectState !== "function" || typeof game.ejectBoardState !== "function") {
+        return null;
+      }
+      const exported = game.ejectState();
+      const boardState = game.ejectBoardState();
+      const state = exported && typeof exported === "object" && exported.game ? exported.game : exported;
+      if (!state || typeof state !== "object") return null;
+      const activeState = state.falling ?? state.active ?? state.current ?? state.piece;
+      const current = normalizePiece(activeState);
+      const queue = queueFrom(state.bag, state.queue, state.next, state.preview, state.previews, state.pieces);
+      const board = Array.isArray(state.board) ? state.board : Array.isArray(boardState?.b) ? boardState.b : null;
+      const playing =
+        typeof game.isPlaying === "function" ? Boolean(game.isPlaying()) :
+        typeof state.playing === "boolean" ? state.playing :
+        typeof state.paused === "boolean" ? !state.paused :
+        true;
+      const started =
+        typeof game.isStarted === "function" ? Boolean(game.isStarted()) :
+        Boolean(state.started ?? true);
+      const destroyed = Boolean(state.destroyed || state.dead || state.gameover);
+      const countdown = started && !destroyed && !playing;
+      const ready = started && !destroyed;
+      if (!ready || (!playing && !countdown) || !current || queue.length === 0 || !Array.isArray(board) || board.length === 0) {
+        return null;
+      }
+      const stats = state.stats ?? {};
+      const field = Array.from({ length: 40 }, (_, rowIndex) => {
+        const sourceRow = board[board.length - 1 - rowIndex];
+        const cells = rowCells(sourceRow);
+        return Array.from({ length: 10 }, (_, x) => filled(cells ? cells[x] : null));
+      });
+      return {
+        ok: true,
+        ready,
+        reason: null,
+        field,
+        current,
+        hold: normalizePiece(state.hold ?? state.held),
+        queue,
+        b2b: Math.max(0, numberFrom(stats.b2b, state.b2b, 0) ?? 0) > 0,
+        combo: Math.max(0, numberFrom(stats.combo, state.combo, 0) ?? 0),
+        incoming: Math.max(0, numberFrom(stats.impendingdamage, state.incoming, 0) ?? 0),
+        pieceCounter: Math.max(0, Math.floor(numberFrom(
+          stats.piecesplaced,
+          stats.piecesPlaced,
+          stats.pieces,
+          state.piecesplaced,
+          state.piecesPlaced,
+          state.pieceCounter,
+          state.piececount,
+          0
+        ) ?? 0)),
+        playing,
+        countdown
+      };
+    };
+    for (const candidate of [window.__fusionEndedTetrioGame, window.__fusionTetrioGame]) {
+      const state = readCandidate(candidate);
+      if (!state) continue;
+      window.__fusionTetrioGame = candidate;
+      if (candidate === window.__fusionEndedTetrioGame) {
+        delete window.__fusionEndedTetrioGame;
+      }
+      return {
+        ok: true,
+        locator: ${JSON.stringify(locatorName)},
+        source: ${JSON.stringify(locatorName)},
+        state
+      };
+    }
+    return { ok: false };
+  })()`;
+}
+
+async function probeNextGameViaFastLocator(
+  cdp,
+  {
+    locator = "",
+    transientState = null,
+    log = console.log
+  } = {}
+) {
+  const raw = await safeRuntimeEvaluate(cdp, {
+    expression: nextGameFastLocatorExpression(`closure:${locator}`),
+    returnByValue: true
+  }, {
+    result: {
+      value: { ok: false }
+    }
+  }, {
+    transientState,
+    log
+  });
+  return raw?.result?.value ?? { ok: false };
+}
+
+async function readNextGameCheapSignal(
+  cdp,
+  {
+    transientState = null,
+    log = console.log
+  } = {}
+) {
+  const raw = await safeRuntimeEvaluate(cdp, {
+    expression: `(() => {
+      try {
+        const candidate = window.__fusionEndedTetrioGame || window.__fusionTetrioGame || null;
+        if (!candidate || typeof candidate.ejectState !== "function") {
+          return { active: false };
+        }
+        const exported = candidate.ejectState();
+        const state = exported && typeof exported === "object" && exported.game ? exported.game : exported;
+        const playing =
+          typeof candidate.isPlaying === "function" ? Boolean(candidate.isPlaying()) :
+          typeof state?.playing === "boolean" ? state.playing :
+          typeof state?.paused === "boolean" ? !state.paused :
+          false;
+        const started =
+          typeof candidate.isStarted === "function" ? Boolean(candidate.isStarted()) :
+          Boolean(state?.started ?? false);
+        const destroyed = Boolean(state?.destroyed || state?.dead || state?.gameover);
+        return { active: Boolean(started && !destroyed && playing) };
+      } catch {
+        return { active: false };
+      }
+    })()`,
+    returnByValue: true
+  }, {
+    result: {
+      value: { active: false }
+    }
+  }, {
+    transientState,
+    log
+  });
+  return raw?.result?.value ?? { active: false };
+}
+
 export async function readTetrioState(cdp, options) {
   const now = options.now ?? Date.now();
   const log = options.log ?? console.log;
@@ -1820,7 +3855,45 @@ export async function readTetrioState(cdp, options) {
     options.browserControlState ?? createBrowserControlState();
   const closureCaptureState =
     options.closureCaptureState ?? createClosureCaptureState();
+  const nextGameReacquireState =
+    options.nextGameReacquireState ?? createNextGameReacquireState();
+  const postGameInteractionWatchState =
+    options.postGameInteractionWatchState ?? createPostGameInteractionWatchState();
+  const endedGameCandidate =
+    options.endedGameCandidate ?? createEndedGameCandidateState();
+  const waitingForNextGame = Boolean(options.waitingForNextGame);
+  const verboseReacquireLogs = options.verboseReacquireLogs === true;
+  if (
+    nextGameReacquireState.active &&
+    nextGameReacquireState.interactionPhase === NEXT_GAME_INTERACTION_PHASE_INACTIVE
+  ) {
+    setNextGameInteractionPhase(
+      nextGameReacquireState,
+      NEXT_GAME_INTERACTION_PHASE_REACQUIRING
+    );
+  } else if (
+    !nextGameReacquireState.active &&
+    postGameInteractionWatchState.active &&
+    nextGameReacquireState.interactionPhase === NEXT_GAME_INTERACTION_PHASE_INACTIVE
+  ) {
+    setNextGameInteractionPhase(
+      nextGameReacquireState,
+      NEXT_GAME_INTERACTION_PHASE_POST_GAME_WATCH
+    );
+  }
   expireClosureCaptureWindow(closureCaptureState, now, { log });
+  if (
+    nextGameReacquireState.active &&
+    waitingForNextGame &&
+    nextGameReacquireState.interactionPhase ===
+      NEXT_GAME_INTERACTION_PHASE_CAPTURE_ARMED &&
+    !isClosureCaptureArmed(closureCaptureState, now)
+  ) {
+    setNextGameInteractionPhase(
+      nextGameReacquireState,
+      NEXT_GAME_INTERACTION_PHASE_REACQUIRING
+    );
+  }
   const pageState = await readBootstrapPageState(
     cdp,
     bootstrapState,
@@ -1863,6 +3936,58 @@ export async function readTetrioState(cdp, options) {
     log("[browser] TETR.IO bootstrap ready; closure capture enabled");
     bootstrapState.readyLogged = true;
   }
+  if (
+    nextGameReacquireState.active &&
+    waitingForNextGame &&
+    bootstrapReady &&
+    nextGameReacquireState.interactionPhase ===
+      NEXT_GAME_INTERACTION_PHASE_REACQUIRING &&
+    Math.max(0, Number(nextGameReacquireState.pendingInteractionGeneration ?? 0)) >
+      Math.max(0, Number(nextGameReacquireState.lastInteractionGenerationHandled ?? 0)) &&
+    Math.max(0, Number(nextGameReacquireState.pendingInteractionTimestamp ?? 0)) >
+      Math.max(0, Number(nextGameReacquireState.startedAt ?? 0))
+  ) {
+    const forceCarriedInteractionArm =
+      String(nextGameReacquireState.pendingInteractionSource ?? "") === "post_game";
+    const preserveExistingProvisionalWindow =
+      forceCarriedInteractionArm &&
+      isAgainButtonProvisionalInteraction(nextGameReacquireState) &&
+      isClosureCaptureArmed(closureCaptureState, now) &&
+      Math.max(0, Number(nextGameReacquireState.interactionWindowGeneration ?? 0)) ===
+        Math.max(0, Number(nextGameReacquireState.pendingInteractionGeneration ?? 0));
+    if (!forceCarriedInteractionArm && isClosureCaptureArmed(closureCaptureState, now)) {
+      // Keep the currently armed one-shot window alive for non-carried interactions.
+    } else if (preserveExistingProvisionalWindow) {
+      if (typeof log === "function") {
+        log(
+          `[browser] provisional window preserved across game end confirmation generation=${Math.max(
+            0,
+            Number(nextGameReacquireState.pendingInteractionGeneration ?? 0)
+          )}`
+        );
+      }
+    } else {
+    if (
+      String(nextGameReacquireState.pendingInteractionSource ?? "") === "post_game"
+    ) {
+      log(
+        `[browser] carried interaction requesting capture generation=${Math.max(
+          0,
+          Number(nextGameReacquireState.pendingInteractionGeneration ?? 0)
+        )}`
+      );
+    }
+    armPendingNextGameInteractionWindow(
+      closureCaptureState,
+      nextGameReacquireState,
+      {
+        now,
+        bootstrapReady,
+        log
+      }
+    );
+    }
+  }
 
   const read = async () => {
     const raw = await safeRuntimeEvaluate(cdp, {
@@ -1884,12 +4009,322 @@ export async function readTetrioState(cdp, options) {
   };
 
   let state = await read();
+  let skipCaptureThisPoll = false;
+  const shouldPollInteraction =
+    options.probePageState &&
+    !options.suppressClosureCapture &&
+    bootstrapReady &&
+    browserControlState.botEnabled &&
+    nextGameReacquireState.interactionPhase !==
+      NEXT_GAME_INTERACTION_PHASE_CAPTURED_WAITING_START &&
+    (
+      (nextGameReacquireState.active && waitingForNextGame && !state.ok) ||
+      (postGameInteractionWatchState.active && !nextGameReacquireState.active)
+    );
+  if (
+    options.probePageState &&
+    !options.suppressClosureCapture &&
+    bootstrapReady &&
+    browserControlState.botEnabled &&
+    (
+      (nextGameReacquireState.active && waitingForNextGame) ||
+      (postGameInteractionWatchState.active &&
+        isAgainButtonProvisionalInteraction(nextGameReacquireState))
+    ) &&
+    !state.ok
+  ) {
+    let fallbackEligible = !endedGameCandidate.objectId;
+    if (endedGameCandidate.objectId) {
+      if (
+        now - Number(nextGameReacquireState.lastEndedObjectCheckAt ?? 0) >=
+        DEFAULT_NEXT_GAME_FAST_LOCATOR_INTERVAL_MS
+      ) {
+        log("[browser] ended game object probe scheduled object_id_present=true");
+        nextGameReacquireState.lastEndedObjectCheckAt = now;
+        const endedProbeFn =
+          options.readEndedGameCandidateStateFn ?? readEndedGameCandidateState;
+        const endedProbe = await endedProbeFn(cdp, endedGameCandidate, {
+          log
+        }).catch((error) => ({
+          status: "transient_error",
+          reason: error?.message ?? String(error)
+        }));
+        if (
+          shouldLogReacquireStatus(
+            nextGameReacquireState.lastEndedObjectProbeStatus,
+            String(endedProbe.status ?? "unknown"),
+            nextGameReacquireState.lastEndedObjectProbeLogAt,
+            now
+          )
+        ) {
+          log(
+            `[browser] ended game object probe status=${String(
+              endedProbe.status ?? "unknown"
+            )}`
+          );
+          nextGameReacquireState.lastEndedObjectProbeLogAt = now;
+          nextGameReacquireState.lastEndedObjectProbeStatus = String(
+            endedProbe.status ?? "unknown"
+          );
+        }
+        if (
+          (endedProbe.status === "valid_countdown" ||
+            endedProbe.status === "valid_playing") &&
+          endedProbe.reactivated &&
+          endedProbe.state?.ok
+        ) {
+          log(
+            `[browser] ended game object reactivated epoch=${Math.max(
+              0,
+              Number(endedGameCandidate.epoch ?? 0)
+            )}->${Math.max(0, Number(endedGameCandidate.epoch ?? 0)) + 1}`
+          );
+          state = endedProbe.state;
+        } else if (
+          endedProbe.status === "object_released" ||
+          endedProbe.status === "execution_context_destroyed" ||
+          endedProbe.status === "invalid_object_id"
+        ) {
+          fallbackEligible = true;
+          clearEndedGameCandidate(endedGameCandidate, endedProbe.status);
+        }
+      } else if (
+        verboseReacquireLogs &&
+        shouldLogReacquireStatus(
+          nextGameReacquireState.lastEndedObjectProbeStatus,
+          "interval_wait",
+          nextGameReacquireState.lastEndedObjectProbeLogAt,
+          now
+        )
+      ) {
+        log("[browser] ended game object probe skipped reason=interval_wait");
+        nextGameReacquireState.lastEndedObjectProbeLogAt = now;
+        nextGameReacquireState.lastEndedObjectProbeStatus = "interval_wait";
+      }
+    } else if (
+      shouldLogReacquireStatus(
+        nextGameReacquireState.lastEndedObjectProbeStatus,
+        "no_object_id",
+        nextGameReacquireState.lastEndedObjectProbeLogAt,
+        now
+      )
+    ) {
+      log("[browser] ended game object probe skipped reason=no_object_id");
+      nextGameReacquireState.lastEndedObjectProbeLogAt = now;
+      nextGameReacquireState.lastEndedObjectProbeStatus = "no_object_id";
+    }
+    if (!state.ok) {
+      if (
+        now - Number(nextGameReacquireState.lastCheapSampledAt ?? 0) >=
+        DEFAULT_NEXT_GAME_FAST_LOCATOR_INTERVAL_MS
+      ) {
+        nextGameReacquireState.lastCheapSampledAt = now;
+      const cheapSignalFn =
+          options.readCheapGameSignalFn ?? readCheapGameSignal;
+        const cheapSignal = await cheapSignalFn(cdp, {
+          transientState: options.transientState,
+          log
+        }).catch(() => ({ active: false, source: "none", label: "inactive", sources: [] }));
+        if (
+          now - Number(nextGameReacquireState.lastCheapSignalLogAt ?? 0) >= 5000 ||
+          nextGameReacquireState.lastCheapSignalLabel !== String(cheapSignal?.label ?? "inactive")
+        ) {
+          for (const entry of Array.isArray(cheapSignal?.sources) ? cheapSignal.sources : []) {
+            log(
+              `[browser] cheap game signal source=${entry.source} value=${entry.value ? "true" : "false"} state=${entry.state}`
+            );
+          }
+          nextGameReacquireState.lastCheapSignalLogAt = now;
+          nextGameReacquireState.lastCheapSignalLabel = String(
+            cheapSignal?.label ?? "inactive"
+          );
+        }
+        const currentAggregate = String(cheapSignal?.label ?? "inactive");
+        const previousAggregate = String(
+          nextGameReacquireState.lastCheapAggregateState || ""
+        );
+        const cheapSignalActive = Boolean(cheapSignal?.active);
+        const againTransitionReady =
+          isAgainButtonProvisionalInteraction(nextGameReacquireState) &&
+          isTransitionReadyForAgainProvisional(cheapSignal);
+        const hardFallbackReady =
+          isAgainButtonProvisionalInteraction(nextGameReacquireState) &&
+          Math.max(0, Number(closureCaptureState.windowFirstInteractionAt ?? 0)) > 0 &&
+          now - Math.max(0, Number(closureCaptureState.windowFirstInteractionAt ?? 0)) >=
+            DEFAULT_AGAIN_PROVISIONAL_HARD_FALLBACK_MS;
+        if (
+          isAgainButtonProvisionalInteraction(nextGameReacquireState) &&
+          (againTransitionReady || hardFallbackReady)
+        ) {
+          nextGameReacquireState.provisionalTransitionReady = true;
+          if (
+            nextGameReacquireState.interactionPhase ===
+            NEXT_GAME_INTERACTION_PHASE_WAITING_TRANSITION_READY
+          ) {
+            setNextGameInteractionPhase(
+              nextGameReacquireState,
+              NEXT_GAME_INTERACTION_PHASE_REACQUIRING
+            );
+          }
+          if (
+            now - Number(nextGameReacquireState.provisionalTransitionReadyLoggedAt ?? 0) >= 1
+          ) {
+            log(
+              againTransitionReady
+                ? "[browser] AGAIN provisional transition ready; enabling targeted/broad fallback"
+                : "[browser] AGAIN provisional hard fallback ready; enabling broad fallback"
+            );
+            nextGameReacquireState.provisionalTransitionReadyLoggedAt = now;
+          }
+          if (Number(closureCaptureState.nextAttemptAt ?? 0) > now) {
+            closureCaptureState.nextAttemptAt = now;
+          }
+        }
+        const qualifiesForArm =
+          (previousAggregate === "result" || previousAggregate === "inactive") &&
+          (currentAggregate === "countdown" || currentAggregate === "playing");
+        if (qualifiesForArm) {
+          log(
+            `[browser] cheap game signal transition inactive->playing source=${String(
+              cheapSignal?.source ?? "unknown"
+            )}`
+          );
+          if (fallbackEligible) {
+            requestClosureCaptureArm(closureCaptureState, {
+              reason: "next_game_cheap_signal",
+              now,
+              bootstrapReady,
+              log
+            });
+          }
+        }
+        nextGameReacquireState.lastCheapSignalState = cheapSignalActive;
+        nextGameReacquireState.lastCheapAggregateState = currentAggregate;
+      }
+    }
+  }
+  if (
+    shouldPollInteraction &&
+    now - Number(nextGameReacquireState.lastFastAttemptAt ?? 0) >=
+      DEFAULT_NEXT_GAME_INTERACTION_POLL_MS &&
+    now - Number(postGameInteractionWatchState.lastPollAt ?? 0) >=
+      DEFAULT_NEXT_GAME_INTERACTION_POLL_MS
+  ) {
+    nextGameReacquireState.lastFastAttemptAt = now;
+    postGameInteractionWatchState.lastPollAt = now;
+    const interactionStateFn =
+      options.readNextGameInteractionStateFn ?? readNextGameInteractionState;
+    const interaction = await interactionStateFn(cdp, {
+      transientState: options.transientState,
+      log
+    }).catch(() => ({
+      generation: 0,
+      type: null,
+      timestamp: 0,
+      targetTag: null,
+      targetId: null,
+      targetClass: null
+    }));
+    const generation = Math.max(0, Number(interaction?.generation ?? 0));
+    const timestamp = Math.max(0, Number(interaction?.timestamp ?? 0));
+    if (generation > nextGameReacquireState.lastInteractionGenerationSeen) {
+      nextGameReacquireState.lastInteractionGenerationSeen = generation;
+      const keyLabel = interaction?.key ? ` key=${String(interaction.key)}` : "";
+      const interactionKind = deriveInteractionKind(interaction);
+      const kindLabel = interactionKind !== "other" ? ` interaction_kind=${interactionKind}` : "";
+      log(
+        `[browser] next-game interaction detected generation=${generation} type=${String(
+          interaction?.type ?? "unknown"
+        )}${keyLabel}${kindLabel} target=${String(interaction?.targetTag ?? "")}${
+          interaction?.targetId ? `#${interaction.targetId}` : ""
+        }`
+      );
+    }
+    if (generation > postGameInteractionWatchState.lastInteractionGenerationSeen) {
+      postGameInteractionWatchState.lastInteractionGenerationSeen = generation;
+    }
+    if (
+      postGameInteractionWatchState.active &&
+      rememberPendingPostGameInteraction(postGameInteractionWatchState, interaction)
+    ) {
+      log(
+        `[browser] post-game interaction captured before end confirmation generation=${generation} type=${String(
+          interaction?.type ?? "unknown"
+        )}`
+      );
+      if (
+        browserControlState.botEnabled &&
+        isTrustedNextGameInteraction(interaction) &&
+        generation > Math.max(0, Number(postGameInteractionWatchState.provisionalArmedGeneration ?? 0))
+      ) {
+        postGameInteractionWatchState.provisionalArmedGeneration = generation;
+        recordProvisionalInteraction(nextGameReacquireState, interaction);
+        closureCaptureState.windowFirstInteractionAt = timestamp;
+        nextGameReacquireState.interactionWindowGeneration = generation;
+        nextGameReacquireState.interactionWindowArmedAt = now;
+        setNextGameInteractionPhase(
+          nextGameReacquireState,
+          deriveInteractionKind(interaction) === "again_button"
+            ? NEXT_GAME_INTERACTION_PHASE_WAITING_TRANSITION_READY
+            : NEXT_GAME_INTERACTION_PHASE_CAPTURE_ARMED
+        );
+        log(`[browser] trusted next-game interaction provisional arm generation=${generation}`);
+        log(`[perf] next_game_interaction_to_arm_ms=${Math.max(0, now - timestamp)}`);
+        requestClosureCaptureArm(closureCaptureState, {
+          reason: "next_game_provisional_interaction",
+          now,
+          bootstrapReady,
+          log
+        });
+        closureCaptureState.nextAttemptAt = now + DEFAULT_TARGETED_PAUSED_PROBE_DELAY_MS;
+        skipCaptureThisPoll = true;
+      }
+    }
+    const interactionIsFresh =
+      nextGameReacquireState.interactionPhase ===
+        NEXT_GAME_INTERACTION_PHASE_REACQUIRING &&
+      generation >
+        Math.max(
+          0,
+          Number(nextGameReacquireState.interactionBaselineGeneration ?? 0)
+        ) &&
+      timestamp > Math.max(0, Number(nextGameReacquireState.startedAt ?? 0));
+    if (
+      interactionIsFresh &&
+      generation > nextGameReacquireState.lastInteractionGenerationHandled
+    ) {
+      const interactionWindowAlreadyArmed =
+        isClosureCaptureArmed(closureCaptureState, now) &&
+        closureCaptureState.armedReason === "next_game_user_interaction";
+      if (!interactionWindowAlreadyArmed) {
+        const armed = armNextGameInteractionWindow(
+          closureCaptureState,
+          nextGameReacquireState,
+          {
+            generation,
+            now,
+            bootstrapReady,
+            log
+          }
+        );
+        if (armed) {
+          nextGameReacquireState.lastInteractionGenerationHandled = generation;
+          clearPendingNextGameInteraction(nextGameReacquireState);
+        }
+      } else {
+        rememberPendingNextGameInteraction(nextGameReacquireState, interaction);
+      }
+    }
+  }
   if (
     options.probePageState &&
     !options.suppressClosureCapture &&
     bootstrapJustBecameReady &&
     browserControlState.botEnabled &&
-    !state.ok
+    !state.ok &&
+    closureCaptureState.armedReason !== "next_game_user_interaction" &&
+    !isProvisionalClosureCaptureReason(closureCaptureState.armedReason) &&
+    !isCarriedClosureCaptureReason(closureCaptureState.armedReason)
   ) {
     if (hasPendingClosureCaptureArm(closureCaptureState)) {
       activatePendingClosureCaptureArm(closureCaptureState, {
@@ -1903,10 +4338,16 @@ export async function readTetrioState(cdp, options) {
       });
     }
   }
+  const carriedInteractionExpected =
+    browserControlState.botEnabled &&
+    waitingForNextGame &&
+    nextGameReacquireState.active &&
+    hasUnhandledCarriedPostGameInteraction(nextGameReacquireState);
   const gameplayExpected = isGameplayExpectedForClosureCapture({
     state,
     activeRoundId: options.activeRoundId ?? "",
     closureCaptureState,
+    carriedInteractionExpected,
     now
   });
   if (
@@ -1920,21 +4361,34 @@ export async function readTetrioState(cdp, options) {
       now
     })
   ) {
-    log("[browser] closure capture skipped; gameplay not expected");
+    log(
+      `[browser] closure capture skipped; gameplay not expected phase=${String(
+        nextGameReacquireState.interactionPhase ?? NEXT_GAME_INTERACTION_PHASE_INACTIVE
+      )} carried_pending=${carriedInteractionExpected ? "true" : "false"} pending_source=${String(
+        nextGameReacquireState.pendingInteractionSource ?? ""
+      )}`
+    );
     closureCaptureState.lastSkippedLogAt = now;
   }
   const shouldCapture = shouldAttemptClosureCapture({
     probePageState: options.probePageState,
     suppressClosureCapture: options.suppressClosureCapture,
     bootstrapReady,
-    stateOk: state.ok,
+    stateOk:
+      isProvisionalClosureCaptureReason(closureCaptureState.armedReason)
+        ? false
+        : state.ok,
     gameplayExpected,
     nextAttemptAt: closureCaptureState.nextAttemptAt,
     lastCaptureAt: options.probeState?.lastCaptureAt ?? 0,
     lastPageProbeAt: options.network?.lastPageProbeAt ?? 0,
     now
   });
-  if (shouldCapture) {
+  const shouldCaptureWithWindow =
+    shouldCapture &&
+    !skipCaptureThisPoll &&
+    !isClosureCaptureWindowExhausted(closureCaptureState);
+  if (shouldCaptureWithWindow) {
     const pausedUsedMs = Math.max(
       0,
       Number(closureCaptureState.cumulativePausedScanBudgetUsedMs ?? 0)
@@ -1955,7 +4409,7 @@ export async function readTetrioState(cdp, options) {
     );
   }
 
-  if (shouldCapture) {
+  if (shouldCaptureWithWindow) {
     if (closureCaptureState.firstAttemptLoggedForReason !== closureCaptureState.armedReason) {
       log(`[browser] closure capture first attempt reason=${closureCaptureState.armedReason}`);
       closureCaptureState.firstAttemptLoggedForReason = closureCaptureState.armedReason;
@@ -1966,13 +4420,44 @@ export async function readTetrioState(cdp, options) {
       options.network.lastPageProbeAt = now;
     }
     const captureFn = options.captureGameFn ?? captureTetrioGame;
+    const isProvisionalCapture = isProvisionalClosureCaptureReason(
+      closureCaptureState.armedReason
+    );
+    const isAgainButtonProvisionalCapture =
+      isProvisionalCapture && isAgainButtonProvisionalInteraction(nextGameReacquireState);
+    const isFollowupFastCapture =
+      closureCaptureState.pendingFollowupFastCapture === true;
+    const allowBroadScan =
+      !isAgainButtonProvisionalCapture ||
+      nextGameReacquireState.provisionalTransitionReady === true;
+    if (
+      !closureCaptureState.windowTargetedProbeAt &&
+      (closureCaptureState.lastSuccessfulPausedLocation || isProvisionalCapture)
+    ) {
+      closureCaptureState.windowTargetedProbeAt = now;
+      if (closureCaptureState.windowArmedAt > 0) {
+        log(
+          `[perf] next_game_arm_to_targeted_probe_ms=${Math.max(
+            0,
+            now - Number(closureCaptureState.windowArmedAt ?? 0)
+          )}`
+        );
+      }
+    }
     const capture = await captureFn(cdp, {
       closureCaptureState,
-      log
+      log,
+      requireActiveGame: isProvisionalCapture,
+      pauseTimeoutMs:
+        isFollowupFastCapture || (isAgainButtonProvisionalCapture && !allowBroadScan)
+          ? DEFAULT_FOLLOWUP_FAST_CAPTURE_TIMEOUT_MS
+          : 900,
+      allowBroadScan
     }).catch((error) => ({
       ok: false,
       reason: error?.message ?? String(error)
     }));
+    closureCaptureState.pendingFollowupFastCapture = false;
     if (options.perfEnabled) {
       console.log(
         `[browser-perf] closure_capture elapsed_ms=${Math.max(0, Date.now() - captureStartedAt)}`
@@ -1982,35 +4467,142 @@ export async function readTetrioState(cdp, options) {
       if (capture.locator) {
         closureCaptureState.lastSuccessfulLocator = String(capture.locator);
       }
+      if (capture.progress) {
+        closureCaptureState.lastSuccessfulPausedLocation = {
+          frameIndex: Math.max(0, Number(capture.progress.frameIndex ?? 0)),
+          scopeIndex: Math.max(0, Number(capture.progress.scopeIndex ?? 0)),
+          candidateIndex: Math.max(0, Number(capture.progress.candidateIndex ?? 0)),
+          locator: String(capture.locator ?? ""),
+          propertyKey: String(capture.locator ?? "")
+        };
+      }
+      if (closureCaptureState.windowArmedAt > 0) {
+        log(
+          `[perf] next_game_arm_to_capture_ms=${Math.max(
+            0,
+            now - Number(closureCaptureState.windowArmedAt ?? 0)
+          )}`
+        );
+      }
+      if (closureCaptureState.windowFirstInteractionAt > 0) {
+        log(
+          `[perf] next_game_interaction_to_capture_ms=${Math.max(
+            0,
+            now - Number(closureCaptureState.windowFirstInteractionAt ?? 0)
+          )}`
+        );
+      }
+      await releaseEndedGameCandidateHandle(cdp, endedGameCandidate, {
+        reason: "new_capture_success",
+        log
+      }).catch(() => undefined);
+      consumeNextGameInteractionWindow(closureCaptureState, nextGameReacquireState, {
+        reason: "capture_success",
+        log: () => {}
+      });
       disarmClosureCaptureWindow(closureCaptureState, {
         reason: "capture_success",
         log
       });
       console.log(`[browser] page probe exposed game object via ${capture.source}`);
       state = await read();
+      if (
+        nextGameReacquireState.active &&
+        waitingForNextGame &&
+        state?.reason === "TETR.IO game is not started"
+      ) {
+        clearPendingNextGameInteraction(nextGameReacquireState);
+        nextGameReacquireState.lastInteractionGenerationHandled = Math.max(
+          Math.max(0, Number(nextGameReacquireState.lastInteractionGenerationHandled ?? 0)),
+          Math.max(0, Number(nextGameReacquireState.interactionWindowGeneration ?? 0))
+        );
+        setNextGameInteractionPhase(
+          nextGameReacquireState,
+          NEXT_GAME_INTERACTION_PHASE_CAPTURED_WAITING_START
+        );
+      } else if (
+        nextGameReacquireState.active &&
+        waitingForNextGame &&
+        !state?.ok
+      ) {
+        setNextGameInteractionPhase(
+          nextGameReacquireState,
+          NEXT_GAME_INTERACTION_PHASE_REACQUIRING
+        );
+      }
     } else if (state.reason) {
       const fullScanOutcome = String(capture.outcome ?? "");
+      const hasResumeCursor = Boolean(capture.resumeCursor);
       const continuationEligible =
-        (fullScanOutcome === "partial_budget_exhausted" ||
-          fullScanOutcome === "completed_not_found") &&
+        fullScanOutcome === "continuation_required" &&
+        hasResumeCursor &&
         !capture.windowBudgetExhausted &&
         closureCaptureState.fullScanAttemptsInWindow < MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW &&
         isClosureCaptureArmed(closureCaptureState, now);
       if (continuationEligible) {
-        scheduleClosureCaptureContinuation(closureCaptureState, now);
-        if (capture.reason === "TETR.IO paused scope scan limit reached") {
+        saveClosureCaptureContinuationCursor(
+          closureCaptureState,
+          capture.resumeCursor,
+          log
+        );
+        const continuationDelayMs = DEFAULT_FULL_SCAN_CONTINUATION_BACKOFF_MS;
+        scheduleClosureCaptureContinuation(
+          closureCaptureState,
+          now,
+          continuationDelayMs
+        );
+        log(
+          `[browser] full closure scan continuation resume cursor=${formatClosureCaptureCursorLabel(
+            capture.resumeCursor
+          )}`
+        );
+        if (capture.continuationReason === "paused_scope_limit_reached") {
           log("[browser] full closure scan paused scope limit reached; scheduling continuation");
         } else {
           log("[browser] full closure scan paused budget reached; scheduling continuation");
         }
       } else if (
+        capture.outcome === "targeted_only_miss" &&
+        isAgainButtonProvisionalCapture &&
+        nextGameReacquireState.provisionalTransitionReady !== true
+      ) {
+        closureCaptureState.provisionalNonHeavyAttemptConsumed = true;
+        setNextGameInteractionPhase(
+          nextGameReacquireState,
+          NEXT_GAME_INTERACTION_PHASE_WAITING_TRANSITION_READY
+        );
+        closureCaptureState.nextAttemptAt = now + DEFAULT_CAPTURE_ARMING_WINDOW_MS;
+        log(
+          `[browser] AGAIN provisional targeted miss; waiting for transition readiness generation=${Math.max(
+            0,
+            Number(nextGameReacquireState.interactionWindowGeneration ?? 0)
+          )}`
+        );
+        log("[browser] broad scan suppressed while AGAIN transition is not ready");
+      } else if (
+        fullScanOutcome === "completed_not_found" &&
+        !capture.windowBudgetExhausted &&
+        closureCaptureState.fullScanAttemptsInWindow < MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW &&
+        isClosureCaptureArmed(closureCaptureState, now)
+      ) {
+        closureCaptureState.pendingFollowupFastCapture = true;
+        scheduleClosureCaptureContinuation(
+          closureCaptureState,
+          now,
+          DEFAULT_TARGETED_PAUSED_PROBE_BACKOFF_MS
+        );
+      } else if (
         capture.reason === "TETR.IO full closure scan cumulative budget exhausted" ||
         capture.windowBudgetExhausted === true ||
         closureCaptureState.scanBudgetExhausted === true ||
-        ((fullScanOutcome === "partial_budget_exhausted" ||
+        ((fullScanOutcome === "continuation_required" ||
           fullScanOutcome === "completed_not_found") &&
           closureCaptureState.fullScanAttemptsInWindow >= MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW)
       ) {
+        consumeNextGameInteractionWindow(closureCaptureState, nextGameReacquireState, {
+          reason: "scan_budget_exhausted",
+          log
+        });
         disarmClosureCaptureWindow(closureCaptureState, {
           reason: "scan_budget_exhausted",
           log
@@ -2048,7 +4640,10 @@ export async function captureTetrioGame(
   cdp,
   {
     closureCaptureState = null,
-    log = console.log
+    log = console.log,
+    requireActiveGame = false,
+    pauseTimeoutMs = 900,
+    allowBroadScan = true
   } = {}
 ) {
   const breakpointIds = [];
@@ -2084,7 +4679,7 @@ export async function captureTetrioGame(
       event = await cdp.waitForEvent(
         "Debugger.paused",
         () => true,
-        900
+        pauseTimeoutMs
       );
     } catch {
       event = null;
@@ -2100,7 +4695,9 @@ export async function captureTetrioGame(
     paused = true;
     const exposed = await exposeTetrioGameFromPausedCallFrames(cdp, event, {
       closureCaptureState,
-      log
+      log,
+      requireActiveGame,
+      allowBroadScan
     });
     await cdp.send("Debugger.resume").catch(() => undefined);
     paused = false;
@@ -2154,10 +4751,15 @@ export async function exposeTetrioGameFromPausedCallFrames(
   pausedEvent,
   {
     closureCaptureState = null,
-    log = console.log
+    log = console.log,
+    requireActiveGame = false,
+    allowBroadScan = true
   } = {}
 ) {
   const locatorHint = String(closureCaptureState?.lastSuccessfulLocator ?? "").trim();
+  const resumeCursorLabel = formatClosureCaptureCursorLabel(
+    closureCaptureState?.pausedScopeScanCursor
+  );
   if (locatorHint) {
     if (closureCaptureState) {
       closureCaptureState.fastLocatorAttempted = true;
@@ -2172,6 +4774,22 @@ export async function exposeTetrioGameFromPausedCallFrames(
     }
     log("[browser] fast closure locator failed; falling back to scan");
   }
+  if (closureCaptureState?.lastSuccessfulPausedLocation) {
+    const hinted = await probeTargetedPausedLocation(cdp, pausedEvent, closureCaptureState, {
+      log,
+      requireActiveGame
+    });
+    if (hinted.ok) {
+      return hinted;
+    }
+  }
+  if (!allowBroadScan) {
+    return {
+      ok: false,
+      reason: "AGAIN provisional targeted miss before transition readiness",
+      outcome: "targeted_only_miss"
+    };
+  }
   const nextFullScanAttempt = (closureCaptureState?.fullScanAttemptsInWindow ?? 0) + 1;
   if (closureCaptureState?.fullScanAttemptsInWindow >= MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW) {
     if (closureCaptureState) {
@@ -2180,25 +4798,35 @@ export async function exposeTetrioGameFromPausedCallFrames(
     return {
       ok: false,
       reason: "TETR.IO full closure scan cumulative budget exhausted",
-      outcome: "partial_budget_exhausted",
+      outcome: "continuation_required",
+      continuationReason: "paused_budget_reached",
       windowBudgetExhausted: true
     };
   }
   log(
-    `[browser] full closure scan attempt=${nextFullScanAttempt}/${MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW}`
+    resumeCursorLabel !== "none"
+      ? `[browser] full closure scan attempt=${nextFullScanAttempt}/${MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW} resume_from=${resumeCursorLabel}`
+      : `[browser] full closure scan attempt=${nextFullScanAttempt}/${MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW}`
   );
   if (closureCaptureState) {
     closureCaptureState.fullScanAttemptsInWindow = nextFullScanAttempt;
   }
   const scanStartedAt = Date.now();
   const scanned = await exposeTetrioGameViaPausedScopeScan(cdp, pausedEvent, {
-    closureCaptureState
+    closureCaptureState,
+    requireActiveGame
   });
   logPausedScopeScanProgress(log, scanned.progress ?? null);
-  if (!scanned.ok && scanned.outcome === "partial_budget_exhausted") {
-    logPausedScopeScanContinuation(log, scanned.continuationCursor ?? null);
+  if (!scanned.ok && scanned.outcome === "continuation_required") {
+    if (scanned.resumeCursor) {
+      logPausedScopeScanContinuation(log, scanned.resumeCursor);
+    } else {
+      log("[browser] invalid full closure scan continuation without cursor; treating as completed_not_found");
+      scanned.outcome = "completed_not_found";
+      scanned.continuationReason = "invalid_resume_cursor";
+    }
   }
-  if (!scanned.ok && scanned.outcome === "partial_budget_exhausted") {
+  if (!scanned.ok && scanned.outcome === "continuation_required") {
     log(
       `[browser] full closure scan aborted budget_ms=${Math.max(0, Date.now() - scanStartedAt)}`
     );
@@ -2228,12 +4856,17 @@ export async function exposeTetrioGameViaPausedScopeScan(
   {
     closureCaptureState = null,
     perScanBudgetMs = DEFAULT_FULL_SCAN_PAUSE_BUDGET_MS,
-    cumulativeBudgetMs = DEFAULT_FULL_SCAN_CUMULATIVE_BUDGET_MS
+    cumulativeBudgetMs = DEFAULT_FULL_SCAN_CUMULATIVE_BUDGET_MS,
+    requireActiveGame = false
   } = {}
 ) {
   const callFrames = pausedEvent?.callFrames ?? [];
+  const frameOrder = getPausedScopeScanFrameOrder(callFrames);
   const persistedCursor =
-    closureCaptureState?.pausedScopeScanCursor ?? createPausedScopeScanCursor();
+    closureCaptureState?.pausedScopeScanCursor ?? {
+      ...createPausedScopeScanCursor(),
+      frameIndex: frameOrder[0] ?? 0
+    };
   const completedScopeKeys = new Set(persistedCursor.completedScopeKeys ?? []);
   const seenCandidateKeys = new Set(persistedCursor.seenCandidateKeys ?? []);
   const budgetUsedMs = Math.max(
@@ -2248,7 +4881,8 @@ export async function exposeTetrioGameViaPausedScopeScan(
     return {
       ok: false,
       reason: "TETR.IO full closure scan cumulative budget exhausted",
-      outcome: "partial_budget_exhausted",
+      outcome: "continuation_required",
+      continuationReason: "paused_budget_reached",
       windowBudgetExhausted: true,
       progress: {
         attempt: Math.max(1, Number(closureCaptureState?.fullScanAttemptsInWindow ?? 1)),
@@ -2256,7 +4890,7 @@ export async function exposeTetrioGameViaPausedScopeScan(
         inspectedObjects: seenCandidateKeys.size,
         pausedMs: 0
       },
-      continuationCursor: formatScanCursor(persistedCursor)
+      resumeCursor: formatScanCursor(persistedCursor)
     };
   }
 
@@ -2276,26 +4910,62 @@ export async function exposeTetrioGameViaPausedScopeScan(
     }
   };
 
-  const persistPartial = ({ frameIndex, scopeIndex, propertyIndex, reason }) => {
+  const persistPartial = ({
+    frameIndex,
+    scopeIndex,
+    propertyIndex,
+    descriptorsLength = 0,
+    continuationReason = "paused_budget_reached",
+    advancePastCurrentProperty = false
+  }) => {
     updateBudgetUsed();
     const windowBudgetExhausted =
       (closureCaptureState?.cumulativePausedScanBudgetUsedMs ?? 0) >= cumulativeBudgetMs;
+    const resumeCursor = computePausedScopeScanResumeCursor(callFrames, {
+      frameIndex,
+      scopeIndex,
+      propertyIndex,
+      descriptorsLength,
+      advancePastCurrentProperty
+    });
+    if (!resumeCursor && !windowBudgetExhausted) {
+      if (closureCaptureState) {
+        clearPausedScopeScanCursor(closureCaptureState);
+        closureCaptureState.scanBudgetExhausted = false;
+      }
+      return {
+        ok: false,
+        reason: "TETR.IO active game variable was not in paused scopes",
+        outcome: "completed_not_found",
+        progress: {
+          attempt: Math.max(1, Number(closureCaptureState?.fullScanAttemptsInWindow ?? 1)),
+          frameIndex,
+          scopeIndex,
+          candidateIndex: propertyIndex,
+          inspectedObjects: seenCandidateKeys.size,
+          pausedMs: Math.max(0, Date.now() - scanStartedAt)
+        }
+      };
+    }
     if (closureCaptureState) {
-      closureCaptureState.pausedScopeScanCursor = {
-        frameIndex,
-        scopeIndex,
-        propertyIndex,
+      closureCaptureState.pausedScopeScanCursor = resumeCursor ? {
+        frameIndex: resumeCursor.frameIndex,
+        scopeIndex: resumeCursor.scopeIndex,
+        propertyIndex: resumeCursor.propertyIndex,
         completedScopeKeys: Array.from(completedScopeKeys),
         seenCandidateKeys: Array.from(seenCandidateKeys)
-      };
+      } : null;
       closureCaptureState.scanBudgetExhausted = windowBudgetExhausted;
     }
     return {
       ok: false,
       reason: windowBudgetExhausted
         ? "TETR.IO full closure scan cumulative budget exhausted"
-        : reason,
-      outcome: "partial_budget_exhausted",
+        : continuationReason === "paused_scope_limit_reached"
+          ? "TETR.IO paused scope scan limit reached"
+          : "TETR.IO paused scope scan pause budget reached",
+      outcome: "continuation_required",
+      continuationReason,
       windowBudgetExhausted,
       progress: {
         attempt: Math.max(1, Number(closureCaptureState?.fullScanAttemptsInWindow ?? 1)),
@@ -2305,17 +4975,18 @@ export async function exposeTetrioGameViaPausedScopeScan(
         inspectedObjects: seenCandidateKeys.size,
         pausedMs: Math.max(0, Date.now() - scanStartedAt)
       },
-      continuationCursor: formatScanCursor({
-        frameIndex,
-        scopeIndex,
-        propertyIndex
-      })
+      resumeCursor: resumeCursor ? formatScanCursor(resumeCursor) : null
     };
   };
 
   const isScanBudgetExhausted = () => Date.now() - scanStartedAt >= scanBudgetMs;
 
-  for (let frameIndex = persistedCursor.frameIndex ?? 0; frameIndex < callFrames.length; frameIndex += 1) {
+  const startFrameOrderIndex = Math.max(
+    0,
+    frameOrder.indexOf(persistedCursor.frameIndex ?? frameOrder[0] ?? 0)
+  );
+  for (let frameOrderIndex = startFrameOrderIndex; frameOrderIndex < frameOrder.length; frameOrderIndex += 1) {
+    const frameIndex = frameOrder[frameOrderIndex];
     const callFrame = callFrames[frameIndex];
     const scopeChain = callFrame?.scopeChain ?? [];
     const initialScopeIndex =
@@ -2339,7 +5010,8 @@ export async function exposeTetrioGameViaPausedScopeScan(
           frameIndex,
           scopeIndex,
           propertyIndex: initialPropertyIndex,
-          reason: "TETR.IO paused scope scan pause budget reached"
+          descriptorsLength: Number.MAX_SAFE_INTEGER,
+          continuationReason: "paused_budget_reached"
         });
       }
       const properties = await cdp.send("Runtime.getProperties", {
@@ -2368,7 +5040,8 @@ export async function exposeTetrioGameViaPausedScopeScan(
             frameIndex,
             scopeIndex,
             propertyIndex,
-            reason: "TETR.IO paused scope scan pause budget reached"
+            descriptorsLength: descriptors.length,
+            continuationReason: "paused_budget_reached"
           });
         }
         const descriptor = descriptors[propertyIndex];
@@ -2391,11 +5064,18 @@ export async function exposeTetrioGameViaPausedScopeScan(
             frameIndex,
             scopeIndex,
             propertyIndex,
-            reason: "TETR.IO paused scope scan limit reached"
+            descriptorsLength: descriptors.length,
+            continuationReason: "paused_scope_limit_reached",
+            advancePastCurrentProperty: true
           });
         }
         seenCandidateKeys.add(candidateKey);
-        const exposed = await exposeTetrioCandidateObject(cdp, valueObjectId, locator);
+        const exposed = await exposeTetrioCandidateObjectWithOptions(
+          cdp,
+          valueObjectId,
+          locator,
+          { requireActiveGame }
+        );
         if (exposed.ok) {
           updateBudgetUsed();
           clearPausedScopeScanCursor(closureCaptureState);
@@ -2458,7 +5138,58 @@ export async function exposeTetrioCandidateObject(cdp, objectId, locatorName) {
           exported && typeof exported === "object" && exported.game
             ? exported.game
             : exported;
+        const requireActiveGame = ${JSON.stringify(false)};
         if (state?.destroyed || state?.dead || state?.gameover) {
+          return { ok: false };
+        }
+        window.__fusionTetrioGame = this;
+        window.__fusionTetrioBridge = {
+          ok: true,
+          source: ${JSON.stringify("closure:" + locatorName)},
+          locator: ${JSON.stringify(locatorName)},
+          at: Date.now(),
+          href: location.href
+        };
+        return window.__fusionTetrioBridge;
+      } catch {
+        return { ok: false };
+      }
+    }`,
+    returnByValue: true,
+    silent: true
+  }).catch(() => null);
+  return result?.result?.value ?? { ok: false };
+}
+
+async function exposeTetrioCandidateObjectWithOptions(
+  cdp,
+  objectId,
+  locatorName,
+  {
+    requireActiveGame = false
+  } = {}
+) {
+  const result = await cdp.send("Runtime.callFunctionOn", {
+    objectId,
+    functionDeclaration: `function() {
+      try {
+        if (
+          !this ||
+          typeof this !== "object" ||
+          typeof this.ejectState !== "function" ||
+          typeof this.ejectBoardState !== "function"
+        ) {
+          return { ok: false };
+        }
+        const exported = this.ejectState();
+        const state =
+          exported && typeof exported === "object" && exported.game
+            ? exported.game
+            : exported;
+        if (state?.destroyed || state?.dead || state?.gameover) {
+          return { ok: false };
+        }
+        if (${requireActiveGame ? "true" : "false"} && state?.playing !== true && state?.countdown !== true) {
           return { ok: false };
         }
         window.__fusionTetrioGame = this;
