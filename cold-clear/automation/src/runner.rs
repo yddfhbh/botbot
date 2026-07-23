@@ -2386,6 +2386,7 @@ mod tests {
     use crate::scanner::PieceToken;
     use libtetris::{PieceState, RotationState, Statistics, TspinStatus};
     use std::collections::VecDeque;
+    use std::fmt::Write as _;
     use std::fs::write;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
@@ -2661,9 +2662,23 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn plan_move_works_for_a_basic_queue() {
-        let snapshot = GameSnapshot {
+    #[derive(Debug)]
+    struct BasicQueuePlanDiagnostics {
+        result: Move,
+        planner_mode: &'static str,
+        current_piece: Piece,
+        next_queue: Vec<PieceToken>,
+        existing_hold: Option<Piece>,
+        selected_piece: Piece,
+        spawned_piece: FallingPiece,
+        route_kind: &'static str,
+        movement_actions: Vec<GameAction>,
+        final_actions: Vec<GameAction>,
+        planned_lock: LockResult,
+    }
+
+    fn basic_queue_snapshot() -> GameSnapshot {
+        GameSnapshot {
             source: "test".to_owned(),
             token: "t1".to_owned(),
             round_id: None,
@@ -2678,9 +2693,107 @@ mod tests {
             playing: true,
             countdown: false,
             active: None,
+        }
+    }
+
+    fn collect_basic_queue_plan_diagnostics(
+        config: &AutomationConfig,
+        snapshot: &GameSnapshot,
+    ) -> BasicQueuePlanDiagnostics {
+        let (result, planner_mode) = plan_move(config, snapshot).unwrap();
+        let plan = build_execution_plan(config, snapshot, &result, config.bot.movement_mode).unwrap();
+        let selected_piece = execution_piece(snapshot, result.hold).unwrap();
+        let board = board_from_snapshot(snapshot).unwrap();
+        let spawned_piece = active_piece_for_execution(snapshot, result.hold, selected_piece)
+            .unwrap_or_else(|| {
+                spawn_for_execution(&board, selected_piece, config.bot.spawn_rule).unwrap()
+            });
+        let planned_lock = simulate_planned_lock(snapshot, &result).unwrap().lock;
+        BasicQueuePlanDiagnostics {
+            result,
+            planner_mode,
+            current_piece: snapshot.queue_pieces()[0],
+            next_queue: snapshot.queue.clone(),
+            existing_hold: snapshot.hold_piece(),
+            selected_piece,
+            spawned_piece,
+            route_kind: plan.route_selection.route_kind,
+            movement_actions: plan.execution_plan.movement_actions.clone(),
+            final_actions: route_actions_with_hard_drop(&plan.execution_plan),
+            planned_lock,
+        }
+    }
+
+    fn format_basic_queue_plan_diagnostics(diag: &BasicQueuePlanDiagnostics) -> String {
+        let mut message = String::new();
+        let _ = write!(
+            message,
+            "current_piece={:?} next_queue={:?} existing_hold={:?} result_hold={} result_inputs={:?} target=(x={}, y={}, rot={:?}) selected_piece={:?} spawn=(x={}, y={}, rot={:?}) route_kind={} movement_actions={:?} final_actions={:?} hard_drop_added_in_runner=route_actions_with_hard_drop hard_drop_executed_in_driver=execute_plan/build_plan_sequence_actions planner_mode={} placement_kind={:?} cleared_lines={:?}",
+            diag.current_piece,
+            diag.next_queue,
+            diag.existing_hold,
+            diag.result.hold,
+            diag.result.inputs,
+            diag.result.expected_location.x,
+            diag.result.expected_location.y,
+            diag.result.expected_location.kind.1,
+            diag.selected_piece,
+            diag.spawned_piece.x,
+            diag.spawned_piece.y,
+            diag.spawned_piece.kind.1,
+            diag.route_kind,
+            diag.movement_actions,
+            diag.final_actions,
+            diag.planner_mode,
+            diag.planned_lock.placement_kind,
+            diag.planned_lock.cleared_lines
+        );
+        message
+    }
+
+    #[test]
+    fn plan_move_works_for_a_basic_queue() {
+        let config = AutomationConfig::default();
+        let snapshot = basic_queue_snapshot();
+        let diag = collect_basic_queue_plan_diagnostics(&config, &snapshot);
+        eprintln!(
+            "[test-diagnostic] plan_move_works_for_a_basic_queue {}",
+            format_basic_queue_plan_diagnostics(&diag)
+        );
+
+        assert!(
+            !diag.planned_lock.locked_out,
+            "planned placement should be legal: {}",
+            format_basic_queue_plan_diagnostics(&diag)
+        );
+        let expected_selected_piece = if diag.result.hold {
+            diag.existing_hold.unwrap_or(snapshot.queue_pieces()[1])
+        } else {
+            diag.current_piece
         };
-        let (result, _mode) = plan_move(&AutomationConfig::default(), &snapshot).unwrap();
-        assert!(!result.inputs.is_empty() || result.hold);
+        assert_eq!(
+            diag.selected_piece, expected_selected_piece,
+            "hold selection should match the snapshot state: {}",
+            format_basic_queue_plan_diagnostics(&diag)
+        );
+        assert!(
+            diag.final_actions.contains(&GameAction::HardDrop),
+            "final action sequence must include HardDrop even when movement inputs are empty: {}",
+            format_basic_queue_plan_diagnostics(&diag)
+        );
+        assert!(
+            !diag.final_actions.is_empty(),
+            "final action sequence must never be empty: {}",
+            format_basic_queue_plan_diagnostics(&diag)
+        );
+        if diag.result.inputs.is_empty() && !diag.result.hold {
+            assert_eq!(
+                diag.final_actions,
+                vec![GameAction::HardDrop],
+                "empty movement route should become a valid in-place hard drop: {}",
+                format_basic_queue_plan_diagnostics(&diag)
+            );
+        }
     }
 
     #[test]
