@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -66,6 +67,47 @@ pub struct TimedGameAction {
     pub after_delay: Duration,
 }
 
+static NEXT_INPUT_SEQUENCE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+pub struct InputFocusState {
+    #[serde(default, alias = "visibilityState")]
+    pub visibility_state: Option<String>,
+    #[serde(default, alias = "actualVisibilityState")]
+    pub actual_visibility_state: Option<String>,
+    #[serde(default, alias = "hasFocus")]
+    pub has_focus: Option<bool>,
+    #[serde(default, alias = "actualHasFocus")]
+    pub actual_has_focus: Option<bool>,
+    #[serde(default, alias = "activeTag")]
+    pub active_tag: Option<String>,
+    #[serde(default, alias = "contentEditable")]
+    pub content_editable: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+pub struct InputDispatchRecord {
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default, alias = "dispatch")]
+    pub dispatch_result: Option<String>,
+    #[serde(default, alias = "keyDownAtMs")]
+    pub keydown_at_ms: Option<u64>,
+    #[serde(default, alias = "keyUpAtMs")]
+    pub keyup_at_ms: Option<u64>,
+    #[serde(default, alias = "afterMs")]
+    pub after_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InputCommandDiagnostics {
+    pub backend: &'static str,
+    pub command_type: String,
+    pub helper_error: Option<String>,
+    pub focus_state: Option<InputFocusState>,
+    pub dispatch_results: Vec<InputDispatchRecord>,
+}
+
 pub trait InputBackend {
     fn tap(&mut self, action: GameAction, duration: Duration) -> Result<()>;
     fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
@@ -80,6 +122,12 @@ pub trait InputBackend {
     fn release_all_keys(&mut self) -> Result<()>;
     fn supports_batched_sequences(&self) -> bool {
         false
+    }
+    fn take_last_command_diagnostics(&mut self) -> Option<InputCommandDiagnostics> {
+        None
+    }
+    fn backend_name(&self) -> &'static str {
+        "generic"
     }
 }
 
@@ -100,6 +148,14 @@ impl<T: InputBackend + ?Sized> InputBackend for Box<T> {
 
     fn supports_batched_sequences(&self) -> bool {
         (**self).supports_batched_sequences()
+    }
+
+    fn take_last_command_diagnostics(&mut self) -> Option<InputCommandDiagnostics> {
+        (**self).take_last_command_diagnostics()
+    }
+
+    fn backend_name(&self) -> &'static str {
+        (**self).backend_name()
     }
 }
 
@@ -363,9 +419,11 @@ where
         ));
     }
 
+    let sequence_id = next_input_sequence_id();
     let started_at = unix_time_ms();
     log(format!(
-        "[automation] sequence_start ts={} actions={:?}",
+        "[automation] sequence_start sequence_id={} ts={} actions={:?}",
+        sequence_id,
         started_at,
         actions
             .iter()
@@ -373,8 +431,11 @@ where
             .collect::<Vec<_>>()
     ));
     backend.execute_sequence(actions)?;
+    let planned_actions = actions.iter().map(|action| action.action).collect::<Vec<_>>();
+    log_command_diagnostics(log, backend, sequence_id, &planned_actions, actions);
     log(format!(
-        "[automation] sequence_end ts={} actions={}",
+        "[automation] sequence_end sequence_id={} ts={} actions={}",
+        sequence_id,
         unix_time_ms(),
         actions.len()
     ));
@@ -437,24 +498,128 @@ where
 {
     let profile = action_tap_profile(action, handling, timings);
     log_movement_clamp(action, profile, handling, log);
+    let sequence_id = next_input_sequence_id();
     let down_at = unix_time_ms();
     log(format!(
-        "[automation] tap {:?} down ts={} duration_ms={} source={}",
+        "[automation] tap {:?} sequence_id={} down ts={} duration_ms={} source={}",
         action,
+        sequence_id,
         down_at,
         profile.actual_duration.as_millis(),
         profile.source
     ));
     backend.tap(action, profile.actual_duration)?;
+    let timed_actions = [TimedGameAction {
+        action,
+        duration: profile.actual_duration,
+        after_delay: Duration::ZERO,
+    }];
+    log_command_diagnostics(log, backend, sequence_id, &[action], &timed_actions);
     let up_at = unix_time_ms();
     log(format!(
-        "[automation] tap {:?} up ts={} held_ms={} source={}",
+        "[automation] tap {:?} sequence_id={} up ts={} held_ms={} source={}",
         action,
+        sequence_id,
         up_at,
         profile.actual_duration.as_millis(),
         profile.source
     ));
     Ok(())
+}
+
+fn next_input_sequence_id() -> u64 {
+    NEXT_INPUT_SEQUENCE_ID.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
+fn log_command_diagnostics<B, F>(
+    log: &mut F,
+    backend: &mut B,
+    sequence_id: u64,
+    actions: &[GameAction],
+    timed_actions: &[TimedGameAction],
+) where
+    B: InputBackend + ?Sized,
+    F: FnMut(String),
+{
+    if let Some(diagnostics) = backend.take_last_command_diagnostics() {
+        log(format!(
+            "[input] sequence_id={} backend={} command_type={} focus={}",
+            sequence_id,
+            diagnostics.backend,
+            diagnostics.command_type,
+            format_focus_state(diagnostics.focus_state.as_ref())
+        ));
+        if let Some(error) = diagnostics.helper_error.as_deref() {
+            log(format!(
+                "[input] sequence_id={} backend={} helper_error={}",
+                sequence_id, diagnostics.backend, error
+            ));
+        }
+        for (index, action) in actions.iter().enumerate() {
+            let dispatch = diagnostics
+                .dispatch_results
+                .get(index)
+                .cloned()
+                .unwrap_or_default();
+            let after_ms = dispatch.after_ms.unwrap_or_else(|| {
+                timed_actions
+                    .get(index)
+                    .map_or(0, |timed| timed.after_delay.as_millis() as u64)
+            });
+            log(format!(
+                "[input] sequence_id={} action={:?} index={} dispatch={} key={} keydown_ms={} keyup_ms={} after_ms={}",
+                sequence_id,
+                action,
+                index,
+                dispatch.dispatch_result.as_deref().unwrap_or("unavailable"),
+                dispatch.key.as_deref().unwrap_or("-"),
+                dispatch
+                    .keydown_at_ms
+                    .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+                dispatch
+                    .keyup_at_ms
+                    .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+                after_ms
+            ));
+        }
+        return;
+    }
+
+    log(format!(
+        "[input] sequence_id={} backend={} focus=unavailable",
+        sequence_id,
+        backend.backend_name()
+    ));
+    for (index, action) in actions.iter().enumerate() {
+        let after_ms = timed_actions
+            .get(index)
+            .map_or(0, |timed| timed.after_delay.as_millis() as u64);
+        log(format!(
+            "[input] sequence_id={} action={:?} index={} dispatch=ok key=- keydown_ms=- keyup_ms=- after_ms={}",
+            sequence_id, action, index, after_ms
+        ));
+    }
+}
+
+fn format_focus_state(state: Option<&InputFocusState>) -> String {
+    let Some(state) = state else {
+        return "unavailable".to_owned();
+    };
+    format!(
+        "visibility={} actual_visibility={} has_focus={} actual_has_focus={} active={} content_editable={}",
+        state.visibility_state.as_deref().unwrap_or("-"),
+        state.actual_visibility_state.as_deref().unwrap_or("-"),
+        state
+            .has_focus
+            .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+        state
+            .actual_has_focus
+            .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+        state.active_tag.as_deref().unwrap_or("-"),
+        state
+            .content_editable
+            .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+    )
 }
 
 fn sleep_action_delay<F>(log: &mut F, action: GameAction, timings: ExecutionTimings)
@@ -855,6 +1020,7 @@ pub struct BrowserCdpInputBackend {
     stdout: BufReader<ChildStdout>,
     next_command_id: u64,
     exited: bool,
+    last_command_diagnostics: Option<InputCommandDiagnostics>,
 }
 
 impl BrowserCdpInputBackend {
@@ -901,6 +1067,7 @@ impl BrowserCdpInputBackend {
             stdout: BufReader::new(stdout),
             next_command_id: 1,
             exited: false,
+            last_command_diagnostics: None,
         };
         backend.wait_for_ready(Duration::from_secs(1))?;
         Ok(backend)
@@ -970,7 +1137,15 @@ impl BrowserCdpInputBackend {
         self.stdin
             .flush()
             .context("failed to flush browser input helper")?;
-        self.wait_for_command_response(id, command_type)
+        let response = self.wait_for_command_response(id, command_type)?;
+        self.last_command_diagnostics = Some(InputCommandDiagnostics {
+            backend: "browser_cdp",
+            command_type: command_type.to_owned(),
+            helper_error: response.error.clone(),
+            focus_state: response.focus_state.clone(),
+            dispatch_results: response.dispatch_results.clone(),
+        });
+        Ok(())
     }
 
     fn wait_for_ready(&mut self, _timeout: Duration) -> Result<()> {
@@ -1005,7 +1180,11 @@ impl BrowserCdpInputBackend {
         }
     }
 
-    fn wait_for_command_response(&mut self, id: u64, command_type: &'static str) -> Result<()> {
+    fn wait_for_command_response(
+        &mut self,
+        id: u64,
+        command_type: &'static str,
+    ) -> Result<BrowserInputHelperResponse> {
         let mut line = String::new();
         loop {
             line.clear();
@@ -1037,7 +1216,7 @@ impl BrowserCdpInputBackend {
                 continue;
             }
             if response.ok {
-                return Ok(());
+                return Ok(response);
             }
             bail!(
                 "browser input helper rejected {} command id={}: {}",
@@ -1106,6 +1285,14 @@ impl InputBackend for BrowserCdpInputBackend {
     fn supports_batched_sequences(&self) -> bool {
         true
     }
+
+    fn take_last_command_diagnostics(&mut self) -> Option<InputCommandDiagnostics> {
+        self.last_command_diagnostics.take()
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "browser_cdp"
+    }
 }
 
 pub struct SharedBrowserCdpInputBackendHandle {
@@ -1140,9 +1327,22 @@ impl InputBackend for SharedBrowserCdpInputBackendHandle {
     fn supports_batched_sequences(&self) -> bool {
         true
     }
+
+    fn take_last_command_diagnostics(&mut self) -> Option<InputCommandDiagnostics> {
+        let mut backend = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shared browser input backend lock poisoned"))
+            .ok()?;
+        backend.take_last_command_diagnostics()
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "browser_cdp"
+    }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct BrowserInputHelperResponse {
     ok: bool,
     #[allow(dead_code)]
@@ -1159,6 +1359,10 @@ struct BrowserInputHelperResponse {
     id: Option<u64>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default, alias = "focusState")]
+    focus_state: Option<InputFocusState>,
+    #[serde(default, alias = "dispatchResults")]
+    dispatch_results: Vec<InputDispatchRecord>,
 }
 
 #[allow(dead_code)]

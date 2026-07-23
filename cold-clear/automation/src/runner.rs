@@ -139,6 +139,7 @@ where
     let mut perf_window = RollingPerfWindow::default();
     let mut vs_sim_controller = VsSimulationController::new(&config.snapshot_path);
     let vs_post_hold_delay_ms = resolve_vs_post_hold_delay_ms();
+    let mut pending_placement_verification: Option<PendingPlacementVerification> = None;
 
     loop {
         if stop.load(AtomicOrdering::Relaxed) {
@@ -166,6 +167,12 @@ where
                         last_piece_counter = None;
                     }
                 }
+                if let Some(pending) = pending_placement_verification.as_ref() {
+                    if should_verify_placement(pending, &snapshot) {
+                        log_placement_verification(pending, &snapshot, &mut log);
+                        pending_placement_verification = None;
+                    }
+                }
                 if let Some(reason) = skip_snapshot_reason(&snapshot, last_piece_counter, age) {
                     log_skip_snapshot_reason(&snapshot, reason, &mut log);
                     thread::sleep(poll_delay);
@@ -175,6 +182,16 @@ where
                 match prepare_execution(config, &snapshot, &sprint_state, &mut log)? {
                     Some(prepared) => {
                         emit_move_logs(config, &snapshot, &prepared, &mut log);
+                        pending_placement_verification = build_pending_placement_verification(
+                            &snapshot,
+                            &prepared,
+                        )
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "failed to prepare placement verification for token={}: {error:#}",
+                                snapshot.token
+                            )
+                        })?;
                         if snapshot.source == "browser_ws_sim"
                             && !vs_sim_controller.validate_route_preflight(&snapshot, &mut log)?
                         {
@@ -198,6 +215,7 @@ where
                                     "input error before hard drop",
                                     &mut log,
                                 );
+                                pending_placement_verification = None;
                                 log(format!(
                                     "[vs-sim] suppressed input failure before hard drop: {error:#}"
                                 ));
@@ -215,6 +233,7 @@ where
                                     "pre-drop validation failed",
                                     &mut log,
                                 );
+                                pending_placement_verification = None;
                                 thread::sleep(poll_delay);
                                 continue;
                             }
@@ -232,6 +251,7 @@ where
                                         "input correction failed before hard drop",
                                         &mut log,
                                     );
+                                    pending_placement_verification = None;
                                     log(format!(
                                         "[vs-sim] suppressed pre-hard-drop correction failure: {error:#}"
                                     ));
@@ -264,6 +284,7 @@ where
                                                 "hard drop input failed",
                                                 &mut log,
                                             );
+                                            pending_placement_verification = None;
                                             log(format!(
                                                 "[vs-sim] suppressed hard drop failure: {error:#}"
                                             ));
@@ -281,6 +302,7 @@ where
                                             &mut log,
                                         )?;
                                         if !committed {
+                                            pending_placement_verification = None;
                                             thread::sleep(poll_delay);
                                             continue;
                                         }
@@ -325,6 +347,7 @@ where
                                     }
                                 }
                                 HardDropDecision::Retry(retry_snapshot) => {
+                                    pending_placement_verification = None;
                                     if snapshot.source == "browser_ws_sim" {
                                         vs_sim_controller.invalidate_current_round(
                                             "pre-hard-drop verification requested a retry",
@@ -834,6 +857,46 @@ struct PreparedExecution {
     route_selection: RouteSelection,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PlacementVerificationClassification {
+    PlacementMatch,
+    InputMismatch,
+    StaleSnapshot,
+    AmbiguousLineClear,
+    UnsupportedVerification,
+}
+
+impl PlacementVerificationClassification {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::PlacementMatch => "placement_match",
+            Self::InputMismatch => "input_mismatch",
+            Self::StaleSnapshot => "stale_snapshot",
+            Self::AmbiguousLineClear => "ambiguous_line_clear",
+            Self::UnsupportedVerification => "unsupported_verification",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingPlacementVerification {
+    token: String,
+    piece_counter: Option<u32>,
+    input_lines_cleared: Option<u32>,
+    input_board: [[bool; 10]; 40],
+    input_board_hash: u64,
+    planned_piece: Piece,
+    planned_target: FallingPiece,
+    use_hold: bool,
+    route_kind: &'static str,
+    route_actions: Vec<GameAction>,
+    raw_inputs: Vec<PieceMovement>,
+    expected_board: [[bool; 10]; 40],
+    expected_hash: u64,
+    expected_cells: Vec<(i32, i32)>,
+    expected_line_clears: usize,
+}
+
 #[derive(Clone, Debug)]
 enum HardDropDecision {
     Proceed,
@@ -1210,6 +1273,220 @@ fn emit_move_logs<F>(
             ));
         }
     }
+    let board_hash = snapshot_board_hash(snapshot).unwrap_or_default();
+    log(format!(
+        "[placement] token={} piece_counter={} current={} hold={} board_hash={:016x} planned_piece={} planned=(x={},y={},rot={:?}) use_hold={} route={} actions={:?} raw_inputs={:?}",
+        snapshot.token,
+        snapshot
+            .piece_counter
+            .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+        active_piece,
+        hold_piece,
+        board_hash,
+        piece_label(prepared.planned_piece),
+        target.x,
+        target.y,
+        target.kind.1,
+        prepared.planned_move.hold,
+        prepared.route_selection.route_kind,
+        route_actions_with_hard_drop(&prepared.execution_plan),
+        prepared.planned_move.inputs
+    ));
+}
+
+fn build_pending_placement_verification(
+    snapshot: &GameSnapshot,
+    prepared: &PreparedExecution,
+) -> Result<Option<PendingPlacementVerification>> {
+    let expected_board = expected_board_after_lock(snapshot, &prepared.planned_move)?;
+    let input_board = snapshot.field_array()?;
+    let expected_hash = board_hash(&expected_board);
+    Ok(Some(PendingPlacementVerification {
+        token: snapshot.token.clone(),
+        piece_counter: snapshot.piece_counter,
+        input_lines_cleared: snapshot.lines_cleared,
+        input_board,
+        input_board_hash: snapshot_board_hash(snapshot)?,
+        planned_piece: prepared.planned_piece,
+        planned_target: prepared.planned_move.expected_location,
+        use_hold: prepared.planned_move.hold,
+        route_kind: prepared.route_selection.route_kind,
+        route_actions: route_actions_with_hard_drop(&prepared.execution_plan),
+        raw_inputs: prepared.planned_move.inputs.iter().copied().collect(),
+        expected_board,
+        expected_hash,
+        expected_cells: planned_cells(&prepared.planned_move.expected_location),
+        expected_line_clears: prepared.planned_lock.cleared_lines.len(),
+    }))
+}
+
+fn should_verify_placement(
+    pending: &PendingPlacementVerification,
+    snapshot: &GameSnapshot,
+) -> bool {
+    match (pending.piece_counter, snapshot.piece_counter) {
+        (Some(previous), Some(current)) => current > previous,
+        _ => false,
+    }
+}
+
+fn log_placement_verification<F>(
+    pending: &PendingPlacementVerification,
+    snapshot: &GameSnapshot,
+    log: &mut F,
+) where
+    F: FnMut(String),
+{
+    match classify_placement_verification(pending, snapshot, Some(pending.input_board_hash)) {
+        Ok(result) => {
+            log(format!(
+                "[placement] verified token={} result={} planned_piece={} planned=(x={},y={},rot={:?}) use_hold={} expected_hash={:016x} actual_hash={:016x} line_clears={} planned_cells={:?} actual_cells={:?} board_diff={:?} route={} actions={:?} raw_inputs={:?}",
+                pending.token,
+                result.classification.label(),
+                piece_label(pending.planned_piece),
+                pending.planned_target.x,
+                pending.planned_target.y,
+                pending.planned_target.kind.1,
+                pending.use_hold,
+                result.expected_hash,
+                result.actual_hash,
+                result.line_clear_count,
+                result.expected_cells,
+                result.actual_cells,
+                result.board_diff,
+                pending.route_kind,
+                pending.route_actions,
+                pending.raw_inputs
+            ));
+        }
+        Err(error) => {
+            log(format!(
+                "[placement] token={} result=unsupported_verification error={error:#}",
+                pending.token
+            ));
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlacementVerificationResult {
+    classification: PlacementVerificationClassification,
+    expected_hash: u64,
+    actual_hash: u64,
+    line_clear_count: usize,
+    expected_cells: Vec<(i32, i32)>,
+    actual_cells: Vec<(i32, i32)>,
+    board_diff: Vec<(usize, usize)>,
+}
+
+fn classify_placement_verification(
+    pending: &PendingPlacementVerification,
+    actual_snapshot: &GameSnapshot,
+    actual_input_board_hash: Option<u64>,
+) -> Result<PlacementVerificationResult> {
+    let actual_board = actual_snapshot.field_array()?;
+    let actual_hash = board_hash(&actual_board);
+    let board_diff = board_diff_cells(&pending.expected_board, &actual_board);
+    let actual_cells = infer_actual_locked_cells(actual_snapshot, pending);
+    let classification = if actual_input_board_hash != Some(pending.input_board_hash) {
+        PlacementVerificationClassification::StaleSnapshot
+    } else if actual_hash == pending.expected_hash {
+        PlacementVerificationClassification::PlacementMatch
+    } else if pending.expected_line_clears > 0 {
+        PlacementVerificationClassification::AmbiguousLineClear
+    } else if actual_cells.is_empty() {
+        PlacementVerificationClassification::UnsupportedVerification
+    } else {
+        PlacementVerificationClassification::InputMismatch
+    };
+    Ok(PlacementVerificationResult {
+        classification,
+        expected_hash: pending.expected_hash,
+        actual_hash,
+        line_clear_count: count_line_clears(actual_snapshot, pending)?,
+        expected_cells: pending.expected_cells.clone(),
+        actual_cells,
+        board_diff,
+    })
+}
+
+fn count_line_clears(
+    actual_snapshot: &GameSnapshot,
+    pending: &PendingPlacementVerification,
+) -> Result<usize> {
+    Ok(match (pending.input_lines_cleared, actual_snapshot.lines_cleared) {
+        (Some(before), Some(after)) if after >= before => (after - before) as usize,
+        _ => pending.expected_line_clears,
+    })
+}
+
+fn infer_actual_locked_cells(
+    actual_snapshot: &GameSnapshot,
+    pending: &PendingPlacementVerification,
+) -> Vec<(i32, i32)> {
+    if pending.expected_line_clears > 0 {
+        return Vec::new();
+    }
+    let Ok(after) = actual_snapshot.field_array() else {
+        return Vec::new();
+    };
+    let mut actual_cells = Vec::new();
+    for (y, row) in after.iter().enumerate() {
+        for (x, &filled) in row.iter().enumerate() {
+            if filled && !pending.input_board[y][x] {
+                actual_cells.push((x as i32, y as i32));
+            }
+        }
+    }
+    actual_cells
+}
+
+fn expected_board_after_lock(snapshot: &GameSnapshot, planned_move: &Move) -> Result<[[bool; 10]; 40]> {
+    let mut board = board_from_snapshot(snapshot)?;
+    for piece in snapshot.queue_pieces() {
+        board.add_next_piece(piece);
+    }
+    let queued_piece = board
+        .advance_queue()
+        .context("snapshot queue must include active piece for expected board computation")?;
+    if planned_move.hold {
+        board
+            .hold(queued_piece)
+            .unwrap_or_else(|| board.advance_queue().expect("hold move must have preview piece"));
+    }
+    board.lock_piece(planned_move.expected_location);
+    Ok(board.get_field())
+}
+
+fn snapshot_board_hash(snapshot: &GameSnapshot) -> Result<u64> {
+    Ok(board_hash(&snapshot.field_array()?))
+}
+
+fn board_hash(board: &[[bool; 10]; 40]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for row in board {
+        for &cell in row {
+            hash ^= u64::from(cell);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
+fn board_diff_cells(expected: &[[bool; 10]; 40], actual: &[[bool; 10]; 40]) -> Vec<(usize, usize)> {
+    let mut diff = Vec::new();
+    for y in 0..40 {
+        for x in 0..10 {
+            if expected[y][x] != actual[y][x] {
+                diff.push((x, y));
+            }
+        }
+    }
+    diff
+}
+
+fn planned_cells(target: &FallingPiece) -> Vec<(i32, i32)> {
+    target.cells().into_iter().collect()
 }
 
 fn route_actions_with_hard_drop(plan: &ExecutionPlan) -> Vec<GameAction> {
@@ -1226,6 +1503,18 @@ fn queue_labels(queue: &[PieceToken]) -> String {
         .map(|piece| piece.label())
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn piece_label(piece: Piece) -> &'static str {
+    match piece {
+        Piece::I => "I",
+        Piece::O => "O",
+        Piece::T => "T",
+        Piece::L => "L",
+        Piece::J => "J",
+        Piece::S => "S",
+        Piece::Z => "Z",
+    }
 }
 
 fn movement_mode_label(mode: MovementModeConfig) -> &'static str {
@@ -3426,6 +3715,216 @@ mod tests {
                 .unwrap_or_else(|| board.advance_queue().expect("hold move needs preview"));
         }
         board.lock_piece(planned_move.expected_location)
+    }
+
+    fn empty_field() -> [[bool; 10]; 40] {
+        [[false; 10]; 40]
+    }
+
+    fn snapshot_from_field(
+        field: [[bool; 10]; 40],
+        piece_counter: u32,
+        lines_cleared: u32,
+    ) -> GameSnapshot {
+        GameSnapshot {
+            source: "test".to_owned(),
+            token: format!("browser-test-{piece_counter}"),
+            round_id: None,
+            field: field.into_iter().collect(),
+            queue: vec![PieceToken::T, PieceToken::I, PieceToken::O],
+            hold: None,
+            combo: 0,
+            b2b: false,
+            incoming: 0,
+            piece_counter: Some(piece_counter),
+            lines_cleared: Some(lines_cleared),
+            playing: true,
+            countdown: false,
+            active: None,
+        }
+    }
+
+    fn pending_fixture(
+        input_board: [[bool; 10]; 40],
+        expected_board: [[bool; 10]; 40],
+        expected_cells: Vec<(i32, i32)>,
+        expected_line_clears: usize,
+        use_hold: bool,
+        route_kind: &'static str,
+        raw_inputs: Vec<PieceMovement>,
+    ) -> PendingPlacementVerification {
+        PendingPlacementVerification {
+            token: "browser-test-0".to_owned(),
+            piece_counter: Some(0),
+            input_lines_cleared: Some(0),
+            input_board,
+            input_board_hash: board_hash(&input_board),
+            planned_piece: Piece::T,
+            planned_target: FallingPiece {
+                kind: libtetris::PieceState(Piece::T, RotationState::North),
+                x: 4,
+                y: 1,
+                tspin: libtetris::TspinStatus::None,
+            },
+            use_hold,
+            route_kind,
+            route_actions: vec![GameAction::RotateCw, GameAction::Left, GameAction::HardDrop],
+            raw_inputs,
+            expected_board,
+            expected_hash: board_hash(&expected_board),
+            expected_cells,
+            expected_line_clears,
+        }
+    }
+
+    #[test]
+    fn placement_verification_reports_match_when_expected_board_matches() {
+        let input_board = empty_field();
+        let mut expected_board = input_board;
+        expected_board[0][4] = true;
+        expected_board[0][5] = true;
+        expected_board[1][4] = true;
+        expected_board[1][5] = true;
+        let pending = pending_fixture(
+            input_board,
+            expected_board,
+            vec![(4, 0), (5, 0), (4, 1), (5, 1)],
+            0,
+            false,
+            "SpawnTapCountSafe",
+            vec![PieceMovement::Right],
+        );
+        let actual_snapshot = snapshot_from_field(expected_board, 1, 0);
+
+        let result =
+            classify_placement_verification(&pending, &actual_snapshot, Some(pending.input_board_hash))
+                .unwrap();
+
+        assert_eq!(
+            result.classification,
+            PlacementVerificationClassification::PlacementMatch
+        );
+        assert_eq!(result.actual_cells, pending.expected_cells);
+    }
+
+    #[test]
+    fn placement_verification_reports_input_mismatch_for_shifted_lock() {
+        let input_board = empty_field();
+        let mut expected_board = input_board;
+        expected_board[0][4] = true;
+        expected_board[0][5] = true;
+        expected_board[1][4] = true;
+        expected_board[1][5] = true;
+        let pending = pending_fixture(
+            input_board,
+            expected_board,
+            vec![(4, 0), (5, 0), (4, 1), (5, 1)],
+            0,
+            false,
+            "SpawnTapCountSafe",
+            vec![PieceMovement::Right],
+        );
+        let mut actual_board = input_board;
+        actual_board[0][5] = true;
+        actual_board[0][6] = true;
+        actual_board[1][5] = true;
+        actual_board[1][6] = true;
+        let actual_snapshot = snapshot_from_field(actual_board, 1, 0);
+
+        let result =
+            classify_placement_verification(&pending, &actual_snapshot, Some(pending.input_board_hash))
+                .unwrap();
+
+        assert_eq!(
+            result.classification,
+            PlacementVerificationClassification::InputMismatch
+        );
+        assert_eq!(result.actual_cells, vec![(5, 0), (6, 0), (5, 1), (6, 1)]);
+    }
+
+    #[test]
+    fn placement_verification_reports_stale_snapshot_when_input_hash_changed() {
+        let input_board = empty_field();
+        let mut expected_board = input_board;
+        expected_board[0][4] = true;
+        let pending = pending_fixture(
+            input_board,
+            expected_board,
+            vec![(4, 0)],
+            0,
+            false,
+            "SpawnTapCountSafe",
+            vec![PieceMovement::Left],
+        );
+        let actual_snapshot = snapshot_from_field(expected_board, 1, 0);
+
+        let result =
+            classify_placement_verification(&pending, &actual_snapshot, Some(pending.input_board_hash + 1))
+                .unwrap();
+
+        assert_eq!(
+            result.classification,
+            PlacementVerificationClassification::StaleSnapshot
+        );
+    }
+
+    #[test]
+    fn placement_verification_uses_expected_board_for_line_clear_match() {
+        let mut input_board = empty_field();
+        for x in 0..9 {
+            input_board[0][x] = true;
+        }
+        let expected_board = empty_field();
+        let pending = pending_fixture(
+            input_board,
+            expected_board,
+            vec![(9, 0)],
+            1,
+            true,
+            "HoldRoute",
+            vec![PieceMovement::Cw, PieceMovement::SonicDrop],
+        );
+        let actual_snapshot = snapshot_from_field(expected_board, 1, 1);
+
+        let result =
+            classify_placement_verification(&pending, &actual_snapshot, Some(pending.input_board_hash))
+                .unwrap();
+
+        assert_eq!(
+            result.classification,
+            PlacementVerificationClassification::PlacementMatch
+        );
+        assert_eq!(result.line_clear_count, 1);
+    }
+
+    #[test]
+    fn placement_verification_marks_line_clear_mismatch_as_ambiguous() {
+        let mut input_board = empty_field();
+        for x in 0..9 {
+            input_board[0][x] = true;
+        }
+        let expected_board = empty_field();
+        let pending = pending_fixture(
+            input_board,
+            expected_board,
+            vec![(9, 0)],
+            1,
+            false,
+            "SoftDropSpinRoute",
+            vec![PieceMovement::Cw, PieceMovement::SonicDrop],
+        );
+        let mut actual_board = empty_field();
+        actual_board[0][0] = true;
+        let actual_snapshot = snapshot_from_field(actual_board, 1, 1);
+
+        let result =
+            classify_placement_verification(&pending, &actual_snapshot, Some(pending.input_board_hash))
+                .unwrap();
+
+        assert_eq!(
+            result.classification,
+            PlacementVerificationClassification::AmbiguousLineClear
+        );
     }
 
     fn simulate_seed(config: &AutomationConfig, seed: u64) -> SimulationResult {

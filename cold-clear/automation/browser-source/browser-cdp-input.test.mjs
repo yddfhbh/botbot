@@ -139,12 +139,13 @@ test("sequence preserves action order and responds once", async () => {
     ]
   );
   assert.equal(responses.length, 1);
-  assert.deepEqual(responses[0], {
-    ok: true,
-    id: 1,
-    type: "sequence",
-    actionCount: 3
-  });
+  assert.equal(responses[0].ok, true);
+  assert.equal(responses[0].id, 1);
+  assert.equal(responses[0].type, "sequence");
+  assert.equal(responses[0].actionCount, 3);
+  assert.equal(responses[0].focusState?.activeTag, "BODY");
+  assert.equal(responses[0].dispatchResults?.length, 3);
+  assert.ok(responses[0].dispatchResults.every((item) => item.dispatch === "ok"));
   assert.equal(cdp.events[0].method, "Page.bringToFront");
   assert.equal(cdp.events[1].method, "Runtime.evaluate");
 });

@@ -130,8 +130,8 @@ export async function handleMessage(
     if (message.type === "tap") {
       const action = normalizeTapAction(message);
       cdp = await ensureConnected(cdp, targetInfo, pressedKeys);
-      await prepareInputTarget(cdp, focusLogState);
-      await executeInputAction(cdp, action, targetInfo, (nextCdp) => {
+      const focusState = await prepareInputTarget(cdp, focusLogState);
+      const dispatchResult = await executeInputAction(cdp, action, targetInfo, (nextCdp) => {
         cdp = nextCdp;
       }, pressedKeys);
       sendResponse({
@@ -139,7 +139,9 @@ export async function handleMessage(
         id: message.id ?? null,
         type: "tap",
         key: action.key,
-        durationMs: action.durationMs
+        durationMs: action.durationMs,
+        focusState,
+        dispatchResults: [dispatchResult]
       });
       return cdp;
     }
@@ -147,15 +149,17 @@ export async function handleMessage(
     if (message.type === "sequence") {
       const actions = normalizeSequenceActions(message.actions);
       cdp = await ensureConnected(cdp, targetInfo, pressedKeys);
-      await prepareInputTarget(cdp, focusLogState);
-      await executeSequence(cdp, actions, targetInfo, (nextCdp) => {
+      const focusState = await prepareInputTarget(cdp, focusLogState);
+      const dispatchResults = await executeSequence(cdp, actions, targetInfo, (nextCdp) => {
         cdp = nextCdp;
       }, pressedKeys);
       sendResponse({
         ok: true,
         id: message.id ?? null,
         type: "sequence",
-        actionCount: actions.length
+        actionCount: actions.length,
+        focusState,
+        dispatchResults
       });
       return cdp;
     }
@@ -273,7 +277,7 @@ async function prepareInputTarget(cdp, focusLogState) {
       `hidden:${visibilityState}`,
       `[input] blocked hidden page visibility=${visibilityState}`
     );
-    throw new InputCommandError("page_not_visible", { visibilityState });
+    throw new InputCommandError("page_not_visible", { visibilityState, focusState });
   }
 
   if (isUnsafeActiveElement(activeTag, isContentEditable)) {
@@ -286,7 +290,7 @@ async function prepareInputTarget(cdp, focusLogState) {
       `unsafe:${details.activeTag}:${isContentEditable ? "contenteditable" : "plain"}`,
       `[input] blocked unsafe active element tag=${details.activeTag}`
     );
-    throw new InputCommandError("unsafe_active_element", details);
+    throw new InputCommandError("unsafe_active_element", { ...details, focusState });
   }
 
   logFocusStateOnce(
@@ -294,6 +298,7 @@ async function prepareInputTarget(cdp, focusLogState) {
     `safe:${activeTag || "NONE"}`,
     `[input] focus prepared active=${activeTag || "NONE"}`
   );
+  return focusState;
 }
 
 function isUnsafeActiveElement(activeTag, isContentEditable) {
@@ -367,22 +372,34 @@ export async function releaseTrackedKeys(cdp, pressedKeys) {
 }
 
 async function executeInputAction(cdp, action, targetInfo, setClient, pressedKeys) {
+  const keyDownAtMs = Date.now();
   try {
     await dispatchTrackedKey(cdp, action.spec, "keyDown", pressedKeys);
     await sleep(action.durationMs);
+    const keyUpAtMs = Date.now();
     await dispatchTrackedKey(cdp, action.spec, "keyUp", pressedKeys);
     if (action.afterMs > 0) {
       await sleep(action.afterMs);
     }
+    return {
+      key: action.key,
+      dispatch: "ok",
+      keyDownAtMs,
+      keyUpAtMs,
+      afterMs: action.afterMs
+    };
   } catch (error) {
     await recoverInputState(cdp, error, targetInfo, setClient, pressedKeys);
+    throw error;
   }
 }
 
 export async function executeSequence(cdp, actions, targetInfo, setClient, pressedKeys) {
+  const results = [];
   for (const action of actions) {
-    await executeInputAction(cdp, action, targetInfo, setClient, pressedKeys);
+    results.push(await executeInputAction(cdp, action, targetInfo, setClient, pressedKeys));
   }
+  return results;
 }
 
 async function recoverInputState(cdp, error, targetInfo, setClient, pressedKeys) {
