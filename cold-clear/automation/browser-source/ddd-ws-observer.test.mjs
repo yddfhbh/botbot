@@ -510,6 +510,115 @@ test("VS sim OFF leaves bridge logging and files untouched", async () => {
   }
 });
 
+test("vs_runtime_events_create_bridge_file_at_configured_path", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const { dir, filePath } = makeTempTraceFile("vs-ws-bridge.json");
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: () => {
+        throw new Error("unused");
+      },
+      log: (line) => logs.push(line),
+      vsSimEnabled: true,
+      vsBridgePath: filePath
+    });
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      requestId: "req-vs-runtime",
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify(vsRoundPayload())
+      }
+    });
+
+    cleanup();
+
+    assert.equal(existsSync(filePath), true);
+    const parsed = JSON.parse(readFileSync(filePath, "utf8"));
+    assert.equal(parsed.roundId, "5449:1744077373");
+    assert.equal(parsed.local.gameid, 5449);
+    assert.equal(parsed.options.seed, 1744077373);
+    assert.equal(typeof parsed.readyAt, "number");
+    assert.ok(logs.some((line) => line.startsWith("[vs-bridge] runtime started output_path=")));
+    assert.ok(logs.some((line) => line.includes("[vs-bridge] round assembler state round_id=5449:1744077373")));
+    assert.ok(logs.some((line) => line.includes("[vs-bridge] atomic write succeeded path=")));
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("accepted_vs_options_do_not_reach_solo_queue", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const cleanup = await installDddWsObserver(cdp, {
+    unpack: () => {
+      throw new Error("unused");
+    },
+    log: (line) => logs.push(line),
+    onGameOptions: ({ signature, options }) => ({
+      classification:
+        options?.gameid !== undefined && options?.gameid !== null && options?.gameid !== ""
+          ? "vs"
+          : "solo",
+      signature
+    })
+  });
+
+  cdp.emit("Network.webSocketFrameReceived", {
+    requestId: "req-vs-options",
+    response: {
+      opcode: 1,
+      payloadData: JSON.stringify({
+        options: { seed: 458782892, bagtype: "7-bag", gameid: 233, nextcount: 5 }
+      })
+    }
+  });
+
+  cleanup();
+
+  assert.ok(logs.some((line) => line.includes("[vs-bridge] options accepted gameid=233 seed=458782892")));
+  assert.equal(
+    logs.some((line) => line.includes("[browser] solo signal queued key=ddd:458782892|7-bag|233")),
+    false
+  );
+});
+
+test("orphan_options_return_before_solo_queue_during_vs_session", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const cleanup = await installDddWsObserver(cdp, {
+    unpack: () => {
+      throw new Error("unused");
+    },
+    log: (line) => logs.push(line),
+    onGameOptions: ({ options }) => ({
+      classification:
+        options?.gameid !== undefined && options?.gameid !== null && options?.gameid !== ""
+          ? "vs"
+          : "orphan_ignored"
+    })
+  });
+
+  cdp.emit("Network.webSocketFrameReceived", {
+    requestId: "req-vs-orphan",
+    response: {
+      opcode: 1,
+      payloadData: JSON.stringify({
+        options: { seed: 187156, bagtype: "7-bag", nextcount: 5 }
+      })
+    }
+  });
+
+  cleanup();
+
+  assert.equal(
+    logs.some((line) => line.includes("[browser] solo signal queued key=ddd:187156|7-bag|")),
+    false
+  );
+});
+
 test("VS bridge initialization failure does not stop the observer", async () => {
   const cdp = new FakeCdp();
   const logs = [];

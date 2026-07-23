@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 export const DEFAULT_BRIDGE_PATH = fileURLToPath(
@@ -284,6 +284,11 @@ function tryBuildBridge(state, capturedAt, log) {
     incomingGarbage: previousIncomingGarbage
   };
   state.currentSignature = signature;
+  log?.(
+    `[vs-bridge] round assembler state round_id=${state.current.roundId} local_gameid=${String(
+      state.current.local?.gameid ?? "missing"
+    )} ready_at=${String(state.current.readyAt ?? 0)}`
+  );
 
   if (previousIncomingGarbage.length === 0) {
     state.garbageKeys.clear();
@@ -615,10 +620,25 @@ function clearWaitingReason(state) {
 
 function safeWriteBridgeFile(state, log) {
   try {
+    log?.(
+      `[vs-bridge] write requested path=${displayPath(state.bridgeFilePath)} sequence=${String(
+        state.current?.sequence ?? state.sequence
+      )}`
+    );
     writeVsBridgeFile(state.bridgeFilePath, state.current);
+    const finalSize = statSync(state.bridgeFilePath).size;
+    log?.(
+      `[vs-bridge] atomic write succeeded path=${displayPath(
+        state.bridgeFilePath
+      )} sequence=${String(state.current?.sequence ?? state.sequence)} size=${finalSize}`
+    );
     return true;
   } catch (error) {
-    log?.(`[vs-bridge] write failed: ${error?.message ?? String(error)}`);
+    log?.(
+      `[vs-bridge] atomic write failed path=${displayPath(
+        state.bridgeFilePath
+      )} error=${error?.message ?? String(error)}`
+    );
     return false;
   }
 }

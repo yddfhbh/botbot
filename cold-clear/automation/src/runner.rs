@@ -385,6 +385,12 @@ where
     F: FnMut(String),
 {
     if let Some(snapshot) = scanner.next_snapshot()? {
+        if snapshot.source == "browser_ws_sim" {
+            log(format!(
+                "[vs-shadow] provider accepted token={}",
+                snapshot.token
+            ));
+        }
         return Ok(Some(ObservedSnapshot {
             age: scanner.latest_snapshot_age(),
             snapshot,
@@ -393,9 +399,16 @@ where
 
     Ok(vs_sim_controller
         .next_snapshot(log)?
-        .map(|snapshot| ObservedSnapshot {
-            age: None,
-            snapshot,
+        .map(|snapshot| {
+            scanner.accept_external_snapshot(&snapshot);
+            log(format!(
+                "[vs-shadow] provider accepted token={}",
+                snapshot.token
+            ));
+            ObservedSnapshot {
+                age: None,
+                snapshot,
+            }
         }))
 }
 
@@ -3154,7 +3167,7 @@ mod tests {
     }
 
     fn vs_validation_snapshot() -> GameSnapshot {
-        let mut snapshot = runner_test_snapshot("vs-4382-2034120187-0", 0);
+        let mut snapshot = runner_test_snapshot("vsws-1-0", 0);
         snapshot.source = "browser_ws_sim".to_owned();
         snapshot.round_id = Some("4382:2034120187".to_owned());
         snapshot

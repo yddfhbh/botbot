@@ -13,7 +13,7 @@ use crate::browser_source::BrowserSnapshotWire;
 
 pub const MAX_SNAPSHOT_AGE_MS: u64 = 1_000;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GameSnapshot {
     #[serde(default = "default_snapshot_source")]
     pub source: String,
@@ -104,6 +104,8 @@ pub trait SnapshotScanner {
 
     fn arm_piece_transition(&mut self, _: &GameSnapshot) {}
 
+    fn accept_external_snapshot(&mut self, _: &GameSnapshot) {}
+
     fn latest_snapshot_age(&self) -> Option<Duration> {
         None
     }
@@ -163,6 +165,13 @@ impl SnapshotScanner for JsonFileScanner {
 
     fn latest_snapshot_age(&self) -> Option<Duration> {
         self.latest_snapshot_age
+    }
+
+    fn accept_external_snapshot(&mut self, snapshot: &GameSnapshot) {
+        self.last_token = Some(snapshot.token.clone());
+        self.pending_token = None;
+        self.pending_seen_count = 0;
+        self.stale_snapshot_token_logged = None;
     }
 
     fn next_snapshot(&mut self) -> Result<Option<GameSnapshot>> {

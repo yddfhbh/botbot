@@ -22,6 +22,7 @@ import {
   createClosureCaptureState,
   createEndedGameCandidateState,
   createGameStartSignalState,
+  createSessionModeState,
   createInteractionTrackerInstallState,
   createNextGameReacquireState,
   createPostGameInteractionWatchState,
@@ -47,6 +48,7 @@ import {
   isTetrioGameEndedState,
   nextGameInteractionTrackerExpression,
   pausedFrameExposureExpression,
+  handleDddGameOptions,
   noteGameStartSignal,
   primeNextGameInteractionBaseline,
   primePostGameInteractionWatchBaseline,
@@ -4480,6 +4482,103 @@ test("Bot OFF cancels next-game reacquire", () => {
   assert.equal(controlState.botEnabled, false);
   assert.equal(nextGameReacquireState.active, false);
   assert.ok(logs.includes("[browser] next-game reacquire cancelled reason=bot_off"));
+});
+
+test("VS gameid options disarm an existing closure window and do not queue a solo signal", () => {
+  const logs = [];
+  const sessionModeState = createSessionModeState();
+  const gameStartSignalState = createGameStartSignalState();
+  const closureCaptureState = createClosureCaptureState();
+  armClosureCaptureWindow(closureCaptureState, {
+    reason: "bot_on",
+    now: 10_000,
+    log: (line) => logs.push(line)
+  });
+
+  const result = handleDddGameOptions({
+    sessionModeState,
+    gameStartSignalState,
+    closureCaptureState,
+    signature: "sig-vs",
+    options: {
+      gameid: "6509",
+      seed: "1212141728",
+      bagtype: "7-bag",
+      nextcount: 6
+    },
+    capturedAt: 10_100,
+    log: (line) => logs.push(line)
+  });
+
+  assert.equal(result.selectedVsShadow, true);
+  assert.equal(result.queuedSolo, false);
+  assert.equal(sessionModeState.mode, "vs_ws_shadow");
+  assert.equal(isClosureCaptureArmed(closureCaptureState, 10_101), false);
+  assert.equal(hasUnconsumedGameStartSignal(gameStartSignalState), false);
+  assert.ok(logs.includes("[browser] closure capture disarmed reason=vs_ws_shadow_selected"));
+  assert.ok(logs.includes("[browser] closure capture suppressed for VS WebSocket session"));
+});
+
+test("orphan multiplayer options are ignored while VS shadow mode is selected", () => {
+  const logs = [];
+  const sessionModeState = createSessionModeState();
+  const gameStartSignalState = createGameStartSignalState();
+
+  handleDddGameOptions({
+    sessionModeState,
+    gameStartSignalState,
+    signature: "sig-vs",
+    options: {
+      gameid: "6509",
+      seed: "1212141728",
+      bagtype: "7-bag",
+      nextcount: 6
+    },
+    capturedAt: 20_000,
+    log: () => {}
+  });
+
+  const orphan = handleDddGameOptions({
+    sessionModeState,
+    gameStartSignalState,
+    signature: "sig-orphan",
+    options: {
+      seed: "187156",
+      bagtype: "7-bag",
+      nextcount: 6
+    },
+    capturedAt: 20_010,
+    log: (line) => logs.push(line)
+  });
+
+  assert.equal(orphan.selectedVsShadow, false);
+  assert.equal(orphan.queuedSolo, false);
+  assert.equal(hasUnconsumedGameStartSignal(gameStartSignalState), false);
+  assert.ok(logs.some((line) => line.includes("orphan multiplayer options ignored seed=187156")));
+});
+
+test("solo DDD options still queue a solo start signal when VS shadow mode is not selected", () => {
+  const logs = [];
+  const sessionModeState = createSessionModeState();
+  const gameStartSignalState = createGameStartSignalState();
+
+  const result = handleDddGameOptions({
+    sessionModeState,
+    gameStartSignalState,
+    signature: "sig-solo",
+    options: {
+      seed: "123456",
+      bagtype: "7-bag",
+      nextcount: 6
+    },
+    capturedAt: 30_000,
+    log: (line) => logs.push(line)
+  });
+
+  assert.equal(result.selectedVsShadow, false);
+  assert.equal(result.queuedSolo, true);
+  assert.equal(hasUnconsumedGameStartSignal(gameStartSignalState), true);
+  assert.ok(logs.includes("[browser] solo signal queued key=ddd:sig-solo source=ddd_game_options"));
 });
 
 test("VS sim ON with active round suppresses closure capture for ten seconds", async () => {

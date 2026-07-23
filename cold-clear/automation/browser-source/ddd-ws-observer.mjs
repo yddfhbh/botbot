@@ -186,12 +186,19 @@ export async function installDddWsObserver(
   if (vsSimEnabled) {
     try {
       vsBridge = createVsBridgeState(vsBridgePath, logger);
+      safeLog(
+        log,
+        `[vs-bridge] runtime started output_path=${String(vsBridge?.bridgeFilePath ?? vsBridgePath).replace(/\\/g, "/")}`
+      );
     } catch (error) {
       safeLog(
         log,
         `[vs-bridge] initialization failed: ${error?.message ?? String(error)}`
       );
     }
+  }
+  if (vsBridge) {
+    safeLog(log, "[vs-bridge] observer attached");
   }
 
   const observerState = {
@@ -271,6 +278,13 @@ export async function installDddWsObserver(
         const candidates = collectOptionCandidates(decodedRoots);
         const timestamp = Date.now();
         const urlHost = resolveTraceUrlHost(event?.requestId, observerState);
+        logVsBridgeEventSummary(decodedRoots, {
+          log,
+          enabled: Boolean(observerState.vsBridge),
+          opcode,
+          requestId: event?.requestId ?? "",
+          payloadSize: payload.length
+        });
         observerState.decodeAttempts += decodeAttemptCount(payload);
         for (const chunk of split87Frame(payload)) {
           observerState.decodeAttempts += decodeAttemptCount(chunk);
@@ -319,6 +333,13 @@ export async function installDddWsObserver(
         const candidates = collectOptionCandidates(decodedRoots);
         const timestamp = Date.now();
         const urlHost = resolveTraceUrlHost(event?.requestId, observerState);
+        logVsBridgeEventSummary(decodedRoots, {
+          log,
+          enabled: Boolean(observerState.vsBridge),
+          opcode,
+          requestId: event?.requestId ?? "",
+          payloadSize: payloadData.length
+        });
         logCapturedCandidates(
           candidates,
           event?.requestId,
@@ -348,6 +369,9 @@ export async function installDddWsObserver(
   });
 
   return () => {
+    if (vsBridge) {
+      safeLog(log, "[vs-bridge] runtime stopped reason=cleanup");
+    }
     markVsBridgeInactive(observerState.vsBridge, logger);
     emitVsRoundStatusIfChanged(observerState, onVsRoundStatus);
     offCreated();
@@ -641,16 +665,30 @@ function logCapturedCandidates(
     observerState.recentOptionsSignatures.set(signature, now);
     observerState.optionsCaptured += 1;
     observerState.optionsCaptureSequence += 1;
+    let classification = "solo";
     try {
-      onGameOptions?.({
+      const outcome = onGameOptions?.({
         signature,
         options,
         sequence: observerState.optionsCaptureSequence,
         capturedAt: now
       });
+      if (outcome && typeof outcome === "object" && typeof outcome.classification === "string") {
+        classification = String(outcome.classification);
+      }
     } catch {}
 
-    safeLog(log, `[browser] solo signal queued key=ddd:${signature} source=ddd_game_options`);
+    if (classification === "vs") {
+      safeLog(
+        log,
+        `[vs-bridge] options accepted gameid=${String(options.gameid)} seed=${String(options.seed)}`
+      );
+      safeLog(log, "[vs-bridge] forwarding options to round assembler");
+    } else if (classification === "orphan_ignored") {
+      continue;
+    } else {
+      safeLog(log, `[browser] solo signal queued key=ddd:${signature} source=ddd_game_options`);
+    }
     safeLog(log, "[ws-observer] game options captured");
     if (requestId && observerState.requestUrls.has(requestId)) {
       safeLog(
@@ -679,6 +717,43 @@ function logCapturedCandidates(
     if (Object.prototype.hasOwnProperty.call(options, "gameid")) {
       safeLog(log, `[ws-observer] gameid=${String(options.gameid)}`);
     }
+  }
+}
+
+function logVsBridgeEventSummary(
+  decodedRoots,
+  { log, enabled = false, opcode, requestId = "", payloadSize = 0 } = {}
+) {
+  if (
+    enabled !== true ||
+    typeof log !== "function" ||
+    !Array.isArray(decodedRoots) ||
+    decodedRoots.length === 0
+  ) {
+    return;
+  }
+  for (const root of decodedRoots.slice(0, 3)) {
+    if (!root || typeof root !== "object" || Array.isArray(root)) {
+      continue;
+    }
+    const keys = Object.keys(root).slice(0, 12).join(",");
+    const roundId =
+      root.roundId ?? root.roundid ?? root.gameid ?? root.gameId ?? root.id ?? "";
+    const hasPlayers = Boolean(root.players || root.player || root.local || root.opponents);
+    const hasReady =
+      root.readyAt !== undefined ||
+      root.ready_at !== undefined ||
+      root.countdown !== undefined ||
+      root.precountdown !== undefined ||
+      root.options?.countdown_count !== undefined;
+    safeLog(
+      log,
+      `[vs-bridge] event received type=ws_frame opcode=${String(opcode)} request_id=${String(
+        requestId || "-"
+      )} payload_size=${String(payloadSize)} top_level_keys=${keys || "-"} round_like=${String(
+        roundId || "-"
+      )} has_players=${hasPlayers} has_ready=${hasReady}`
+    );
   }
 }
 

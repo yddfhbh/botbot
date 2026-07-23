@@ -46,6 +46,8 @@ const NEXT_GAME_INTERACTION_PHASE_REACQUIRING = "reacquiring";
 const NEXT_GAME_INTERACTION_PHASE_WAITING_TRANSITION_READY = "waiting_transition_ready";
 const NEXT_GAME_INTERACTION_PHASE_CAPTURE_ARMED = "capture_armed";
 const NEXT_GAME_INTERACTION_PHASE_CAPTURED_WAITING_START = "captured_waiting_start";
+const SESSION_MODE_CLOSURE_CAPTURE = "closure_capture";
+const SESSION_MODE_VS_WS_SHADOW = "vs_ws_shadow";
 
 export function determineChromiumOwnership({ connectOnly, alreadyOpen }) {
   return !connectOnly && !alreadyOpen;
@@ -81,6 +83,10 @@ export function buildSnapshotSignature(gameEpoch, state) {
 
 export function buildSnapshotToken(gameEpoch, pieceCounter) {
   return `browser-${gameEpoch}-${pieceCounter}`;
+}
+
+function buildVsShadowSnapshotToken(gameEpoch, pieceCounter) {
+  return `vsws-${gameEpoch}-${pieceCounter}`;
 }
 
 export function resolvePollMs(args) {
@@ -1099,6 +1105,129 @@ export function shouldLogClosureCaptureSkipped({
 export function createBrowserControlState() {
   return {
     botEnabled: false
+  };
+}
+
+export function createSessionModeState() {
+  return {
+    mode: SESSION_MODE_CLOSURE_CAPTURE,
+    selectedGameId: "",
+    selectedSignature: "",
+    orphanSignature: "",
+    staleSnapshotClearedAt: 0,
+    selectedLoggedAt: 0,
+    suppressionLoggedAt: 0
+  };
+}
+
+export function selectVsWsShadowMode(
+  sessionModeState,
+  {
+    gameId,
+    signature,
+    closureCaptureState = null,
+    log = console.log
+  }
+) {
+  if (!sessionModeState || !gameId) {
+    return false;
+  }
+  const nextGameId = String(gameId);
+  if (
+    sessionModeState.mode === SESSION_MODE_VS_WS_SHADOW &&
+    sessionModeState.selectedGameId === nextGameId &&
+    sessionModeState.selectedSignature === String(signature ?? "")
+  ) {
+    return false;
+  }
+  sessionModeState.mode = SESSION_MODE_VS_WS_SHADOW;
+  sessionModeState.selectedGameId = nextGameId;
+  sessionModeState.selectedSignature = String(signature ?? "");
+  sessionModeState.selectedLoggedAt = Date.now();
+  if (closureCaptureState) {
+    const hadPending = Boolean(closureCaptureState.pendingCaptureArm);
+    const disarmed = disarmClosureCaptureWindow(closureCaptureState, {
+      reason: "vs_ws_shadow_selected",
+      log,
+      clearPending: true
+    });
+    if (!disarmed && hadPending && typeof log === "function") {
+      log("[browser] closure capture disarmed reason=vs_ws_shadow_selected");
+    }
+  }
+  log(`[browser] VS WebSocket shadow mode selected gameid=${nextGameId}`);
+  log("[browser] closure capture suppressed for VS WebSocket session");
+  return true;
+}
+
+function resetSessionModeState(sessionModeState) {
+  if (!sessionModeState) {
+    return;
+  }
+  sessionModeState.mode = SESSION_MODE_CLOSURE_CAPTURE;
+  sessionModeState.selectedGameId = "";
+  sessionModeState.selectedSignature = "";
+  sessionModeState.orphanSignature = "";
+  sessionModeState.staleSnapshotClearedAt = 0;
+  sessionModeState.selectedLoggedAt = 0;
+  sessionModeState.suppressionLoggedAt = 0;
+}
+
+export function handleDddGameOptions({
+  sessionModeState,
+  gameStartSignalState,
+  closureCaptureState = null,
+  signature,
+  options,
+  capturedAt,
+  log = console.log
+}) {
+  const now = Number.isFinite(capturedAt) ? capturedAt : Date.now();
+  const countdownMs = estimateCountdownWait(options);
+  const hasGameId =
+    options?.gameid !== undefined && options?.gameid !== null && options?.gameid !== "";
+  if (hasGameId) {
+    return {
+      classification: "vs",
+      selectedVsShadow: selectVsWsShadowMode(sessionModeState, {
+        gameId: options.gameid,
+        signature,
+        closureCaptureState,
+        log
+      }),
+      queuedSolo: false
+    };
+  }
+  if (sessionModeState?.mode === SESSION_MODE_VS_WS_SHADOW) {
+    if (signature && sessionModeState.orphanSignature !== signature) {
+      sessionModeState.orphanSignature = signature;
+      log(
+        `[browser] orphan multiplayer options ignored seed=${String(options?.seed ?? "missing")} gameid=missing`
+      );
+    }
+    return {
+      classification: "orphan_ignored",
+      selectedVsShadow: false,
+      queuedSolo: false
+    };
+  }
+  return {
+    classification: "solo",
+    selectedVsShadow: false,
+    queuedSolo: noteSoloGameStartSignal(gameStartSignalState, {
+      key: `ddd:${signature}`,
+      source: "ddd_game_options",
+      now,
+      log,
+      details: {
+        seed: options?.seed ?? null,
+        bagtype: options?.bagtype ?? null,
+        gameid: options?.gameid ?? null,
+        nextCount: options?.nextcount ?? DEFAULT_NEXT_COUNT,
+        countdownMs,
+        readyAt: now + countdownMs
+      }
+    })
   };
 }
 
@@ -2127,6 +2256,7 @@ function scorePausedScopeDescriptor(descriptor) {
 export function applyBrowserControlMessage({
   message,
   controlState,
+  sessionModeState = null,
   closureCaptureState,
   nextGameReacquireState = null,
   now = Date.now(),
@@ -2150,6 +2280,14 @@ export function applyBrowserControlMessage({
   }
   controlState.botEnabled = message.enabled;
   if (message.enabled) {
+    if (sessionModeState?.mode === SESSION_MODE_VS_WS_SHADOW) {
+      log(
+        sessionModeState.selectedGameId
+          ? `[browser] closure capture suppressed for VS WebSocket session`
+          : "[browser] closure capture suppressed for VS WebSocket session"
+      );
+      return true;
+    }
     requestClosureCaptureArm(closureCaptureState, {
       reason: "bot_on",
       now,
@@ -2384,6 +2522,7 @@ export function clearSnapshotFile(snapshotPath) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const snapshotPath = args.snapshotPath ?? "automation/live-snapshot.json";
+  const vsBridgePath = path.join(path.dirname(snapshotPath), "vs-ws-bridge.json");
   const url = args.url ?? DEFAULT_URL;
   const port = numberArg(args.port, DEFAULT_PORT);
   const targetHint = args.target ?? "TETR.IO";
@@ -2422,6 +2561,7 @@ async function main() {
   let vsRoundActive = false;
   let vsRoundId = "";
   const browserControlState = createBrowserControlState();
+  const sessionModeState = createSessionModeState();
   const closureCaptureState = createClosureCaptureState();
   const gameStartSignalState = createGameStartSignalState();
   const nextGameReacquireState = createNextGameReacquireState();
@@ -2437,6 +2577,8 @@ async function main() {
     dddWsObserverCleanup = await installDddWsObserver(cdp, {
       unpack: msgpack?.unpack ?? null,
       log: message => console.log(message),
+      vsSimEnabled: true,
+      vsBridgePath,
       onVsRoundStatus: (status) => {
         const nextActive = Boolean(status?.active);
         const nextRoundId = nextActive ? String(status?.roundId ?? "") : "";
@@ -2451,9 +2593,13 @@ async function main() {
           disarmClosureCaptureWindow(closureCaptureState, {
             reason: "vs_round_active"
           });
-          console.log(
-            `[browser] VS round active; closure capture probe suspended roundId=${vsRoundId}`
-          );
+          if (sessionModeState.mode === SESSION_MODE_VS_WS_SHADOW) {
+            console.log("[browser] closure capture suppressed for VS WebSocket session");
+          } else {
+            console.log(
+              `[browser] VS round active; closure capture probe suspended roundId=${vsRoundId}`
+            );
+          }
         } else {
           disarmClosureCaptureWindow(closureCaptureState, {
             reason: "vs_round_inactive"
@@ -2462,21 +2608,14 @@ async function main() {
         }
       },
       onGameOptions: ({ signature, options, capturedAt }) => {
-        const now = Number.isFinite(capturedAt) ? capturedAt : Date.now();
-        const countdownMs = estimateCountdownWait(options);
-        noteSoloGameStartSignal(gameStartSignalState, {
-          key: `ddd:${signature}`,
-          source: "ddd_game_options",
-          now,
-          log: (message) => console.log(message),
-          details: {
-            seed: options?.seed ?? null,
-            bagtype: options?.bagtype ?? null,
-            gameid: options?.gameid ?? null,
-            nextCount: options?.nextcount ?? DEFAULT_NEXT_COUNT,
-            countdownMs,
-            readyAt: now + countdownMs
-          }
+        handleDddGameOptions({
+          sessionModeState,
+          gameStartSignalState,
+          closureCaptureState,
+          signature,
+          options,
+          capturedAt,
+          log: (message) => console.log(message)
         });
       },
       perfEnabled: browserPerfEnabled
@@ -2538,6 +2677,7 @@ async function main() {
       reason: "browser_reset",
       log: (message) => console.log(message)
     });
+    resetSessionModeState(sessionModeState);
     console.log("[browser] browser target state reset");
   };
   cdp.on("Page.frameNavigated", (event) => {
@@ -2582,6 +2722,7 @@ async function main() {
     applyBrowserControlMessage({
       message,
       controlState: browserControlState,
+      sessionModeState,
       closureCaptureState,
       nextGameReacquireState,
       bootstrapReady: isBootstrapReadyForClosureCapture(bootstrapState),
@@ -2648,16 +2789,40 @@ async function main() {
         bootstrapState,
         transientState,
         browserControlState,
-        suppressClosureCapture: vsWsSimEnabled && vsRoundActive,
+        suppressClosureCapture:
+          sessionModeState.mode === SESSION_MODE_VS_WS_SHADOW ||
+          (vsWsSimEnabled && vsRoundActive),
         activeRoundId: vsRoundActive ? vsRoundId : "",
         closureCaptureState,
         nextGameReacquireState,
         postGameInteractionWatchState,
         endedGameCandidate,
         waitingForNextGame,
-        suppressedReason: DEFAULT_SUPPRESSED_REASON,
+        suppressedReason:
+          sessionModeState.mode === SESSION_MODE_VS_WS_SHADOW
+            ? "VS WebSocket shadow session selected"
+            : DEFAULT_SUPPRESSED_REASON,
         perfEnabled: browserPerfEnabled
       });
+
+      if (sessionModeState.mode === SESSION_MODE_VS_WS_SHADOW) {
+        if (sessionModeState.staleSnapshotClearedAt === 0) {
+          clearSnapshotFile(snapshotPath);
+          resetSnapshotTracking(snapshotTracking);
+          sessionModeState.staleSnapshotClearedAt = Date.now();
+        }
+        const perfUpdate = maybeLogBrowserPerf({
+          browserPerfEnabled,
+          lastPerfLoggedAt,
+          maxEventLoopDelayMs
+        });
+        if (perfUpdate) {
+          lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
+          maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+        }
+        await sleep(pollMs);
+        continue;
+      }
 
       if (
         browserControlState.botEnabled &&

@@ -25,11 +25,13 @@ const VS_POST_LOCK_DELAY_MS_ENV: &str = "FUSION_VS_POST_LOCK_DELAY_MS";
 pub struct VsSimulationController {
     enabled: bool,
     bridge_path: PathBuf,
+    snapshot_output_path: Option<PathBuf>,
     session: Option<VsSimulationSession>,
     blocked_round_id: Option<String>,
     max_pieces: usize,
     post_ready_grace_ms: u64,
     post_lock_delay_ms: u64,
+    epoch_counter: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -48,12 +50,16 @@ struct VsSimulationSession {
     committed_locks: usize,
     post_lock_committed_at_ms: u64,
     next_snapshot_ready_at_ms: u64,
+    epoch: u64,
     paused_pending_verification: bool,
     logged_start_timing: bool,
     logged_focus_grace_wait: bool,
     logged_input_grace_complete: bool,
     logged_post_lock_wait: bool,
     logged_post_lock_release: bool,
+    logged_runner_resume: bool,
+    activation_state: ShadowActivationState,
+    initial_snapshot_published: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -62,12 +68,27 @@ enum ValidationStage {
     PreHardDrop,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum BridgePhase {
+    Scheduled,
+    Active,
+    Ended,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ShadowActivationState {
+    Scheduled,
+    Active,
+}
+
 #[derive(Debug, Deserialize)]
 struct VsBridgeWire {
     version: u64,
     sequence: u64,
     #[serde(alias = "roundId")]
     round_id: String,
+    #[serde(default)]
+    phase: Option<String>,
     active: bool,
     #[serde(alias = "capturedAt")]
     captured_at: u64,
@@ -111,9 +132,11 @@ impl VsSimulationController {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("vs-ws-bridge.json");
-        Self::with_settings(
-            std::env::var(VS_WS_SIM_ENV).ok().as_deref() == Some("1"),
+        Self::with_validation_limit_and_output(
+            true,
             bridge_path,
+            resolve_max_piece_limit(),
+            Some(snapshot_path.to_path_buf()),
         )
     }
 
@@ -122,14 +145,25 @@ impl VsSimulationController {
     }
 
     pub fn with_validation_limit(enabled: bool, bridge_path: PathBuf, max_pieces: usize) -> Self {
+        Self::with_validation_limit_and_output(enabled, bridge_path, max_pieces, None)
+    }
+
+    fn with_validation_limit_and_output(
+        enabled: bool,
+        bridge_path: PathBuf,
+        max_pieces: usize,
+        snapshot_output_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             enabled,
             bridge_path,
+            snapshot_output_path,
             session: None,
             blocked_round_id: None,
             max_pieces,
             post_ready_grace_ms: resolve_post_ready_grace_ms(),
             post_lock_delay_ms: resolve_post_lock_delay_ms(),
+            epoch_counter: 0,
         }
     }
 
@@ -166,6 +200,31 @@ impl VsSimulationController {
             return Ok(None);
         };
         let now = current_time_ms();
+        log_bridge_observation(session, now, log);
+
+        if session.activation_state == ShadowActivationState::Scheduled {
+            if now < session.countdown_ready_at_ms {
+                log_countdown_wait(session, now, log);
+                return Ok(None);
+            }
+            if let Some(session) = self.session.as_mut() {
+                if session.activation_state == ShadowActivationState::Scheduled {
+                    session.activation_state = ShadowActivationState::Active;
+                    log(format!(
+                        "[vs-shadow] countdown complete; activating shadow epoch={}",
+                        session.epoch
+                    ));
+                    log(format!(
+                        "[vs-shadow] scheduled round activated epoch={}",
+                        session.epoch
+                    ));
+                }
+            }
+        }
+
+        let Some(session) = &self.session else {
+            return Ok(None);
+        };
         let paused_pending_verification = session.paused_pending_verification;
         let piece_index = session.piece_index;
         let input_allowed_at_ms = session.input_allowed_at_ms;
@@ -188,6 +247,13 @@ impl VsSimulationController {
                 }
             }
         }
+        if piece_index == 0 && countdown_ready_at_ms > 0 && now < countdown_ready_at_ms {
+            log(format!(
+                "[vs-shadow] waiting for countdown remaining_ms={}",
+                countdown_ready_at_ms.saturating_sub(now)
+            ));
+            return Ok(None);
+        }
         if initial_input_grace_active(piece_index, now, input_allowed_at_ms) {
             if let Some(session) = self.session.as_mut() {
                 if !session.logged_focus_grace_wait {
@@ -198,7 +264,15 @@ impl VsSimulationController {
                     session.logged_focus_grace_wait = true;
                 }
             }
-            return Ok(None);
+            if self
+                .session
+                .as_ref()
+                .map(|session| session.initial_snapshot_published)
+                .unwrap_or(false)
+                || piece_index > 0
+            {
+                return Ok(None);
+            }
         }
         if piece_index == 0 && !logged_input_grace_complete {
             if let Some(session) = self.session.as_mut() {
@@ -237,12 +311,35 @@ impl VsSimulationController {
             }
         }
 
-        Ok(Some(
-            self.session
-                .as_ref()
-                .expect("session should still exist")
-                .snapshot()?,
-        ))
+        let snapshot = self
+            .session
+            .as_ref()
+            .expect("session should still exist")
+            .snapshot()?;
+        self.publish_snapshot(&snapshot, log)?;
+
+        if let Some(session) = self.session.as_mut() {
+            if !session.initial_snapshot_published && session.piece_index == 0 {
+                log(format!(
+                    "[vs-shadow] initial snapshot published token={}",
+                    snapshot.token
+                ));
+                session.initial_snapshot_published = true;
+            }
+            if !session.logged_runner_resume {
+                log(format!(
+                    "[bot] runner resumed for VS WebSocket epoch={}",
+                    session.epoch
+                ));
+                log(format!(
+                    "[automation] live VS game resumed token={}",
+                    session.token()
+                ));
+                session.logged_runner_resume = true;
+            }
+        }
+
+        Ok(Some(snapshot))
     }
 
     pub fn validate_route_preflight<F>(
@@ -392,6 +489,7 @@ impl VsSimulationController {
     {
         if let Some(session) = self.session.take() {
             self.blocked_round_id = Some(session.round_id.clone());
+            self.clear_snapshot_output(log);
             log(format!(
                 "[vs-sim] invalidated roundId={} reason={}",
                 session.round_id, reason
@@ -507,7 +605,9 @@ impl VsSimulationController {
         if bridge.version != 1 {
             return Ok(());
         }
-        if !bridge.active {
+        let now = current_time_ms();
+        let bridge_phase = resolve_bridge_phase(&bridge, now, self.session.as_ref());
+        if bridge_phase == BridgePhase::Ended {
             if self
                 .session
                 .as_ref()
@@ -515,6 +615,7 @@ impl VsSimulationController {
                 == Some(bridge.round_id.as_str())
             {
                 self.session = None;
+                self.clear_snapshot_output(log);
             }
             return Ok(());
         }
@@ -560,21 +661,89 @@ impl VsSimulationController {
                 session.input_allowed_at_ms =
                     compute_input_allowed_at_ms(bridge.ready_at, self.post_ready_grace_ms);
                 session.last_bridge_sequence = bridge.sequence;
+                session.activation_state = match bridge_phase {
+                    BridgePhase::Active => ShadowActivationState::Active,
+                    BridgePhase::Scheduled => session.activation_state,
+                    BridgePhase::Ended => ShadowActivationState::Scheduled,
+                };
             }
             _ => {
-                let session = VsSimulationSession::from_bridge(&bridge, self.post_ready_grace_ms)?;
+                let input_allowed_at_ms =
+                    compute_input_allowed_at_ms(bridge.ready_at, self.post_ready_grace_ms);
+                if bridge_phase == BridgePhase::Active
+                    && bridge.ready_at > 0
+                    && now > input_allowed_at_ms
+                {
+                    self.blocked_round_id = Some(bridge.round_id.clone());
+                    log("[vs-shadow] cannot attach mid-game without authoritative state".to_owned());
+                    return Ok(());
+                }
+                self.epoch_counter = self.epoch_counter.saturating_add(1);
+                let session = VsSimulationSession::from_bridge(
+                    &bridge,
+                    self.post_ready_grace_ms,
+                    self.epoch_counter,
+                    bridge_phase,
+                )?;
                 let first14 = generated_sequence_labels(&session.seed, 14)?;
                 log(format!("[vs-sim] generated queue first14={first14}"));
+                log(format!(
+                    "[vs-shadow] scheduled round accepted round_id={} gameid={} ready_at={}",
+                    session.round_id, session.local_game_id, session.countdown_ready_at_ms
+                ));
                 self.session = Some(session);
             }
         }
 
         Ok(())
     }
+
+    fn publish_snapshot<F>(&self, snapshot: &GameSnapshot, log: &mut F) -> Result<()>
+    where
+        F: FnMut(String),
+    {
+        let Some(path) = self.snapshot_output_path.as_ref() else {
+            return Ok(());
+        };
+        write_snapshot_output(path, snapshot).map(|()| {
+            log(format!(
+                "[vs-shadow] snapshot write succeeded token={}",
+                snapshot.token
+            ));
+        }).map_err(|error| {
+            log(format!(
+                "[vs-shadow] snapshot write failed error={:#}",
+                error
+            ));
+            error
+        })
+    }
+
+    fn clear_snapshot_output<F>(&self, log: &mut F)
+    where
+        F: FnMut(String),
+    {
+        let Some(path) = self.snapshot_output_path.as_ref() else {
+            return;
+        };
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound) => {}
+            Err(err) => log(format!(
+                "[vs-shadow] snapshot clear failed error={:#}",
+                err
+            )),
+        }
+    }
 }
 
 impl VsSimulationSession {
-    fn from_bridge(bridge: &VsBridgeWire, post_ready_grace_ms: u64) -> Result<Self> {
+    fn from_bridge(
+        bridge: &VsBridgeWire,
+        post_ready_grace_ms: u64,
+        epoch: u64,
+        bridge_phase: BridgePhase,
+    ) -> Result<Self> {
         let seed = value_to_string(&bridge.options.seed).context("bridge seed was not a scalar")?;
         let local_game_id =
             value_to_string(&bridge.local.gameid).context("local gameid was not a scalar")?;
@@ -601,20 +770,24 @@ impl VsSimulationSession {
             committed_locks: 0,
             post_lock_committed_at_ms: 0,
             next_snapshot_ready_at_ms: 0,
+            epoch,
             paused_pending_verification: false,
             logged_start_timing: false,
             logged_focus_grace_wait: false,
             logged_input_grace_complete: false,
             logged_post_lock_wait: false,
             logged_post_lock_release: false,
+            logged_runner_resume: false,
+            activation_state: match bridge_phase {
+                BridgePhase::Active => ShadowActivationState::Active,
+                BridgePhase::Scheduled | BridgePhase::Ended => ShadowActivationState::Scheduled,
+            },
+            initial_snapshot_published: false,
         })
     }
 
     fn token(&self) -> String {
-        format!(
-            "vs-{}-{}-{}",
-            self.local_game_id, self.seed, self.piece_index
-        )
+        format!("vsws-{}-{}", self.epoch, self.piece_index)
     }
 
     fn snapshot(&self) -> Result<GameSnapshot> {
@@ -729,6 +902,72 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn resolve_bridge_phase(
+    bridge: &VsBridgeWire,
+    now: u64,
+    session: Option<&VsSimulationSession>,
+) -> BridgePhase {
+    if let Some(phase) = bridge.phase.as_deref() {
+        match phase {
+            "scheduled" => return BridgePhase::Scheduled,
+            "active" => return BridgePhase::Active,
+            "ended" => return BridgePhase::Ended,
+            _ => {}
+        }
+    }
+    if bridge.active {
+        return BridgePhase::Active;
+    }
+    if bridge_is_schedulable(bridge) {
+        let same_round_became_active = session
+            .filter(|session| session.round_id == bridge.round_id)
+            .map(|session| session.activation_state == ShadowActivationState::Active)
+            .unwrap_or(false);
+        if same_round_became_active && now >= bridge.ready_at {
+            return BridgePhase::Ended;
+        }
+        return BridgePhase::Scheduled;
+    }
+    BridgePhase::Ended
+}
+
+fn bridge_is_schedulable(bridge: &VsBridgeWire) -> bool {
+    !bridge.round_id.trim().is_empty()
+        && value_to_string(&bridge.local.gameid).is_some()
+        && value_to_string(&bridge.options.seed).is_some()
+        && bridge.options.bagtype.as_deref() == Some("7-bag")
+        && bridge.ready_at > 0
+}
+
+fn log_bridge_observation<F>(session: &VsSimulationSession, now: u64, log: &mut F)
+where
+    F: FnMut(String),
+{
+    let phase = match session.activation_state {
+        ShadowActivationState::Scheduled => "scheduled",
+        ShadowActivationState::Active => "active",
+    };
+    log(format!(
+        "[vs-shadow] bridge observed sequence={} round_id={} phase={} active={} ready_at={} now={}",
+        session.last_bridge_sequence,
+        session.round_id,
+        phase,
+        session.activation_state == ShadowActivationState::Active,
+        session.countdown_ready_at_ms,
+        now
+    ));
+}
+
+fn log_countdown_wait<F>(session: &VsSimulationSession, now: u64, log: &mut F)
+where
+    F: FnMut(String),
+{
+    let remaining_ms = session.countdown_ready_at_ms.saturating_sub(now);
+    log(format!(
+        "[vs-shadow] waiting for countdown remaining_ms={remaining_ms}"
+    ));
+}
+
 fn initial_input_grace_active(piece_index: usize, now: u64, input_allowed_at_ms: u64) -> bool {
     piece_index == 0 && now < input_allowed_at_ms
 }
@@ -755,6 +994,25 @@ where
             "[vs-sim] pre-drop validation failed reason={reason}"
         )),
     }
+}
+
+fn write_snapshot_output(path: &Path, snapshot: &GameSnapshot) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create snapshot directory {}", parent.display()))?;
+    let temporary = path.with_extension("json.tmp");
+    let serialized = serde_json::to_vec_pretty(snapshot)?;
+    fs::write(&temporary, serialized)
+        .with_context(|| format!("failed to write temporary snapshot {}", temporary.display()))?;
+    fs::rename(&temporary, path).or_else(|rename_err| {
+        if path.exists() {
+            fs::remove_file(path).ok();
+            fs::rename(&temporary, path)
+        } else {
+            Err(rename_err)
+        }
+    }).with_context(|| format!("failed to publish snapshot {}", path.display()))?;
+    Ok(())
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
@@ -922,12 +1180,17 @@ fn hold_label(hold: Option<Piece>) -> &'static str {
 mod tests {
     use super::*;
     use std::env;
-    use std::fs::write;
+    use std::fs::{read_to_string, write};
     const HOLD_TEST_SEED: &str = "18645";
 
     fn temp_bridge_path(name: &str) -> PathBuf {
         let unique = current_time_ms();
         env::temp_dir().join(format!("automation-{name}-{unique}.json"))
+    }
+
+    fn temp_snapshot_path(name: &str) -> PathBuf {
+        let unique = current_time_ms();
+        env::temp_dir().join(format!("automation-{name}-{unique}-snapshot.json"))
     }
 
     fn write_bridge(path: &Path, body: &str) {
@@ -943,13 +1206,17 @@ mod tests {
         local_game_id: &str,
         seed: &str,
         captured_at: u64,
+        phase: Option<&str>,
     ) -> String {
+        let phase_line = phase
+            .map(|value| format!(r#"  "phase": "{value}",{}"#, "\n"))
+            .unwrap_or_default();
         format!(
             r#"{{
   "version": 1,
   "sequence": {sequence},
   "roundId": "{round_id}",
-  "active": {active},
+{phase_line}  "active": {active},
   "capturedAt": {captured_at},
   "readyAt": {ready_at},
   "local": {{
@@ -989,6 +1256,7 @@ mod tests {
             "4382",
             "2034120187",
             current_time_ms(),
+            None,
         )
     }
 
@@ -1017,12 +1285,16 @@ mod tests {
             committed_locks,
             post_lock_committed_at_ms: 0,
             next_snapshot_ready_at_ms: 0,
+            epoch: 1,
             paused_pending_verification: false,
             logged_start_timing: false,
             logged_focus_grace_wait: false,
             logged_input_grace_complete: false,
             logged_post_lock_wait: false,
             logged_post_lock_release: false,
+            logged_runner_resume: false,
+            activation_state: ShadowActivationState::Active,
+            initial_snapshot_published: false,
         }
     }
 
@@ -1055,6 +1327,140 @@ mod tests {
     }
 
     #[test]
+    fn active_false_bridge_with_future_ready_at_is_treated_as_scheduled() {
+        let path = temp_bridge_path("vs-sim-scheduled-future");
+        let ready_at = current_time_ms().saturating_add(2_000);
+        write_bridge(
+            &path,
+            &sample_bridge_with_state(
+                "4382:2034120187",
+                1,
+                ready_at,
+                "[]",
+                false,
+                "4382",
+                "2034120187",
+                current_time_ms(),
+                None,
+            ),
+        );
+        let mut controller = VsSimulationController::with_settings(true, path.clone());
+
+        let snapshot = controller.next_snapshot(&mut |_| {}).unwrap();
+
+        assert!(snapshot.is_none());
+        assert_eq!(
+            controller
+                .session
+                .as_ref()
+                .map(|session| session.activation_state),
+            Some(ShadowActivationState::Scheduled)
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ready_at_reached_publishes_initial_snapshot_even_when_bridge_active_is_false() {
+        let bridge_path = temp_bridge_path("vs-sim-ready-at-activation");
+        let snapshot_path = temp_snapshot_path("vs-sim-ready-at-activation");
+        write_bridge(
+            &bridge_path,
+            &sample_bridge_with_state(
+                "4382:2034120187",
+                1,
+                current_time_ms().saturating_sub(10),
+                "[]",
+                false,
+                "4382",
+                "2034120187",
+                current_time_ms(),
+                None,
+            ),
+        );
+        let mut controller = VsSimulationController::with_validation_limit_and_output(
+            true,
+            bridge_path.clone(),
+            resolve_max_piece_limit(),
+            Some(snapshot_path.clone()),
+        );
+
+        let snapshot = controller
+            .next_snapshot(&mut |_| {})
+            .unwrap()
+            .expect("scheduled round should activate");
+        let written = read_to_string(&snapshot_path).expect("snapshot file");
+
+        assert_eq!(snapshot.token, "vsws-1-0");
+        assert!(written.contains(r#""token": "vsws-1-0""#));
+        let _ = fs::remove_file(bridge_path);
+        let _ = fs::remove_file(snapshot_path);
+    }
+
+    #[test]
+    fn explicit_ended_phase_prevents_snapshot_publication() {
+        let bridge_path = temp_bridge_path("vs-sim-ended-phase");
+        let snapshot_path = temp_snapshot_path("vs-sim-ended-phase");
+        write_bridge(
+            &bridge_path,
+            &sample_bridge_with_state(
+                "4382:2034120187",
+                1,
+                current_time_ms().saturating_sub(10),
+                "[]",
+                false,
+                "4382",
+                "2034120187",
+                current_time_ms(),
+                Some("ended"),
+            ),
+        );
+        let mut controller = VsSimulationController::with_validation_limit_and_output(
+            true,
+            bridge_path.clone(),
+            resolve_max_piece_limit(),
+            Some(snapshot_path.clone()),
+        );
+
+        let snapshot = controller.next_snapshot(&mut |_| {}).unwrap();
+
+        assert!(snapshot.is_none());
+        assert!(!snapshot_path.exists());
+        let _ = fs::remove_file(bridge_path);
+        let _ = fs::remove_file(snapshot_path);
+    }
+
+    #[test]
+    fn active_round_transitioning_back_to_false_ends_the_same_round() {
+        let path = temp_bridge_path("vs-sim-active-then-false");
+        write_ready_bridge(&path, "4382:2034120187", 1);
+        let mut controller = VsSimulationController::with_settings(true, path.clone());
+        let _ = controller
+            .next_snapshot(&mut |_| {})
+            .unwrap()
+            .expect("initial snapshot");
+        write_bridge(
+            &path,
+            &sample_bridge_with_state(
+                "4382:2034120187",
+                2,
+                current_time_ms().saturating_sub(10),
+                "[]",
+                false,
+                "4382",
+                "2034120187",
+                current_time_ms(),
+                None,
+            ),
+        );
+
+        let snapshot = controller.next_snapshot(&mut |_| {}).unwrap();
+
+        assert!(snapshot.is_none());
+        assert!(controller.session.is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn blank_field_seed_generates_expected_first_current_and_queue() {
         let path = temp_bridge_path("vs-sim-seed");
         write_ready_bridge(&path, "4382:2034120187", 1);
@@ -1066,7 +1472,7 @@ mod tests {
             .expect("simulated snapshot");
 
         assert_eq!(snapshot.source, "browser_ws_sim");
-        assert_eq!(snapshot.token, "vs-4382-2034120187-0");
+        assert_eq!(snapshot.token, "vsws-1-0");
         assert_eq!(
             snapshot.queue,
             vec![
@@ -1276,7 +1682,7 @@ mod tests {
             .expect("next round snapshot");
 
         assert_eq!(next_round.piece_counter, Some(0));
-        assert_eq!(next_round.token, "vs-4382-2034120188-0");
+        assert_eq!(next_round.token, "vsws-2-0");
         let _ = fs::remove_file(path);
     }
 
@@ -1377,6 +1783,7 @@ mod tests {
                 "4382",
                 "2034120187",
                 current_time_ms().saturating_sub(60_000),
+                None,
             ),
         );
         let mut controller = VsSimulationController::with_settings(true, path.clone());
@@ -1413,6 +1820,7 @@ mod tests {
                 "4382",
                 "2034120187",
                 current_time_ms().saturating_sub(60_000),
+                None,
             ),
         );
 
@@ -1445,6 +1853,7 @@ mod tests {
                 "4382",
                 "2034120187",
                 current_time_ms(),
+                None,
             ),
         );
 
@@ -1480,6 +1889,7 @@ mod tests {
                 "4382",
                 "2034120187",
                 current_time_ms(),
+                None,
             ),
         );
 
@@ -1616,7 +2026,7 @@ mod tests {
         ));
         assert!(logs
             .iter()
-            .any(|line| line.contains("waiting post-countdown focus grace 500ms")));
+            .any(|line| line.contains("[vs-shadow] waiting for countdown remaining_ms=")));
         let _ = fs::remove_file(path);
     }
 
